@@ -1,8 +1,8 @@
 {
-  "id": "bitwarden-keyring",
+  "id": "noctalia-bitwarden-keyring",
   "name": "Bitwarden Keyring",
   "version": "0.2.0",
-  "minNoctaliaVersion": "3.6.0",
+  "minNoctaliaVersion": "4.0.0",
   "author": "bitwarden-keyring",
   "license": "MIT",
   "description": "Password prompts for Bitwarden Keyring vault unlock",

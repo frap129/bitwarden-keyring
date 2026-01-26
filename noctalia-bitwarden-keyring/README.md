@@ -8,12 +8,13 @@ This plugin integrates with [bitwarden-keyring](https://github.com/frap129/bitwa
 
 ## Requirements
 
-- [Noctalia](https://noctalia.org) >= 3.6.0
+- [Noctalia](https://noctalia.org) >= 4.0.0
 - bitwarden-keyring running with `--noctalia` flag
 
 ## Installation
 
 1. **Install this plugin**:
+
    ```bash
    # Copy to Noctalia plugins directory
    mkdir -p ~/.config/noctalia/plugins
@@ -23,11 +24,13 @@ This plugin integrates with [bitwarden-keyring](https://github.com/frap129/bitwa
 2. **Enable the plugin in Noctalia settings**
 
 3. **Start bitwarden-keyring with Noctalia support**:
+
    ```bash
    bitwarden-keyring --noctalia
    ```
 
    Or enable via environment variable:
+
    ```bash
    export BITWARDEN_KEYRING_NOCTALIA=1
    bitwarden-keyring
@@ -37,13 +40,13 @@ This plugin integrates with [bitwarden-keyring](https://github.com/frap129/bitwa
 
 The plugin can be configured through Noctalia's plugin settings:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `timeout` | 120 | Request timeout in seconds |
-| `showBitwardenIcon` | true | Show Bitwarden icon in the dialog |
-| `autoCloseOnSuccess` | true | Auto-close panel after successful auth |
-| `autoCloseOnCancel` | true | Auto-close panel on cancel |
-| `panelMode` | "attached" | Panel display mode (attached/centered/window) |
+| Setting              | Default    | Description                                   |
+| -------------------- | ---------- | --------------------------------------------- |
+| `timeout`            | 120        | Request timeout in seconds                    |
+| `showBitwardenIcon`  | true       | Show Bitwarden icon in the dialog             |
+| `autoCloseOnSuccess` | true       | Auto-close panel after successful auth        |
+| `autoCloseOnCancel`  | true       | Auto-close panel on cancel                    |
+| `panelMode`          | "attached" | Panel display mode (attached/centered/window) |
 
 ## How It Works
 
