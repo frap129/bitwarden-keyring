@@ -4,7 +4,7 @@
     {
       "id": "bitwarden-keyring",
       "name": "Bitwarden Keyring",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "author": "joe",
       "description": "Password prompts for Bitwarden Keyring vault unlock.",
       "repository": "https://github.com/joe/bitwarden-keyring",
