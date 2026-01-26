@@ -13,7 +13,6 @@
   },
   "metadata": {
     "defaultSettings": {
-      "pollInterval": 100,
       "timeout": 120,
       "showBitwardenIcon": true,
       "autoCloseOnSuccess": true,

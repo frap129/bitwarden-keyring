@@ -1,11 +1,11 @@
-// Package noctalia provides an IPC client for the noctalia-polkit-agent
+// Package noctalia provides an IPC client for the Noctalia Quickshell plugin
 // to enable Noctalia UI integration for password prompts.
 package noctalia
 
 import "errors"
 
-// KeyringRequest is sent to the noctalia-polkit-agent to request a password prompt.
-// The agent will display a UI dialog and return the password via KeyringResponse.
+// KeyringRequest is sent to the Noctalia Quickshell plugin to request a password prompt.
+// The plugin will display a UI dialog and return the password via KeyringResponse.
 type KeyringRequest struct {
 	Type        string `json:"type"`         // Always "keyring_request"
 	Cookie      string `json:"cookie"`       // Unique request ID (hex-encoded random bytes)
@@ -16,7 +16,7 @@ type KeyringRequest struct {
 	ConfirmOnly bool   `json:"confirm_only"` // Whether to just confirm (no password input)
 }
 
-// KeyringResponse is received from the noctalia-polkit-agent after the user
+// KeyringResponse is received from the Noctalia Quickshell plugin after the user
 // interacts with the password dialog.
 type KeyringResponse struct {
 	Type     string `json:"type"`               // Always "keyring_response"
@@ -37,8 +37,8 @@ var (
 	// ErrSocketNotFound indicates the Noctalia agent socket does not exist
 	ErrSocketNotFound = errors.New("noctalia socket not found")
 
-	// ErrConnectionFailed indicates a failure to connect to the Noctalia agent
-	ErrConnectionFailed = errors.New("failed to connect to noctalia agent")
+	// ErrConnectionFailed indicates a failure to connect to the Noctalia plugin
+	ErrConnectionFailed = errors.New("failed to connect to noctalia plugin")
 
 	// ErrTimeout indicates the password request timed out
 	ErrTimeout = errors.New("noctalia request timed out")

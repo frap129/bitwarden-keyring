@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	// DefaultSocketName is the default socket filename for the noctalia-polkit-agent
-	DefaultSocketName = "noctalia-polkit-agent.sock"
+	// DefaultSocketName is the default socket filename for the Noctalia Quickshell plugin
+	DefaultSocketName = "noctalia-keyring.sock"
 
 	// DefaultTimeout is the default timeout for password prompts (2 minutes)
 	DefaultTimeout = 120 * time.Second
@@ -24,7 +24,7 @@ const (
 	connectTimeout = 5 * time.Second
 )
 
-// Client provides IPC communication with the noctalia-polkit-agent
+// Client provides IPC communication with the Noctalia Quickshell plugin
 type Client struct {
 	socketPath string
 	timeout    time.Duration

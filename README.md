@@ -62,8 +62,8 @@ bitwarden-keyring
 
 ### Requirements for Noctalia
 
-1. [noctalia-polkit-agent](https://github.com/anthonyhab/noctalia-unofficial-auth-agent) running
-2. Socket at `$XDG_RUNTIME_DIR/noctalia-polkit-agent.sock`
+1. The Noctalia plugin from this repository installed
+2. Socket at `$XDG_RUNTIME_DIR/noctalia-keyring.sock` (created by the plugin)
 
 ### Optional: Dedicated Plugin
 

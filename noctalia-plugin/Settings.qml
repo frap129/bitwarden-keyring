@@ -35,7 +35,6 @@ ColumnLayout {
         }
     }
 
-    property string valuePollInterval: getSetting("pollInterval", 100).toString()
     property string valueTimeout: getSetting("timeout", 120).toString()
     property bool valueShowBitwardenIcon: getSetting("showBitwardenIcon", true)
     property bool valueAutoCloseOnSuccess: getSetting("autoCloseOnSuccess", true)
@@ -50,7 +49,6 @@ ColumnLayout {
         }
 
         try {
-            pluginApi.pluginSettings.pollInterval = parseInt(valuePollInterval, 10) || 100
             pluginApi.pluginSettings.timeout = parseInt(valueTimeout, 10) || 120
             pluginApi.pluginSettings.showBitwardenIcon = valueShowBitwardenIcon
             pluginApi.pluginSettings.autoCloseOnSuccess = valueAutoCloseOnSuccess
@@ -68,15 +66,6 @@ ColumnLayout {
         text: "Password prompts for Bitwarden Keyring vault unlock."
         wrapMode: Text.WordWrap
         color: Color.mOnSurface
-    }
-
-    NTextInput {
-        label: "Poll interval (ms)"
-        description: "How frequently the plugin checks for new authentication requests."
-        placeholderText: "100"
-        text: root.valuePollInterval
-        inputItem.inputMethodHints: Qt.ImhDigitsOnly
-        onTextChanged: root.valuePollInterval = text
     }
 
     NTextInput {
