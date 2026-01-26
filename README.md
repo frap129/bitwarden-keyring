@@ -67,7 +67,68 @@ bitwarden-keyring
 
 ### Optional: Dedicated Plugin
 
-For a branded Bitwarden experience, install the Noctalia plugin:
+For a branded Bitwarden experience, you can install the Noctalia plugin from this repository.
+
+#### Add Plugin Source
+
+Add this repository to your Noctalia plugin sources in `~/.config/noctalia/plugins.json`:
+
+```json
+{
+  "version": 1,
+  "sources": [
+    {
+      "enabled": true,
+      "name": "Official Noctalia Plugins",
+      "url": "https://github.com/noctalia-dev/noctalia-plugins"
+    },
+    {
+      "enabled": true,
+      "name": "Bitwarden Keyring",
+      "url": "https://github.com/frap129/bitwarden-keyring"
+    }
+  ],
+  "states": {
+    "bitwarden-keyring": {
+      "enabled": true,
+      "sourceUrl": "https://github.com/frap129/bitwarden-keyring"
+    }
+  }
+}
+```
+
+For NixOS with Home Manager:
+
+```nix
+programs.noctalia-shell = {
+  enable = true;
+  plugins = {
+    sources = [
+      {
+        enabled = true;
+        name = "Official Noctalia Plugins";
+        url = "https://github.com/noctalia-dev/noctalia-plugins";
+      }
+      {
+        enabled = true;
+        name = "Bitwarden Keyring";
+        url = "https://github.com/frap129/bitwarden-keyring";
+      }
+    ];
+    states = {
+      bitwarden-keyring = {
+        enabled = true;
+        sourceUrl = "https://github.com/frap129/bitwarden-keyring";
+      };
+    };
+    version = 1;
+  };
+};
+```
+
+#### Manual Installation
+
+Alternatively, copy the plugin manually:
 
 ```bash
 cp -r noctalia-plugin ~/.config/noctalia/plugins/bitwarden-keyring
