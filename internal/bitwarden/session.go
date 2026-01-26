@@ -15,6 +15,27 @@ import (
 	"github.com/joe/bitwarden-keyring/internal/noctalia"
 )
 
+// ErrUserCancelled indicates the user cancelled the password prompt
+var ErrUserCancelled = errors.New("user cancelled password prompt")
+
+// isUserCancelled checks if the error indicates user cancelled the prompt.
+// CLI tools like zenity, kdialog, rofi exit with code 1 when cancelled.
+// Zenity also exits with code 5 on timeout, which we treat as cancellation.
+func isUserCancelled(err error) bool {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitCode()
+		return code == 1 || code == 5 // 1=cancel, 5=timeout (zenity)
+	}
+	return false
+}
+
+// commandExists checks if a command is available in PATH
+func commandExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
 // SessionConfig configures the SessionManager behavior
 type SessionConfig struct {
 	// NoctaliaEnabled enables Noctalia UI integration for password prompts
@@ -151,37 +172,73 @@ func (sm *SessionManager) deleteSessionFile() {
 func (sm *SessionManager) PromptForPassword() (string, error) {
 	// Try Noctalia first if enabled
 	if sm.noctaliaEnabled && sm.noctaliaClient != nil {
-		if password, err := sm.promptNoctalia(); err == nil {
+		password, err := sm.promptNoctalia()
+		if err == nil {
 			return password, nil
-		} else if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
+		}
+		if errors.Is(err, noctalia.ErrCancelled) {
+			// User explicitly cancelled - don't try fallback methods
+			return "", ErrUserCancelled
+		}
+		if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
 			// Only log non-connection errors (connection errors just mean agent isn't running)
 			log.Printf("Noctalia prompt failed: %v, trying fallback methods", err)
 		}
 	}
 
 	// Try zenity (GNOME/GTK)
-	if password, err := sm.promptZenity(); err == nil {
-		return password, nil
+	if commandExists("zenity") {
+		password, err := sm.promptZenity()
+		if err == nil {
+			return password, nil
+		}
+		if errors.Is(err, ErrUserCancelled) {
+			return "", err
+		}
 	}
 
 	// Try kdialog (KDE)
-	if password, err := sm.promptKDialog(); err == nil {
-		return password, nil
+	if commandExists("kdialog") {
+		password, err := sm.promptKDialog()
+		if err == nil {
+			return password, nil
+		}
+		if errors.Is(err, ErrUserCancelled) {
+			return "", err
+		}
 	}
 
 	// Try rofi (common on tiling WMs)
-	if password, err := sm.promptRofi(); err == nil {
-		return password, nil
+	if commandExists("rofi") {
+		password, err := sm.promptRofi()
+		if err == nil {
+			return password, nil
+		}
+		if errors.Is(err, ErrUserCancelled) {
+			return "", err
+		}
 	}
 
 	// Try dmenu (fallback for tiling WMs)
-	if password, err := sm.promptDmenu(); err == nil {
-		return password, nil
+	if commandExists("dmenu") {
+		password, err := sm.promptDmenu()
+		if err == nil {
+			return password, nil
+		}
+		if errors.Is(err, ErrUserCancelled) {
+			return "", err
+		}
 	}
 
 	// Try systemd-ask-password (works with Plymouth/console)
-	if password, err := sm.promptSystemd(); err == nil {
-		return password, nil
+	if commandExists("systemd-ask-password") {
+		password, err := sm.promptSystemd()
+		if err == nil {
+			return password, nil
+		}
+		if errors.Is(err, ErrUserCancelled) {
+			return "", err
+		}
 	}
 
 	return "", fmt.Errorf("no password prompt method available (install zenity, kdialog, or rofi)")
@@ -213,6 +270,9 @@ func (sm *SessionManager) promptZenity() (string, error) {
 	)
 	output, err := cmd.Output()
 	if err != nil {
+		if isUserCancelled(err) {
+			return "", ErrUserCancelled
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
@@ -227,6 +287,9 @@ func (sm *SessionManager) promptKDialog() (string, error) {
 	)
 	output, err := cmd.Output()
 	if err != nil {
+		if isUserCancelled(err) {
+			return "", ErrUserCancelled
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
@@ -242,6 +305,9 @@ func (sm *SessionManager) promptRofi() (string, error) {
 	)
 	output, err := cmd.Output()
 	if err != nil {
+		if isUserCancelled(err) {
+			return "", ErrUserCancelled
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
@@ -257,6 +323,9 @@ func (sm *SessionManager) promptDmenu() (string, error) {
 	cmd.Stdin = strings.NewReader("") // Empty input
 	output, err := cmd.Output()
 	if err != nil {
+		if isUserCancelled(err) {
+			return "", ErrUserCancelled
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
@@ -271,6 +340,9 @@ func (sm *SessionManager) promptSystemd() (string, error) {
 	)
 	output, err := cmd.Output()
 	if err != nil {
+		if isUserCancelled(err) {
+			return "", ErrUserCancelled
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil

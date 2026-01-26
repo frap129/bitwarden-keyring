@@ -167,10 +167,8 @@ Item {
                     baseSize: Layout.preferredWidth
                     colorBg: "transparent"
                     onClicked: {
-                        if (!busy) {
-                            root.closeRequested()
-                            passwordInput.text = ""
-                        }
+                        root.closeRequested()
+                        passwordInput.text = ""
                     }
                 }
             }

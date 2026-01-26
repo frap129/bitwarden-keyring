@@ -124,9 +124,14 @@ Item {
             closeAuthUI()
             return
         }
-        if (cancelRequest()) {
-            closeAuthUI()
+        cancelRequest()  // Try to send cancel response
+        // Close the connection so Go receives EOF if cancel wasn't sent
+        if (currentConnection) {
+            currentConnection.close()
         }
+        currentRequest = null
+        currentConnection = null
+        closeAuthUI()
     }
 
     // Socket server for receiving password requests
@@ -136,6 +141,7 @@ Item {
         path: root.socketPath
 
         handler: Socket {
+            id: clientSocket
             parser: SplitParser {
                 onRead: function(line) {
                     const trimmed = (line || "").trim()
@@ -144,7 +150,7 @@ Item {
                     try {
                         const request = JSON.parse(trimmed)
                         if (request.type === "keyring_request") {
-                            root.handleKeyringRequest(request, this.parent)
+                            root.handleKeyringRequest(request, clientSocket)
                         }
                     } catch (e) {
                         console.log("Bitwarden Keyring: Failed to parse request:", e)

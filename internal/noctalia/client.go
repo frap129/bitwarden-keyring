@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -145,6 +147,10 @@ func (c *Client) RequestPassword(ctx context.Context, title, message string) (st
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			return "", ErrTimeout
+		}
+		// Connection closed without response = user cancelled (closed the window)
+		if errors.Is(err, io.EOF) {
+			return "", ErrCancelled
 		}
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}

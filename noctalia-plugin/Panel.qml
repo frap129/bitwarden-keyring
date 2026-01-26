@@ -41,6 +41,12 @@ Item {
         statusText: pluginMain?.agentStatus ?? ""
         errorText: pluginMain?.lastError ?? ""
         showBitwardenIcon: pluginMain?.showBitwardenIcon ?? true
-        onCloseRequested: pluginMain?.requestClose()
+        onCloseRequested: {
+            if (pluginMain) {
+                pluginMain.requestClose()
+            } else {
+                root.pluginApi?.closePanel(screen)
+            }
+        }
     }
 }
