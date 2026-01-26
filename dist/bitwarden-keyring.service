@@ -1,0 +1,20 @@
+[Unit]
+Description=Bitwarden Secret Service
+Documentation=https://github.com/joe/bitwarden-keyring
+Before=default.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.secrets
+ExecStart=/usr/bin/bitwarden-keyring
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
