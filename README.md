@@ -176,6 +176,19 @@ systemctl --user daemon-reload
 systemctl --user restart bitwarden-keyring.service
 ```
 
+### Custom PATH for Bitwarden CLI
+
+If your `bw` executable is not in a system-defined path (like `.local/bin` or `.bun/bin`), you can add a custom PATH in a systemd override:
+
+```bash
+mkdir -p ~/.config/systemd/user/bitwarden-keyring.service.d/
+cat > ~/.config/systemd/user/bitwarden-keyring.service.d/path.conf << 'EOF'
+[Service]
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EOF
+systemctl --user daemon-reload
+```
+
 ### Fallback Behavior
 
 When `--noctalia` is set but the agent is unavailable, bitwarden-keyring falls back to standard prompts (zenity, kdialog, rofi, dmenu, systemd-ask-password).
