@@ -6,13 +6,13 @@ pkgdesc="A D-Bus service implementing the Secret Service API using Bitwarden as 
 arch=('x86_64' 'aarch64')
 url="https://github.com/joe/bitwarden-keyring"
 license=('MIT')
-depends=('bitwarden-cli')
 makedepends=('go')
 optdepends=(
-    'bitwarden-cli: Required, can be installed via npm',
+    'bitwarden-cli: Required, can be installed via npm'
     'zenity: GTK password prompt'
     'kdialog: KDE password prompt'
     'rofi: password prompt for tiling WMs'
+    'noctalia-shell: Native panel-based password prompts'
 )
 provides=('secret-service')
 conflicts=('gnome-keyring' 'kwalletd' 'keepassxc')

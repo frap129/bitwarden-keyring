@@ -136,9 +136,26 @@ cp -r noctalia-plugin ~/.config/noctalia/plugins/bitwarden-keyring
 
 Then enable the plugin in Noctalia settings. See [noctalia-plugin/README.md](noctalia-plugin/README.md) for details.
 
-### Service Activation with Noctalia
+### Enabling Noctalia for the Systemd Service
 
-For D-Bus/systemd activation, create a systemd override:
+When using D-Bus/systemd activation, you need to configure the service to enable Noctalia. There are two methods:
+
+#### Method 1: Environment Variable (Recommended)
+
+Create a systemd override that sets the environment variable:
+
+```bash
+mkdir -p ~/.config/systemd/user/bitwarden-keyring.service.d/
+cat > ~/.config/systemd/user/bitwarden-keyring.service.d/noctalia.conf << 'EOF'
+[Service]
+Environment=BITWARDEN_KEYRING_NOCTALIA=1
+EOF
+systemctl --user daemon-reload
+```
+
+#### Method 2: ExecStart Override
+
+Alternatively, override the ExecStart directive:
 
 ```bash
 mkdir -p ~/.config/systemd/user/bitwarden-keyring.service.d/
@@ -148,6 +165,15 @@ ExecStart=
 ExecStart=/usr/bin/bitwarden-keyring --noctalia
 EOF
 systemctl --user daemon-reload
+```
+
+#### Applying Changes
+
+After creating or modifying the override, reload and restart the service:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart bitwarden-keyring.service
 ```
 
 ### Fallback Behavior
