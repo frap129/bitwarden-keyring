@@ -14,6 +14,7 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
+ReadWritePaths="%h/.config/Bitwarden CLI"
 PrivateTmp=yes
 
 [Install]
