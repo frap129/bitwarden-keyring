@@ -170,14 +170,29 @@ func (s *UnifiedService) SearchItems(attributes map[string]string) ([]dbus.Objec
 		return nil, nil, dbus.MakeFailedError(err)
 	}
 
+	// If vault is locked, try to unlock it first
+	if locked {
+		log.Printf("Vault is locked, prompting for password...")
+		password, err := s.bwClient.SessionManager().PromptForPassword()
+		if err != nil {
+			log.Printf("Failed to prompt for password: %v", err)
+			// Return empty results - vault is locked
+			return make([]dbus.ObjectPath, 0), make([]dbus.ObjectPath, 0), nil
+		}
+
+		_, err = s.bwClient.Unlock(ctx, password)
+		if err != nil {
+			log.Printf("Failed to unlock vault: %v", err)
+			return make([]dbus.ObjectPath, 0), make([]dbus.ObjectPath, 0), nil
+		}
+		log.Printf("Vault unlocked successfully")
+	}
+
 	items, err := s.findMatchingItems(ctx, attributes)
 	if err != nil {
 		return nil, nil, dbus.MakeFailedError(err)
 	}
 
-	if locked {
-		return make([]dbus.ObjectPath, 0), items, nil
-	}
 	return items, make([]dbus.ObjectPath, 0), nil
 }
 

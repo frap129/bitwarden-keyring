@@ -1,23 +1,70 @@
 package bitwarden
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/joe/bitwarden-keyring/internal/noctalia"
 )
+
+// SessionConfig configures the SessionManager behavior
+type SessionConfig struct {
+	// NoctaliaEnabled enables Noctalia UI integration for password prompts
+	NoctaliaEnabled bool
+	// NoctaliaSocket is an optional custom socket path for Noctalia
+	NoctaliaSocket string
+	// NoctaliaTimeout is the timeout for Noctalia password prompts
+	NoctaliaTimeout time.Duration
+}
+
+// DefaultSessionConfig returns a SessionConfig with default values
+func DefaultSessionConfig() SessionConfig {
+	return SessionConfig{
+		NoctaliaEnabled: false,
+		NoctaliaSocket:  "",
+		NoctaliaTimeout: noctalia.DefaultTimeout,
+	}
+}
 
 // SessionManager handles Bitwarden session key management
 type SessionManager struct {
-	sessionKey string
-	mu         sync.RWMutex
+	sessionKey      string
+	mu              sync.RWMutex
+	noctaliaClient  *noctalia.Client
+	noctaliaEnabled bool
 }
 
-// NewSessionManager creates a new session manager
+// NewSessionManager creates a new session manager with default config
 func NewSessionManager() *SessionManager {
-	sm := &SessionManager{}
+	return NewSessionManagerWithConfig(DefaultSessionConfig())
+}
+
+// NewSessionManagerWithConfig creates a new session manager with the given config
+func NewSessionManagerWithConfig(cfg SessionConfig) *SessionManager {
+	sm := &SessionManager{
+		noctaliaEnabled: cfg.NoctaliaEnabled,
+	}
+
+	// Initialize Noctalia client if enabled
+	if cfg.NoctaliaEnabled {
+		var opts []noctalia.Option
+		if cfg.NoctaliaSocket != "" {
+			opts = append(opts, noctalia.WithSocketPath(cfg.NoctaliaSocket))
+		}
+		if cfg.NoctaliaTimeout > 0 {
+			opts = append(opts, noctalia.WithTimeout(cfg.NoctaliaTimeout))
+		}
+		sm.noctaliaClient = noctalia.NewClient(opts...)
+	}
+
 	// Try to load session from environment or file
 	sm.loadSession()
 	return sm
@@ -102,6 +149,16 @@ func (sm *SessionManager) deleteSessionFile() {
 // PromptForPassword prompts the user for their master password using a GUI dialog
 // It tries various GUI methods, falling back through the chain
 func (sm *SessionManager) PromptForPassword() (string, error) {
+	// Try Noctalia first if enabled
+	if sm.noctaliaEnabled && sm.noctaliaClient != nil {
+		if password, err := sm.promptNoctalia(); err == nil {
+			return password, nil
+		} else if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
+			// Only log non-connection errors (connection errors just mean agent isn't running)
+			log.Printf("Noctalia prompt failed: %v, trying fallback methods", err)
+		}
+	}
+
 	// Try zenity (GNOME/GTK)
 	if password, err := sm.promptZenity(); err == nil {
 		return password, nil
@@ -128,6 +185,22 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 	}
 
 	return "", fmt.Errorf("no password prompt method available (install zenity, kdialog, or rofi)")
+}
+
+// promptNoctalia uses the Noctalia agent for a password dialog
+func (sm *SessionManager) promptNoctalia() (string, error) {
+	if sm.noctaliaClient == nil {
+		return "", noctalia.ErrSocketNotFound
+	}
+
+	if !sm.noctaliaClient.IsAvailable() {
+		return "", noctalia.ErrSocketNotFound
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), noctalia.DefaultTimeout)
+	defer cancel()
+
+	return sm.noctaliaClient.RequestPassword(ctx, "Bitwarden Keyring", "Enter your Bitwarden Master Password:")
 }
 
 // promptZenity uses zenity for a GTK password dialog

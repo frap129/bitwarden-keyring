@@ -1,0 +1,24 @@
+{
+  "id": "bitwarden-keyring",
+  "name": "Bitwarden Keyring",
+  "version": "0.1.0",
+  "minNoctaliaVersion": "3.6.0",
+  "author": "bitwarden-keyring",
+  "license": "MIT",
+  "description": "Password prompts for Bitwarden Keyring vault unlock",
+  "entryPoints": {
+    "main": "Main.qml",
+    "panel": "Panel.qml",
+    "settings": "Settings.qml"
+  },
+  "metadata": {
+    "defaultSettings": {
+      "pollInterval": 100,
+      "timeout": 120,
+      "showBitwardenIcon": true,
+      "autoCloseOnSuccess": true,
+      "autoCloseOnCancel": true,
+      "panelMode": "attached"
+    }
+  }
+}

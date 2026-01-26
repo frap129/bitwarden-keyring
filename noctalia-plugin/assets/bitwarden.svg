@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- Bitwarden shield icon (simplified) -->
+  <path d="M24 4L6 10v14c0 11.1 7.7 21.5 18 24 10.3-2.5 18-12.9 18-24V10L24 4z" fill="#175DDC"/>
+  <path d="M24 8l-14 4.8v11.4c0 9 6.3 17.4 14 19.4V8z" fill="#1A8FE3"/>
+  <path d="M20 20l-3 3 7 7 10-10-3-3-7 7-4-4z" fill="white"/>
+</svg>

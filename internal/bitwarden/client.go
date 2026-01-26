@@ -25,12 +25,17 @@ type Client struct {
 
 // NewClient creates a new Bitwarden API client
 func NewClient(port int) *Client {
+	return NewClientWithConfig(port, DefaultSessionConfig())
+}
+
+// NewClientWithConfig creates a new Bitwarden API client with custom session config
+func NewClientWithConfig(port int, sessionCfg SessionConfig) *Client {
 	return &Client{
 		baseURL: fmt.Sprintf("http://127.0.0.1:%d", port),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		session: NewSessionManager(),
+		session: NewSessionManagerWithConfig(sessionCfg),
 	}
 }
 
