@@ -5,7 +5,7 @@ A D-Bus service that implements the [Secret Service API](https://specifications.
 ## Requirements
 
 - [Bitwarden CLI](https://bitwarden.com/help/cli/) installed and logged in
-- One of: zenity, kdialog, rofi, dmenu, or systemd-ask-password (for password prompts)
+- One of: noctalia-bitwarden-keyring, zenity, kdialog, rofi, dmenu, or systemd-ask-password (for password prompts)
 
 ## Installation
 
@@ -156,13 +156,13 @@ When `--noctalia` is set but the agent is unavailable, bitwarden-keyring falls b
 
 ## Command-Line Options
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port` | 8087 | Port for Bitwarden serve API |
-| `--debug` | false | Enable debug logging |
-| `--noctalia` | false | Enable Noctalia UI integration |
-| `--noctalia-socket` | (auto) | Custom Noctalia socket path |
-| `--noctalia-timeout` | 120s | Noctalia prompt timeout |
+| Flag                 | Default | Description                    |
+| -------------------- | ------- | ------------------------------ |
+| `--port`             | 8087    | Port for Bitwarden serve API   |
+| `--debug`            | false   | Enable debug logging           |
+| `--noctalia`         | false   | Enable Noctalia UI integration |
+| `--noctalia-socket`  | (auto)  | Custom Noctalia socket path    |
+| `--noctalia-timeout` | 120s    | Noctalia prompt timeout        |
 
 ## License
 
