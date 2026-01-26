@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "bitwarden-keyring",
+      "name": "Bitwarden Keyring",
+      "version": "0.1.0",
+      "author": "joe",
+      "description": "Password prompts for Bitwarden Keyring vault unlock.",
+      "repository": "https://github.com/joe/bitwarden-keyring",
+      "minNoctaliaVersion": "3.6.0",
+      "license": "MIT",
+      "lastUpdated": "2026-01-26T00:00:00Z"
+    }
+  ]
+}

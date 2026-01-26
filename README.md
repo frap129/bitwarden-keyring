@@ -6,7 +6,6 @@ A D-Bus service that implements the [Secret Service API](https://specifications.
 
 - [Bitwarden CLI](https://bitwarden.com/help/cli/) installed and logged in
 - One of: zenity, kdialog, rofi, dmenu, or systemd-ask-password (for password prompts)
-- (Optional) [noctalia-polkit-agent](https://github.com/anthonyhab/noctalia-unofficial-auth-agent) for Noctalia integration
 
 ## Installation
 
