@@ -1,4 +1,4 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: Joe Maples <joe@maples.dev>
 pkgname=bitwarden-keyring
 pkgver=0.1.0
 pkgrel=1
@@ -9,6 +9,7 @@ license=('MIT')
 depends=('bitwarden-cli')
 makedepends=('go')
 optdepends=(
+    'bitwarden-cli: Required, can be installed via npm',
     'zenity: GTK password prompt'
     'kdialog: KDE password prompt'
     'rofi: password prompt for tiling WMs'
@@ -26,24 +27,24 @@ build() {
     export CGO_CXXFLAGS="${CXXFLAGS}"
     export CGO_LDFLAGS="${LDFLAGS}"
     export GOFLAGS="-buildmode=pie -trimpath -ldflags=-linkmode=external -mod=readonly -modcacherw"
-    
+
     go build -o "$pkgname" -ldflags "-X main.version=${pkgver}" ./cmd/bitwarden-keyring
 }
 
 package() {
     cd "$srcdir/.."
-    
+
     # Install binary
     install -Dm755 "$pkgname" "$pkgdir/usr/bin/$pkgname"
-    
+
     # Install D-Bus service file for activation
     install -Dm644 dist/org.freedesktop.secrets.service \
         "$pkgdir/usr/share/dbus-1/services/org.freedesktop.secrets.service"
-    
+
     # Install systemd user service
     install -Dm644 dist/bitwarden-keyring.service \
         "$pkgdir/usr/lib/systemd/user/bitwarden-keyring.service"
-    
+
     # Install README
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
