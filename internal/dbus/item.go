@@ -18,6 +18,7 @@ type Item struct {
 	bwClient       *bitwarden.Client
 	sessionManager *SessionManager
 	collection     *Collection
+	itemManager    *ItemManager
 	mu             sync.RWMutex
 }
 
@@ -62,6 +63,7 @@ func (im *ItemManager) GetOrCreateItem(bwItem *bitwarden.Item, collection *Colle
 		bwClient:       im.bwClient,
 		sessionManager: im.sessionManager,
 		collection:     collection,
+		itemManager:    im,
 	}
 
 	if err := im.exportItem(item); err != nil {
@@ -80,13 +82,16 @@ func (im *ItemManager) GetItem(path dbus.ObjectPath) (*Item, bool) {
 	return item, ok
 }
 
-// RemoveItem removes an item
+// RemoveItem removes an item and unexports all its D-Bus interfaces
 func (im *ItemManager) RemoveItem(path dbus.ObjectPath) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
 	if _, ok := im.items[path]; ok {
+		// Unexport all interfaces that were exported
 		im.conn.Export(nil, path, ItemInterface)
+		im.conn.Export(nil, path, PropertiesInterface)
+		im.conn.Export(nil, path, "org.freedesktop.DBus.Introspectable")
 		delete(im.items, path)
 	}
 }
@@ -131,11 +136,18 @@ func (i *Item) Delete() (dbus.ObjectPath, *dbus.Error) {
 
 	i.mu.RLock()
 	id := i.bwItem.ID
+	collPath := i.collection.path
 	i.mu.RUnlock()
 
 	if err := i.bwClient.DeleteItem(ctx, id); err != nil {
 		return NoPrompt, dbus.MakeFailedError(err)
 	}
+
+	// Remove from manager and unexport all interfaces
+	i.itemManager.RemoveItem(i.path)
+
+	// Emit ItemDeleted signal using actual collection path
+	EmitItemDeleted(i.conn, collPath, i.path)
 
 	return NoPrompt, nil
 }
@@ -191,17 +203,16 @@ func (i *Item) SetSecret(secret Secret) *dbus.Error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
+	// Guard against nil Login struct
+	if i.bwItem.Login == nil {
+		return dbus.MakeFailedError(fmt.Errorf("item has no login credentials"))
+	}
+
 	password := string(decryptedValue)
 	i.bwItem.Login.Password = &password
 
-	// Update in Bitwarden
-	req := bitwarden.CreateItemRequest{
-		Type:     bitwarden.ItemTypeLogin,
-		Name:     i.bwItem.Name,
-		FolderID: i.bwItem.FolderID,
-		Login:    i.bwItem.Login,
-		Fields:   i.bwItem.Fields,
-	}
+	// Use ToUpdateRequest to preserve all fields
+	req := i.bwItem.ToUpdateRequest()
 
 	updated, err := i.bwClient.UpdateItem(ctx, i.bwItem.ID, req)
 	if err != nil {
@@ -209,6 +220,10 @@ func (i *Item) SetSecret(secret Secret) *dbus.Error {
 	}
 
 	i.bwItem = updated
+
+	// Emit ItemChanged signal using actual collection path
+	EmitItemChanged(i.conn, i.collection.path, i.path)
+
 	return nil
 }
 
@@ -218,14 +233,22 @@ func (i *Item) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 		return dbus.Variant{}, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
+	// Handle Locked property separately since it needs to query bwClient
+	// without holding the lock
+	if property == "Locked" {
+		ctx := context.Background()
+		locked, err := i.bwClient.IsLocked(ctx)
+		if err != nil {
+			// Default to locked=true on error (safe default)
+			locked = true
+		}
+		return dbus.MakeVariant(locked), nil
+	}
+
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 
 	switch property {
-	case "Locked":
-		// Items are unlocked if we can access them
-		return dbus.MakeVariant(false), nil
-
 	case "Attributes":
 		attrs := mapping.ItemToAttributes(i.bwItem)
 		return dbus.MakeVariant(attrs), nil
@@ -263,25 +286,43 @@ func (i *Item) Set(iface, property string, value dbus.Variant) *dbus.Error {
 		}
 		i.bwItem.Name = label
 
-		// Update in Bitwarden
-		req := bitwarden.CreateItemRequest{
-			Type:     bitwarden.ItemTypeLogin,
-			Name:     label,
-			FolderID: i.bwItem.FolderID,
-			Login:    i.bwItem.Login,
-			Fields:   i.bwItem.Fields,
-		}
+		// Use ToUpdateRequest to preserve all fields
+		req := i.bwItem.ToUpdateRequest()
 
 		updated, err := i.bwClient.UpdateItem(ctx, i.bwItem.ID, req)
 		if err != nil {
 			return dbus.MakeFailedError(err)
 		}
 		i.bwItem = updated
+
+		// Emit ItemChanged signal using actual collection path
+		EmitItemChanged(i.conn, i.collection.path, i.path)
+
 		return nil
 
 	case "Attributes":
-		// Attributes are derived from Bitwarden fields, not directly settable
-		return dbus.MakeFailedError(fmt.Errorf("attributes are read-only"))
+		attrs, ok := value.Value().(map[string]string)
+		if !ok {
+			return dbus.MakeFailedError(fmt.Errorf("invalid attributes type: expected map[string]string"))
+		}
+
+		// Update item from attributes
+		mapping.UpdateItemFromAttributes(i.bwItem, attrs)
+
+		// Use ToUpdateRequest to preserve all fields
+		req := i.bwItem.ToUpdateRequest()
+
+		// Save to Bitwarden
+		updated, err := i.bwClient.UpdateItem(ctx, i.bwItem.ID, req)
+		if err != nil {
+			return dbus.MakeFailedError(fmt.Errorf("failed to update item: %w", err))
+		}
+		i.bwItem = updated
+
+		// Emit ItemChanged signal using actual collection path
+		EmitItemChanged(i.conn, i.collection.path, i.path)
+
+		return nil
 
 	default:
 		return dbus.MakeFailedError(fmt.Errorf("unknown or read-only property: %s", property))
@@ -294,11 +335,19 @@ func (i *Item) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error) {
 		return nil, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
+	// Check lock state before holding the lock
+	ctx := context.Background()
+	locked, err := i.bwClient.IsLocked(ctx)
+	if err != nil {
+		// Default to locked=true on error (safe default)
+		locked = true
+	}
+
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 
 	props := map[string]dbus.Variant{
-		"Locked":     dbus.MakeVariant(false),
+		"Locked":     dbus.MakeVariant(locked),
 		"Attributes": dbus.MakeVariant(mapping.ItemToAttributes(i.bwItem)),
 		"Label":      dbus.MakeVariant(i.bwItem.Name),
 		"Created":    dbus.MakeVariant(uint64(i.bwItem.CreationDate.Unix())),

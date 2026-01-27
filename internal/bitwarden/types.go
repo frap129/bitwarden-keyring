@@ -142,3 +142,20 @@ type CreateItemRequest struct {
 	Fields         []Field  `json:"fields,omitempty"`
 	Reprompt       int      `json:"reprompt"`
 }
+
+// ToUpdateRequest creates a CreateItemRequest from an existing Item,
+// preserving all fields for updates. This ensures that non-omitempty fields
+// like Favorite and Reprompt are not silently zeroed during updates.
+func (i *Item) ToUpdateRequest() CreateItemRequest {
+	return CreateItemRequest{
+		OrganizationID: i.OrganizationID,
+		FolderID:       i.FolderID,
+		Type:           i.Type,
+		Name:           i.Name,
+		Notes:          i.Notes,
+		Favorite:       i.Favorite,
+		Login:          i.Login,
+		Fields:         i.Fields,
+		Reprompt:       i.Reprompt,
+	}
+}

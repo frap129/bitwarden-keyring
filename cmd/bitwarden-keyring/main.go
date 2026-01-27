@@ -22,7 +22,7 @@ var (
 	noctaliaFlag    = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
 	noctaliaSocket  = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-polkit-agent.sock)")
 	noctaliaTimeout = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
-	version         = "0.2.0"
+	version         = "0.3.0"
 )
 
 func main() {
@@ -79,7 +79,10 @@ func main() {
 	log.Printf("Connected to session D-Bus")
 
 	// Create and export the service
-	service := secretdbus.NewUnifiedService(conn, bwClient)
+	service, err := secretdbus.NewService(conn, bwClient)
+	if err != nil {
+		log.Fatalf("Failed to create service: %v", err)
+	}
 
 	if err := service.Export(); err != nil {
 		log.Fatalf("Failed to export service: %v", err)

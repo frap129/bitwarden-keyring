@@ -123,6 +123,22 @@ func (c *Collection) Path() dbus.ObjectPath {
 	return c.path
 }
 
+// hasMeaningfulAttrs checks if attrs has at least one identity attribute.
+// This prevents accidental replacement when attrs is empty or only has schema.
+func hasMeaningfulAttrs(attrs map[string]string) bool {
+	identityKeys := []string{
+		"label", "service", "domain", "server", "username", "user",
+		mapping.AttrService, mapping.AttrUsername, mapping.AttrDomain,
+		mapping.AttrServer,
+	}
+	for _, key := range identityKeys {
+		if v, ok := attrs[key]; ok && v != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // Delete deletes the collection (D-Bus method)
 func (c *Collection) Delete() (dbus.ObjectPath, *dbus.Error) {
 	// We don't support deleting the default collection
@@ -182,7 +198,7 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 
 	// Extract label from properties
 	label := "Unnamed"
-	if labelVar, ok := properties["org.freedesktop.Secret.Item.Label"]; ok {
+	if labelVar, ok := properties[PropItemLabel]; ok {
 		if l, ok := labelVar.Value().(string); ok {
 			label = l
 		}
@@ -190,7 +206,7 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 
 	// Extract attributes from properties
 	var attrs map[string]string
-	if attrsVar, ok := properties["org.freedesktop.Secret.Item.Attributes"]; ok {
+	if attrsVar, ok := properties[PropItemAttributes]; ok {
 		if a, ok := attrsVar.Value().(map[string]string); ok {
 			attrs = a
 		}
@@ -201,22 +217,26 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 	username := mapping.GetUsername(attrs)
 
 	// If replace is true, try to find and update existing item
-	if replace && attrs != nil {
-		items, _ := c.bwClient.ListItems(ctx)
+	// Only replace if attrs contains meaningful identity attributes
+	if replace && attrs != nil && hasMeaningfulAttrs(attrs) {
+		items, err := c.bwClient.ListItems(ctx)
+		if err != nil {
+			// If we can't list items, we can't safely replace - fail the operation
+			return NoPrompt, NoPrompt, dbus.MakeFailedError(
+				fmt.Errorf("cannot check for existing items: %w", err))
+		}
 		for _, item := range items {
 			if mapping.MatchesAttributes(&item, attrs) {
-				// Update existing item
+				// Update existing item with all attributes first
+				mapping.UpdateItemFromAttributes(&item, attrs)
+
+				// Then set password and label
 				password := string(decryptedValue)
 				item.Login.Password = &password
 				item.Name = label
 
-				req := bitwarden.CreateItemRequest{
-					Type:     bitwarden.ItemTypeLogin,
-					Name:     label,
-					FolderID: item.FolderID,
-					Login:    item.Login,
-					Fields:   item.Fields,
-				}
+				// Use ToUpdateRequest to preserve all fields
+				req := item.ToUpdateRequest()
 
 				updated, err := c.bwClient.UpdateItem(ctx, item.ID, req)
 				if err != nil {
@@ -227,6 +247,9 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 				if err != nil {
 					return NoPrompt, NoPrompt, dbus.MakeFailedError(err)
 				}
+
+				// Emit ItemChanged signal for updated item
+				EmitItemChanged(c.conn, c.path, dbusItem.Path())
 
 				return dbusItem.Path(), NoPrompt, nil
 			}
@@ -263,6 +286,9 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 		return NoPrompt, NoPrompt, dbus.MakeFailedError(err)
 	}
 
+	// Emit ItemCreated signal for new item
+	EmitItemCreated(c.conn, c.path, dbusItem.Path())
+
 	return dbusItem.Path(), NoPrompt, nil
 }
 
@@ -277,7 +303,7 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 
 	switch property {
 	case "Items":
-		// Return all item paths
+		// Return all item paths, ensuring each item is exported
 		ctx := context.Background()
 		items, err := c.bwClient.ListItems(ctx)
 		if err != nil {
@@ -287,7 +313,13 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 		paths := make([]dbus.ObjectPath, 0, len(items))
 		for _, item := range items {
 			if item.Type == bitwarden.ItemTypeLogin {
-				paths = append(paths, ItemPathFromID(item.ID))
+				// Ensure item is exported before returning its path
+				itemCopy := item
+				dbusItem, err := c.itemManager.GetOrCreateItem(&itemCopy, c)
+				if err != nil {
+					continue // Skip items that can't be exported
+				}
+				paths = append(paths, dbusItem.Path())
 			}
 		}
 		return dbus.MakeVariant(paths), nil
@@ -297,7 +329,11 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 
 	case "Locked":
 		ctx := context.Background()
-		locked, _ := c.bwClient.IsLocked(ctx)
+		// Default to locked=true on error (safe default)
+		locked, err := c.bwClient.IsLocked(ctx)
+		if err != nil {
+			locked = true
+		}
 		return dbus.MakeVariant(locked), nil
 
 	case "Created":
@@ -344,13 +380,28 @@ func (c *Collection) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error)
 	defer c.mu.RUnlock()
 
 	ctx := context.Background()
-	locked, _ := c.bwClient.IsLocked(ctx)
 
-	items, _ := c.bwClient.ListItems(ctx)
+	// Default to locked=true on error (safe default)
+	locked, err := c.bwClient.IsLocked(ctx)
+	if err != nil {
+		locked = true
+	}
+
+	// Return empty items list on error
+	items, err := c.bwClient.ListItems(ctx)
+	if err != nil {
+		items = nil
+	}
 	paths := make([]dbus.ObjectPath, 0, len(items))
 	for _, item := range items {
 		if item.Type == bitwarden.ItemTypeLogin {
-			paths = append(paths, ItemPathFromID(item.ID))
+			// Ensure item is exported before returning its path
+			itemCopy := item
+			dbusItem, err := c.itemManager.GetOrCreateItem(&itemCopy, c)
+			if err != nil {
+				continue // Skip items that can't be exported
+			}
+			paths = append(paths, dbusItem.Path())
 		}
 	}
 

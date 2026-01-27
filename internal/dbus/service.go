@@ -62,6 +62,22 @@ func (s *Service) Export() error {
 		return fmt.Errorf("failed to export introspection: %w", err)
 	}
 
+	// Export alias path for default collection
+	// This allows clients to access /org/freedesktop/secrets/aliases/default directly
+	aliasDefaultPath := dbus.ObjectPath(AliasPath + "default")
+	coll, _ := s.collectionManager.GetCollection(DefaultCollectionPath)
+	if coll != nil {
+		if err := s.conn.Export(coll, aliasDefaultPath, CollectionInterface); err != nil {
+			return fmt.Errorf("failed to export collection at alias path: %w", err)
+		}
+		if err := s.conn.Export(coll, aliasDefaultPath, PropertiesInterface); err != nil {
+			return fmt.Errorf("failed to export properties at alias path: %w", err)
+		}
+		if err := s.conn.Export(introspectable(CollectionIntrospectXML), aliasDefaultPath, "org.freedesktop.DBus.Introspectable"); err != nil {
+			return fmt.Errorf("failed to export introspection at alias path: %w", err)
+		}
+	}
+
 	// Request the bus name
 	reply, err := s.conn.RequestName(BusName, dbus.NameFlagDoNotQueue)
 	if err != nil {
@@ -118,12 +134,9 @@ func (s *Service) SearchItems(attributes map[string]string) ([]dbus.ObjectPath, 
 	}
 
 	if locked {
-		// Return empty unlocked, items in locked
-		items, err := s.searchItemsInternal(ctx, attributes)
-		if err != nil {
-			return nil, nil, dbus.MakeFailedError(err)
-		}
-		return nil, items, nil
+		// When locked, return the collection as "locked" so clients can unlock it
+		// We can't enumerate individual items, but clients can call Unlock on the collection
+		return nil, []dbus.ObjectPath{DefaultCollectionPath}, nil
 	}
 
 	// Return items in unlocked, empty locked

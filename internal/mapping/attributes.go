@@ -39,6 +39,18 @@ func ItemToAttributes(item *bitwarden.Item) map[string]string {
 			uri := item.Login.URIs[0].URI
 			attrs[AttrService] = uri
 			attrs[AttrDomain] = extractDomain(uri)
+
+			// Extract URI components for round-trip compatibility
+			protocol, port, path := extractURIComponents(uri)
+			if protocol != "" {
+				attrs[AttrProtocol] = protocol
+			}
+			if port != "" {
+				attrs[AttrPort] = port
+			}
+			if path != "" && path != "/" {
+				attrs[AttrPath] = path
+			}
 		}
 	}
 
@@ -74,6 +86,36 @@ func MatchesAttributes(item *bitwarden.Item, attrs map[string]string) bool {
 		case AttrService, AttrDomain, AttrServer:
 			// Match against URIs
 			if !matchesURI(item, value) {
+				return false
+			}
+
+		case AttrProtocol:
+			// Match protocol against URI scheme
+			if len(item.Login.URIs) == 0 {
+				return false
+			}
+			uri := item.Login.URIs[0].URI
+			if !strings.HasPrefix(strings.ToLower(uri), strings.ToLower(value)+"://") {
+				return false
+			}
+
+		case AttrPort:
+			// Match port against URI
+			if len(item.Login.URIs) == 0 {
+				return false
+			}
+			uri := item.Login.URIs[0].URI
+			if !matchesPort(uri, value) {
+				return false
+			}
+
+		case AttrPath:
+			// Match path against URI
+			if len(item.Login.URIs) == 0 {
+				return false
+			}
+			uri := item.Login.URIs[0].URI
+			if !matchesPath(uri, value) {
 				return false
 			}
 
@@ -142,6 +184,65 @@ func matchesField(item *bitwarden.Item, key, value string) bool {
 	return false
 }
 
+// matchesPort checks if a URI contains the given port
+func matchesPort(uri, port string) bool {
+	// Extract host:port portion from URI
+	u := uri
+	// Remove protocol
+	if idx := strings.Index(u, "://"); idx != -1 {
+		u = u[idx+3:]
+	}
+	// Remove path
+	if idx := strings.Index(u, "/"); idx != -1 {
+		u = u[:idx]
+	}
+	// Handle IPv6 addresses (e.g., [::1]:8080)
+	if strings.HasPrefix(u, "[") {
+		// IPv6 address - look for ]:port
+		if idx := strings.Index(u, "]:"); idx != -1 {
+			uriPort := u[idx+2:]
+			return uriPort == port
+		}
+		// No port after IPv6 address
+	} else if idx := strings.LastIndex(u, ":"); idx != -1 {
+		// IPv4 or hostname with port
+		uriPort := u[idx+1:]
+		return uriPort == port
+	}
+	// No port in URI - check for default ports
+	if strings.HasPrefix(strings.ToLower(uri), "https://") && port == "443" {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(uri), "http://") && port == "80" {
+		return true
+	}
+	return false
+}
+
+// matchesPath checks if a URI contains the given path (exact match per Secret Service spec)
+func matchesPath(uri, path string) bool {
+	// Extract path portion from URI
+	u := uri
+	// Remove protocol
+	if idx := strings.Index(u, "://"); idx != -1 {
+		u = u[idx+3:]
+	}
+	// Find path start
+	if idx := strings.Index(u, "/"); idx != -1 {
+		uriPath := u[idx:]
+		// Normalize paths for comparison
+		expectedPath := path
+		if !strings.HasPrefix(expectedPath, "/") {
+			expectedPath = "/" + expectedPath
+		}
+		// Exact match: paths must match exactly, or URI path must be a sub-path
+		// (e.g., expectedPath="/api" matches uriPath="/api" or "/api/v1", but not "/api2")
+		return uriPath == expectedPath || strings.HasPrefix(uriPath, expectedPath+"/")
+	}
+	// No path in URI - only match if expected path is empty or "/"
+	return path == "" || path == "/"
+}
+
 // extractDomain extracts the domain from a URL or returns the input if not a URL
 func extractDomain(uri string) string {
 	// Remove protocol
@@ -153,19 +254,92 @@ func extractDomain(uri string) string {
 		uri = uri[:idx]
 	}
 
-	// Remove port
-	if idx := strings.Index(uri, ":"); idx != -1 {
+	// Handle IPv6 addresses (e.g., [::1]:8080)
+	if strings.HasPrefix(uri, "[") {
+		// Find closing bracket
+		if idx := strings.Index(uri, "]"); idx != -1 {
+			// Return the bracketed IPv6 address without port
+			return strings.ToLower(uri[:idx+1])
+		}
+		// Malformed IPv6, return as-is
+		return strings.ToLower(uri)
+	}
+
+	// Remove port for non-IPv6 (use LastIndex to handle edge cases)
+	if idx := strings.LastIndex(uri, ":"); idx != -1 {
 		uri = uri[:idx]
 	}
 
 	return strings.ToLower(uri)
 }
 
+// extractURIComponents extracts protocol, port, and path from a URI
+func extractURIComponents(uri string) (protocol, port, path string) {
+	// Extract protocol
+	if idx := strings.Index(uri, "://"); idx != -1 {
+		protocol = uri[:idx]
+		uri = uri[idx+3:]
+	}
+
+	// Extract path (everything after first /)
+	// For IPv6, path comes after the closing bracket
+	if idx := strings.Index(uri, "/"); idx != -1 {
+		path = uri[idx:]
+		uri = uri[:idx]
+	}
+
+	// Extract port - handle IPv6 addresses (e.g., [::1]:8080)
+	if strings.HasPrefix(uri, "[") {
+		// IPv6 address - look for ]:port
+		if idx := strings.Index(uri, "]:"); idx != -1 {
+			port = uri[idx+2:]
+		}
+	} else if idx := strings.LastIndex(uri, ":"); idx != -1 {
+		// IPv4 or hostname with port
+		port = uri[idx+1:]
+	}
+
+	return protocol, port, path
+}
+
 // BuildURIFromAttributes constructs a URI from libsecret attributes
 func BuildURIFromAttributes(attrs map[string]string) string {
 	// Try service first
 	if service, ok := attrs[AttrService]; ok && service != "" {
-		return normalizeURI(service)
+		// If service already has a scheme, use as-is
+		if strings.Contains(service, "://") {
+			return service
+		}
+		// Otherwise, treat as hostname and build full URI with components
+		protocol := "https"
+		if p, ok := attrs[AttrProtocol]; ok && p != "" {
+			protocol = p
+		}
+		uri := protocol + "://" + service
+		// Only add port if service doesn't already contain a port
+		if port, ok := attrs[AttrPort]; ok && port != "" {
+			// Check if service already has a port (hostname:port pattern)
+			// Handle IPv6 (e.g., [::1]:8080) by checking after brackets
+			hasPort := false
+			if strings.HasPrefix(service, "[") {
+				// IPv6: check for port after closing bracket
+				if idx := strings.Index(service, "]:"); idx != -1 {
+					hasPort = true
+				}
+			} else if strings.Contains(service, ":") {
+				hasPort = true
+			}
+			if !hasPort {
+				uri += ":" + port
+			}
+		}
+		if path, ok := attrs[AttrPath]; ok && path != "" {
+			if !strings.HasPrefix(path, "/") {
+				uri += "/"
+			}
+			uri += path
+		}
+		return uri
 	}
 
 	// Try domain/server
@@ -204,14 +378,6 @@ func BuildURIFromAttributes(attrs map[string]string) string {
 	return uri
 }
 
-// normalizeURI ensures a URI has a protocol prefix
-func normalizeURI(uri string) string {
-	if !strings.Contains(uri, "://") {
-		return "https://" + uri
-	}
-	return uri
-}
-
 // GetUsername extracts username from attributes
 func GetUsername(attrs map[string]string) string {
 	if u, ok := attrs[AttrUsername]; ok {
@@ -221,4 +387,87 @@ func GetUsername(attrs map[string]string) string {
 		return u
 	}
 	return ""
+}
+
+// ReservedAttributes are system attributes that should not be stored as custom fields
+var ReservedAttributes = map[string]bool{
+	"label":    true,
+	AttrSchema: true,
+	"created":  true,
+	"modified": true,
+	"locked":   true,
+}
+
+// UpdateItemFromAttributes updates a Bitwarden item with D-Bus attributes.
+// It maps known attributes to their corresponding Bitwarden fields and stores
+// unknown attributes as custom fields.
+// Note: This merges attributes (adds/updates) rather than replacing.
+func UpdateItemFromAttributes(item *bitwarden.Item, attrs map[string]string) {
+	// Track which attributes we've handled to avoid duplicate URI processing
+	handledURI := false
+
+	// Handle username with explicit precedence: AttrUsername takes priority over AttrUser
+	if username, ok := attrs[AttrUsername]; ok {
+		if item.Login == nil {
+			item.Login = &bitwarden.Login{}
+		}
+		item.Login.Username = &username
+	} else if user, ok := attrs[AttrUser]; ok {
+		if item.Login == nil {
+			item.Login = &bitwarden.Login{}
+		}
+		item.Login.Username = &user
+	}
+
+	for key, value := range attrs {
+		switch key {
+		case AttrUsername, AttrUser:
+			// Already handled above with deterministic precedence
+			continue
+
+		case AttrService, AttrDomain, AttrServer:
+			// Only process URI once even if multiple URI-related attrs present
+			if !handledURI {
+				uri := BuildURIFromAttributes(attrs)
+				if uri != "" {
+					if item.Login == nil {
+						item.Login = &bitwarden.Login{}
+					}
+					if len(item.Login.URIs) > 0 {
+						item.Login.URIs[0].URI = uri
+					} else {
+						item.Login.URIs = []bitwarden.URI{{URI: uri}}
+					}
+				}
+				handledURI = true
+			}
+
+		case AttrProtocol, AttrPort, AttrPath:
+			// These are handled as part of URI building, skip individual processing
+			continue
+
+		default:
+			if ReservedAttributes[key] {
+				continue // Skip system attributes
+			}
+			updateOrAddField(item, key, value)
+		}
+	}
+}
+
+// updateOrAddField updates an existing custom field or adds a new one
+func updateOrAddField(item *bitwarden.Item, name, value string) {
+	// Find existing field with same name
+	for i, f := range item.Fields {
+		if f.Name == name {
+			item.Fields[i].Value = value
+			return
+		}
+	}
+	// Add new field
+	item.Fields = append(item.Fields, bitwarden.Field{
+		Name:  name,
+		Value: value,
+		Type:  0, // text
+	})
 }

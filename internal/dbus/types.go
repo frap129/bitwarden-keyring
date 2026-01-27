@@ -27,6 +27,11 @@ const (
 	ErrIsLocked     = "org.freedesktop.Secret.Error.IsLocked"
 	ErrNoSession    = "org.freedesktop.Secret.Error.NoSession"
 	ErrNoSuchObject = "org.freedesktop.Secret.Error.NoSuchObject"
+
+	// Property keys for D-Bus properties
+	PropItemLabel      = "org.freedesktop.Secret.Item.Label"
+	PropItemAttributes = "org.freedesktop.Secret.Item.Attributes"
+	PropCollLabel      = "org.freedesktop.Secret.Collection.Label"
 )
 
 // Secret represents a secret value as defined by the Secret Service API
