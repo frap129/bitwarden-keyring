@@ -224,11 +224,32 @@ SSH keys must be stored as dedicated SSH Key items in Bitwarden (not as secure n
 3. Paste your private key (and optionally public key)
 4. Save
 
+### Adding Keys via ssh-add
+
+You can also add keys directly from the command line using `ssh-add`:
+
+```bash
+# Add a key (will be stored in Bitwarden)
+ssh-add ~/.ssh/id_ed25519
+
+# List keys to verify
+ssh-add -l
+
+# Remove a specific key (will delete from Bitwarden)
+ssh-add -d ~/.ssh/id_ed25519.pub
+```
+
+**Important Notes:**
+- When you add a key via `ssh-add`, it creates a new SSH Key item in your Bitwarden vault
+- The private key is stored unencrypted in Bitwarden (encrypted at rest by Bitwarden's encryption)
+- Removing a key with `ssh-add -d` permanently deletes it from your Bitwarden vault
+
 ### Limitations
 
-- **Read-only**: Keys cannot be added/removed via `ssh-add` (use Bitwarden UI)
+- **No RemoveAll**: `ssh-add -D` (remove all keys) is not supported to prevent accidental deletion
+- **Options ignored**: `ssh-add -t` (lifetime) and `-c` (confirm) options are silently ignored
 - **Vault lock = Agent lock**: Locking the Bitwarden vault locks the agent
-- **Encrypted keys**: Private keys with passphrases are not currently supported
+- **Encrypted keys**: Private keys with passphrases must be unlocked before adding (ssh-add prompts for this)
 
 ### System Configuration
 

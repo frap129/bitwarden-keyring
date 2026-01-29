@@ -105,3 +105,48 @@ func TestItem_ToUpdateRequest_HandlesNilFields(t *testing.T) {
 		t.Errorf("Name not preserved: got %s", req.Name)
 	}
 }
+
+func TestItem_ToUpdateRequest_PreservesSSHKey(t *testing.T) {
+	item := &Item{
+		ID:       "ssh-item-id",
+		Type:     ItemTypeSSHKey,
+		Name:     "My SSH Key",
+		Favorite: true,
+		Reprompt: 0,
+		SSHKey: &SSHKey{
+			PrivateKey:     "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----",
+			PublicKey:      "ssh-ed25519 AAAA... comment",
+			KeyFingerprint: "SHA256:abcdefgh",
+		},
+	}
+
+	req := item.ToUpdateRequest()
+
+	// Verify SSH key fields are preserved
+	if req.Type != ItemTypeSSHKey {
+		t.Errorf("Type not preserved: got %v, want %v", req.Type, ItemTypeSSHKey)
+	}
+	if req.Name != "My SSH Key" {
+		t.Errorf("Name not preserved: got %s, want 'My SSH Key'", req.Name)
+	}
+	if req.Favorite != true {
+		t.Errorf("Favorite not preserved: got %v, want true", req.Favorite)
+	}
+	if req.SSHKey == nil {
+		t.Fatal("SSHKey not preserved: got nil")
+	}
+	if req.SSHKey.PrivateKey != item.SSHKey.PrivateKey {
+		t.Errorf("SSHKey.PrivateKey not preserved: got %s", req.SSHKey.PrivateKey)
+	}
+	if req.SSHKey.PublicKey != item.SSHKey.PublicKey {
+		t.Errorf("SSHKey.PublicKey not preserved: got %s", req.SSHKey.PublicKey)
+	}
+	if req.SSHKey.KeyFingerprint != item.SSHKey.KeyFingerprint {
+		t.Errorf("SSHKey.KeyFingerprint not preserved: got %s", req.SSHKey.KeyFingerprint)
+	}
+
+	// Verify Login is nil for SSH key items
+	if req.Login != nil {
+		t.Errorf("Login should be nil for SSH key items: got %v", req.Login)
+	}
+}

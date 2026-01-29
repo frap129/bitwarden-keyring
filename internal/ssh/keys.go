@@ -3,7 +3,10 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"encoding/pem"
 	"fmt"
+	"strings"
 
 	cryptossh "golang.org/x/crypto/ssh"
 
@@ -102,4 +105,23 @@ func FindSSHKeyByPublicKey(keys []*SSHKeyItem, pubKey cryptossh.PublicKey) (*SSH
 		}
 	}
 	return nil, false
+}
+
+// marshalPrivateKeyOpenSSH converts a crypto.PrivateKey to OpenSSH PEM format.
+// The comment is embedded in the key file.
+func marshalPrivateKeyOpenSSH(key crypto.PrivateKey, comment string) ([]byte, error) {
+	pemBlock, err := cryptossh.MarshalPrivateKey(key, comment)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal private key: %w", err)
+	}
+	return pem.EncodeToMemory(pemBlock), nil
+}
+
+// formatAuthorizedKey returns the public key in authorized_keys format with optional comment.
+func formatAuthorizedKey(pub cryptossh.PublicKey, comment string) string {
+	authKey := strings.TrimSpace(string(cryptossh.MarshalAuthorizedKey(pub)))
+	if comment != "" {
+		return authKey + " " + comment
+	}
+	return authKey
 }

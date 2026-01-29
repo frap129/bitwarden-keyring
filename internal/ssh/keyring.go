@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"fmt"
@@ -18,13 +19,14 @@ import (
 type BitwardenClient interface {
 	IsLocked(ctx context.Context) (bool, error)
 	ListItems(ctx context.Context) ([]bitwarden.Item, error)
+	CreateItem(ctx context.Context, req bitwarden.CreateItemRequest) (*bitwarden.Item, error)
+	DeleteItem(ctx context.Context, id string) error
 	Lock(ctx context.Context) error
 	Unlock(ctx context.Context, password string) (string, error)
 	SessionManager() *bitwarden.SessionManager
 }
 
 // Keyring implements the agent.Agent interface using Bitwarden as the key store.
-// It is read-only - keys cannot be added or removed via the SSH agent protocol.
 type Keyring struct {
 	client BitwardenClient
 	mu     sync.RWMutex
@@ -170,19 +172,159 @@ func (k *Keyring) SignWithFlags(key cryptossh.PublicKey, data []byte, flags agen
 	return sshKey.Signer.Sign(rand.Reader, data)
 }
 
-// Add is not supported - this is a read-only agent.
+// Add adds a key to the agent by creating an SSH key item in Bitwarden.
+// Note: The LifetimeSecs and ConfirmBeforeUse fields are ignored as Bitwarden
+// does not support these options.
 func (k *Keyring) Add(key agent.AddedKey) error {
-	return ErrReadOnly
+	if key.PrivateKey == nil {
+		return fmt.Errorf("private key is required")
+	}
+
+	ctx := context.Background()
+
+	// Check if vault is locked
+	locked, err := k.client.IsLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check vault status: %w", err)
+	}
+	if locked {
+		return ErrVaultLocked
+	}
+
+	// Create a signer from the private key to get the public key
+	signer, err := cryptossh.NewSignerFromKey(key.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("failed to create signer from key: %w", err)
+	}
+
+	// Check for duplicate by fingerprint
+	fingerprint := cryptossh.FingerprintSHA256(signer.PublicKey())
+
+	// Refresh keys and check for existing key with same fingerprint
+	if err := k.refreshKeys(ctx); err != nil {
+		return fmt.Errorf("failed to refresh keys: %w", err)
+	}
+
+	k.mu.RLock()
+	_, found := FindSSHKeyByPublicKey(k.keys, signer.PublicKey())
+	k.mu.RUnlock()
+
+	if found {
+		// Key already exists, return success (idempotent)
+		if k.debug {
+			log.Printf("SSH agent: key %s already exists, skipping", fingerprint)
+		}
+		return nil
+	}
+
+	// Marshal the private key to OpenSSH format
+	privateKeyPEM, err := marshalPrivateKeyOpenSSH(key.PrivateKey, key.Comment)
+	if err != nil {
+		return fmt.Errorf("failed to marshal private key: %w", err)
+	}
+
+	// Format the public key
+	publicKeyStr := formatAuthorizedKey(signer.PublicKey(), key.Comment)
+
+	// Determine the item name
+	name := key.Comment
+	if name == "" {
+		name = fingerprint
+	}
+
+	// Create the Bitwarden item
+	req := bitwarden.CreateItemRequest{
+		Type: bitwarden.ItemTypeSSHKey,
+		Name: name,
+		SSHKey: &bitwarden.SSHKey{
+			PrivateKey:     string(privateKeyPEM),
+			PublicKey:      publicKeyStr,
+			KeyFingerprint: fingerprint,
+		},
+	}
+
+	createdItem, err := k.client.CreateItem(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to create SSH key item: %w", err)
+	}
+
+	// Add to cache
+	k.mu.Lock()
+	k.keys = append(k.keys, &SSHKeyItem{
+		Item:   createdItem,
+		Signer: signer,
+	})
+	k.mu.Unlock()
+
+	if k.debug {
+		log.Printf("SSH agent: added key %s as item %s", fingerprint, createdItem.ID)
+	}
+
+	return nil
 }
 
-// Remove is not supported - this is a read-only agent.
+// Remove removes a key from the agent by deleting the SSH key item from Bitwarden.
 func (k *Keyring) Remove(key cryptossh.PublicKey) error {
-	return ErrReadOnly
+	if key == nil {
+		return fmt.Errorf("public key is required")
+	}
+
+	ctx := context.Background()
+
+	// Check if vault is locked
+	locked, err := k.client.IsLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check vault status: %w", err)
+	}
+	if locked {
+		return ErrVaultLocked
+	}
+
+	// Refresh keys from Bitwarden
+	if err := k.refreshKeys(ctx); err != nil {
+		return fmt.Errorf("failed to refresh keys: %w", err)
+	}
+
+	// Find the key in cache
+	k.mu.RLock()
+	sshKey, found := FindSSHKeyByPublicKey(k.keys, key)
+	k.mu.RUnlock()
+
+	if !found {
+		return ErrKeyNotFound
+	}
+
+	// Delete from Bitwarden
+	if err := k.client.DeleteItem(ctx, sshKey.Item.ID); err != nil {
+		return fmt.Errorf("failed to delete SSH key item: %w", err)
+	}
+
+	// Remove from cache
+	k.mu.Lock()
+	targetBlob := key.Marshal()
+	newKeys := make([]*SSHKeyItem, 0, len(k.keys)-1)
+	for _, cachedKey := range k.keys {
+		if cachedKey.Signer != nil {
+			keyBlob := cachedKey.Signer.PublicKey().Marshal()
+			if !bytes.Equal(keyBlob, targetBlob) {
+				newKeys = append(newKeys, cachedKey)
+			}
+		}
+	}
+	k.keys = newKeys
+	k.mu.Unlock()
+
+	if k.debug {
+		log.Printf("SSH agent: removed key %s (item %s)", cryptossh.FingerprintSHA256(key), sshKey.Item.ID)
+	}
+
+	return nil
 }
 
-// RemoveAll is not supported - this is a read-only agent.
+// RemoveAll is not supported to prevent accidental deletion of all SSH keys.
+// Use Remove to delete individual keys instead.
 func (k *Keyring) RemoveAll() error {
-	return ErrReadOnly
+	return ErrRemoveAllNotSupported
 }
 
 // Lock locks the Bitwarden vault, clearing the key cache.

@@ -1,7 +1,12 @@
 package ssh
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"strings"
 	"testing"
+
+	cryptossh "golang.org/x/crypto/ssh"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
@@ -190,5 +195,107 @@ func TestFindSSHKeyByPublicKey(t *testing.T) {
 	_, ok = FindSSHKeyByPublicKey([]*SSHKeyItem{}, signer.PublicKey())
 	if ok {
 		t.Error("FindSSHKeyByPublicKey() should not find key in empty list")
+	}
+}
+
+func TestMarshalPrivateKeyOpenSSH_RoundTrip(t *testing.T) {
+	// Generate a fresh ED25519 key pair
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+
+	comment := "test-comment"
+
+	// Marshal the key to OpenSSH format
+	pemBytes, err := marshalPrivateKeyOpenSSH(priv, comment)
+	if err != nil {
+		t.Fatalf("marshalPrivateKeyOpenSSH() error = %v", err)
+	}
+
+	// Verify it starts with the OpenSSH header
+	if !strings.HasPrefix(string(pemBytes), "-----BEGIN OPENSSH PRIVATE KEY-----") {
+		t.Errorf("marshalPrivateKeyOpenSSH() did not produce OpenSSH format: %s", string(pemBytes[:50]))
+	}
+
+	// Parse it back
+	signer, err := cryptossh.ParsePrivateKey(pemBytes)
+	if err != nil {
+		t.Fatalf("failed to parse marshaled key: %v", err)
+	}
+
+	// Create a signer from the original key to compare
+	origSigner, err := cryptossh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("failed to create signer from original key: %v", err)
+	}
+
+	// Verify the public keys match
+	origPubKey := origSigner.PublicKey()
+	parsedPubKey := signer.PublicKey()
+
+	if origPubKey.Type() != parsedPubKey.Type() {
+		t.Errorf("key types don't match: original %s, parsed %s", origPubKey.Type(), parsedPubKey.Type())
+	}
+
+	if string(origPubKey.Marshal()) != string(parsedPubKey.Marshal()) {
+		t.Error("public key bytes don't match after round-trip")
+	}
+}
+
+func TestFormatAuthorizedKey_WithComment(t *testing.T) {
+	// Generate a key
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+
+	signer, err := cryptossh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("failed to create signer: %v", err)
+	}
+
+	comment := "user@host"
+	result := formatAuthorizedKey(signer.PublicKey(), comment)
+
+	// Should start with ssh-ed25519
+	if !strings.HasPrefix(result, "ssh-ed25519 ") {
+		t.Errorf("formatAuthorizedKey() should start with 'ssh-ed25519 ': %s", result)
+	}
+
+	// Should end with the comment
+	if !strings.HasSuffix(result, " "+comment) {
+		t.Errorf("formatAuthorizedKey() should end with comment: %s", result)
+	}
+
+	// Should not have trailing newline
+	if strings.HasSuffix(result, "\n") {
+		t.Error("formatAuthorizedKey() should not have trailing newline")
+	}
+}
+
+func TestFormatAuthorizedKey_WithoutComment(t *testing.T) {
+	// Generate a key
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+
+	signer, err := cryptossh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("failed to create signer: %v", err)
+	}
+
+	result := formatAuthorizedKey(signer.PublicKey(), "")
+
+	// Should start with ssh-ed25519
+	if !strings.HasPrefix(result, "ssh-ed25519 ") {
+		t.Errorf("formatAuthorizedKey() should start with 'ssh-ed25519 ': %s", result)
+	}
+
+	// Should have exactly 2 space-separated parts (type and key)
+	parts := strings.Fields(result)
+	if len(parts) != 2 {
+		t.Errorf("formatAuthorizedKey() without comment should have 2 parts, got %d: %v", len(parts), parts)
 	}
 }

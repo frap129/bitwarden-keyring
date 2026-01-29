@@ -2,6 +2,7 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +11,18 @@ import (
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
+
+// VaultClient defines the interface for Bitwarden operations needed by the SSH agent.
+// This interface allows for easier testing by providing a way to mock the client.
+type VaultClient interface {
+	IsLocked(ctx context.Context) (bool, error)
+	ListItems(ctx context.Context) ([]bitwarden.Item, error)
+	CreateItem(ctx context.Context, req bitwarden.CreateItemRequest) (*bitwarden.Item, error)
+	DeleteItem(ctx context.Context, id string) error
+	Lock(ctx context.Context) error
+	Unlock(ctx context.Context, password string) (string, error)
+	SessionManager() *bitwarden.SessionManager
+}
 
 // DefaultSocketPath returns the default path for the SSH agent socket.
 // It uses $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock if XDG_RUNTIME_DIR is set,
@@ -51,12 +64,13 @@ type ListSSHKeysResult struct {
 
 // Common errors for the SSH agent.
 var (
-	ErrKeyNotFound    = errors.New("ssh key not found")
-	ErrVaultLocked    = errors.New("bitwarden vault is locked")
-	ErrReadOnly       = errors.New("ssh agent is read-only")
-	ErrInvalidKey     = errors.New("invalid ssh key format")
-	ErrSocketExists   = errors.New("socket already exists")
-	ErrNotSocket      = errors.New("path exists but is not a socket")
-	ErrNotSSHKeyItem  = errors.New("item is not an SSH key")
-	ErrAlreadyStarted = errors.New("server already started")
+	ErrKeyNotFound           = errors.New("ssh key not found")
+	ErrVaultLocked           = errors.New("bitwarden vault is locked")
+	ErrReadOnly              = errors.New("ssh agent is read-only")
+	ErrRemoveAllNotSupported = errors.New("ssh-add -D (remove all) is not supported")
+	ErrInvalidKey            = errors.New("invalid ssh key format")
+	ErrSocketExists          = errors.New("socket already exists")
+	ErrNotSocket             = errors.New("path exists but is not a socket")
+	ErrNotSSHKeyItem         = errors.New("item is not an SSH key")
+	ErrAlreadyStarted        = errors.New("server already started")
 )

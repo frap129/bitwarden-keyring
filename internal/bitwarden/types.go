@@ -148,6 +148,7 @@ type CreateItemRequest struct {
 	Notes          *string  `json:"notes,omitempty"`
 	Favorite       bool     `json:"favorite"`
 	Login          *Login   `json:"login,omitempty"`
+	SSHKey         *SSHKey  `json:"sshKey,omitempty"`
 	Fields         []Field  `json:"fields,omitempty"`
 	Reprompt       int      `json:"reprompt"`
 }
@@ -164,6 +165,7 @@ func (i *Item) ToUpdateRequest() CreateItemRequest {
 		Notes:          i.Notes,
 		Favorite:       i.Favorite,
 		Login:          i.Login,
+		SSHKey:         i.SSHKey,
 		Fields:         i.Fields,
 		Reprompt:       i.Reprompt,
 	}
