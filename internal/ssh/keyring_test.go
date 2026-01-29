@@ -71,13 +71,13 @@ func (tk *testableKeyring) refreshKeysFromMock(ctx context.Context) error {
 		return ErrVaultLocked
 	}
 
-	keys, err := ListSSHKeys(ctx, tk.mock)
+	result, err := ListSSHKeys(ctx, tk.mock)
 	if err != nil {
 		return err
 	}
 
 	tk.mu.Lock()
-	tk.keys = keys
+	tk.keys = result.Keys
 	tk.mu.Unlock()
 
 	return nil

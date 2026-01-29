@@ -1,10 +1,11 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
-	"golang.org/x/crypto/ssh"
+	cryptossh "golang.org/x/crypto/ssh"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
@@ -15,7 +16,7 @@ func IsSSHKeyItem(item *bitwarden.Item) bool {
 }
 
 // ParseSSHKey parses the private key from a Bitwarden SSH key item and returns a Signer.
-func ParseSSHKey(item *bitwarden.Item) (ssh.Signer, error) {
+func ParseSSHKey(item *bitwarden.Item) (cryptossh.Signer, error) {
 	if !IsSSHKeyItem(item) {
 		return nil, ErrNotSSHKeyItem
 	}
@@ -24,7 +25,7 @@ func ParseSSHKey(item *bitwarden.Item) (ssh.Signer, error) {
 		return nil, fmt.Errorf("%w: empty private key", ErrInvalidKey)
 	}
 
-	signer, err := ssh.ParsePrivateKey([]byte(item.SSHKey.PrivateKey))
+	signer, err := cryptossh.ParsePrivateKey([]byte(item.SSHKey.PrivateKey))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
 	}
@@ -33,7 +34,7 @@ func ParseSSHKey(item *bitwarden.Item) (ssh.Signer, error) {
 }
 
 // ParseSSHKeyWithPassphrase parses an encrypted private key using the provided passphrase.
-func ParseSSHKeyWithPassphrase(item *bitwarden.Item, passphrase []byte) (ssh.Signer, error) {
+func ParseSSHKeyWithPassphrase(item *bitwarden.Item, passphrase []byte) (cryptossh.Signer, error) {
 	if !IsSSHKeyItem(item) {
 		return nil, ErrNotSSHKeyItem
 	}
@@ -42,7 +43,7 @@ func ParseSSHKeyWithPassphrase(item *bitwarden.Item, passphrase []byte) (ssh.Sig
 		return nil, fmt.Errorf("%w: empty private key", ErrInvalidKey)
 	}
 
-	signer, err := ssh.ParsePrivateKeyWithPassphrase([]byte(item.SSHKey.PrivateKey), passphrase)
+	signer, err := cryptossh.ParsePrivateKeyWithPassphrase([]byte(item.SSHKey.PrivateKey), passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
 	}
@@ -56,14 +57,15 @@ type KeyLister interface {
 }
 
 // ListSSHKeys retrieves all SSH key items from the Bitwarden vault
-// and returns them with their parsed signers.
-func ListSSHKeys(ctx context.Context, client KeyLister) ([]*SSHKeyItem, error) {
+// and returns them with their parsed signers. Parse errors are collected
+// in the result struct so callers can decide how to handle them.
+func ListSSHKeys(ctx context.Context, client KeyLister) (*ListSSHKeysResult, error) {
 	items, err := client.ListItems(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list items: %w", err)
 	}
 
-	var sshKeys []*SSHKeyItem
+	result := &ListSSHKeysResult{}
 	for i := range items {
 		item := &items[i]
 		if !IsSSHKeyItem(item) {
@@ -72,27 +74,29 @@ func ListSSHKeys(ctx context.Context, client KeyLister) ([]*SSHKeyItem, error) {
 
 		signer, err := ParseSSHKey(item)
 		if err != nil {
-			// Skip keys that fail to parse but log them
-			// In production, we might want to handle this differently
+			result.Errors = append(result.Errors, ParseError{
+				ItemName: item.Name,
+				Err:      err,
+			})
 			continue
 		}
 
-		sshKeys = append(sshKeys, &SSHKeyItem{
+		result.Keys = append(result.Keys, &SSHKeyItem{
 			Item:   item,
 			Signer: signer,
 		})
 	}
 
-	return sshKeys, nil
+	return result, nil
 }
 
 // FindSSHKeyByPublicKey searches for an SSH key item that matches the given public key.
-func FindSSHKeyByPublicKey(keys []*SSHKeyItem, pubKey ssh.PublicKey) (*SSHKeyItem, bool) {
+func FindSSHKeyByPublicKey(keys []*SSHKeyItem, pubKey cryptossh.PublicKey) (*SSHKeyItem, bool) {
 	targetBlob := pubKey.Marshal()
 	for _, key := range keys {
 		if key.Signer != nil {
 			keyBlob := key.Signer.PublicKey().Marshal()
-			if string(keyBlob) == string(targetBlob) {
+			if bytes.Equal(keyBlob, targetBlob) {
 				return key, true
 			}
 		}

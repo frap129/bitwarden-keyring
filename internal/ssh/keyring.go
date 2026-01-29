@@ -4,38 +4,62 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log"
 	"sync"
 
-	"golang.org/x/crypto/ssh"
+	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
 
+// BitwardenClient defines the interface for Bitwarden operations needed by the Keyring.
+// This interface allows for easier testing by providing a way to mock the client.
+type BitwardenClient interface {
+	IsLocked(ctx context.Context) (bool, error)
+	ListItems(ctx context.Context) ([]bitwarden.Item, error)
+	Lock(ctx context.Context) error
+	Unlock(ctx context.Context, password string) (string, error)
+	SessionManager() *bitwarden.SessionManager
+}
+
 // Keyring implements the agent.Agent interface using Bitwarden as the key store.
 // It is read-only - keys cannot be added or removed via the SSH agent protocol.
 type Keyring struct {
-	client *bitwarden.Client
+	client BitwardenClient
 	mu     sync.RWMutex
 	keys   []*SSHKeyItem // cached keys
+	debug  bool          // enable debug logging
 }
 
 // NewKeyring creates a new Keyring backed by the given Bitwarden client.
-func NewKeyring(client *bitwarden.Client) *Keyring {
+func NewKeyring(client BitwardenClient) *Keyring {
 	return &Keyring{
 		client: client,
 	}
 }
 
+// SetDebug enables or disables debug logging.
+func (k *Keyring) SetDebug(debug bool) {
+	k.debug = debug
+}
+
 // refreshKeys reloads the SSH keys from Bitwarden.
 func (k *Keyring) refreshKeys(ctx context.Context) error {
-	keys, err := ListSSHKeys(ctx, k.client)
+	result, err := ListSSHKeys(ctx, k.client)
 	if err != nil {
 		return err
 	}
 
+	// Log parse errors in debug mode
+	if k.debug && len(result.Errors) > 0 {
+		for _, parseErr := range result.Errors {
+			log.Printf("SSH agent: failed to parse key %q: %v", parseErr.ItemName, parseErr.Err)
+		}
+	}
+
 	k.mu.Lock()
-	k.keys = keys
+	k.keys = result.Keys
 	k.mu.Unlock()
 
 	return nil
@@ -80,12 +104,12 @@ func (k *Keyring) List() ([]*agent.Key, error) {
 
 // Sign has the agent sign the data using a protocol 2 key as defined
 // in [PROTOCOL.agent] section 2.6.2.
-func (k *Keyring) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
+func (k *Keyring) Sign(key cryptossh.PublicKey, data []byte) (*cryptossh.Signature, error) {
 	return k.SignWithFlags(key, data, 0)
 }
 
 // SignWithFlags signs data with the specified flags.
-func (k *Keyring) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
+func (k *Keyring) SignWithFlags(key cryptossh.PublicKey, data []byte, flags agent.SignatureFlags) (*cryptossh.Signature, error) {
 	ctx := context.Background()
 
 	// Check if vault is locked
@@ -112,24 +136,33 @@ func (k *Keyring) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 	sshKey, found := FindSSHKeyByPublicKey(k.keys, key)
 	k.mu.RUnlock()
 
+	// If not found, try refreshing once and retry
 	if !found {
-		return nil, ErrKeyNotFound
+		if err := k.refreshKeys(ctx); err != nil {
+			return nil, fmt.Errorf("failed to refresh keys: %w", err)
+		}
+		k.mu.RLock()
+		sshKey, found = FindSSHKeyByPublicKey(k.keys, key)
+		k.mu.RUnlock()
+		if !found {
+			return nil, ErrKeyNotFound
+		}
 	}
 
 	// Handle signature algorithm based on flags
 	var algo string
 	switch {
 	case flags&agent.SignatureFlagRsaSha256 != 0:
-		algo = ssh.KeyAlgoRSASHA256
+		algo = cryptossh.KeyAlgoRSASHA256
 	case flags&agent.SignatureFlagRsaSha512 != 0:
-		algo = ssh.KeyAlgoRSASHA512
+		algo = cryptossh.KeyAlgoRSASHA512
 	default:
 		algo = ""
 	}
 
 	// Use AlgorithmSigner if available and algorithm is specified
 	if algo != "" {
-		if algSigner, ok := sshKey.Signer.(ssh.AlgorithmSigner); ok {
+		if algSigner, ok := sshKey.Signer.(cryptossh.AlgorithmSigner); ok {
 			return algSigner.SignWithAlgorithm(rand.Reader, data, algo)
 		}
 	}
@@ -143,7 +176,7 @@ func (k *Keyring) Add(key agent.AddedKey) error {
 }
 
 // Remove is not supported - this is a read-only agent.
-func (k *Keyring) Remove(key ssh.PublicKey) error {
+func (k *Keyring) Remove(key cryptossh.PublicKey) error {
 	return ErrReadOnly
 }
 
@@ -152,7 +185,11 @@ func (k *Keyring) RemoveAll() error {
 	return ErrReadOnly
 }
 
-// Lock locks the Bitwarden vault.
+// Lock locks the Bitwarden vault, clearing the key cache.
+//
+// Note: The passphrase parameter is ignored. This agent implements vault-level
+// locking rather than passphrase-based agent locking as used by ssh-agent.
+// When the Bitwarden vault is locked, the agent cannot access any keys.
 func (k *Keyring) Lock(passphrase []byte) error {
 	ctx := context.Background()
 	if err := k.client.Lock(ctx); err != nil {
@@ -166,9 +203,12 @@ func (k *Keyring) Lock(passphrase []byte) error {
 	return nil
 }
 
-// Unlock unlocks the Bitwarden vault.
-// Note: The passphrase parameter is ignored; Bitwarden uses its own unlock mechanism
-// via the SessionManager which prompts for the master password.
+// Unlock unlocks the Bitwarden vault and refreshes the key cache.
+//
+// Note: The passphrase parameter is ignored. This agent uses Bitwarden's
+// authentication mechanism instead. The SessionManager will prompt for the
+// master password via the configured prompt client (e.g., Noctalia).
+// This differs from ssh-agent's passphrase-based locking.
 func (k *Keyring) Unlock(passphrase []byte) error {
 	ctx := context.Background()
 
@@ -188,7 +228,7 @@ func (k *Keyring) Unlock(passphrase []byte) error {
 }
 
 // Signers returns signers for all available keys.
-func (k *Keyring) Signers() ([]ssh.Signer, error) {
+func (k *Keyring) Signers() ([]cryptossh.Signer, error) {
 	ctx := context.Background()
 
 	// Check if vault is locked
@@ -208,7 +248,7 @@ func (k *Keyring) Signers() ([]ssh.Signer, error) {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
 
-	var signers []ssh.Signer
+	var signers []cryptossh.Signer
 	for _, key := range k.keys {
 		if key.Signer != nil {
 			signers = append(signers, key.Signer)

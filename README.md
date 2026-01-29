@@ -193,6 +193,76 @@ systemctl --user daemon-reload
 
 When `--noctalia` is set but the agent is unavailable, bitwarden-keyring falls back to standard prompts (zenity, kdialog, rofi, dmenu, systemd-ask-password).
 
+## SSH Agent
+
+bitwarden-keyring can act as an SSH agent, serving keys stored in your Bitwarden vault.
+
+### Enable SSH Agent
+
+Start bitwarden-keyring with the `--ssh-agent` flag:
+
+```bash
+bitwarden-keyring --ssh-agent
+```
+
+### Verify It Works
+
+```bash
+# List available keys
+ssh-add -l
+
+# Test connection
+ssh -T git@github.com
+```
+
+### Storing SSH Keys in Bitwarden
+
+SSH keys must be stored as dedicated SSH Key items in Bitwarden (not as secure notes or attachments):
+
+1. Open Bitwarden web vault or desktop app
+2. Create new item -> Select "SSH Key" type
+3. Paste your private key (and optionally public key)
+4. Save
+
+### Limitations
+
+- **Read-only**: Keys cannot be added/removed via `ssh-add` (use Bitwarden UI)
+- **Vault lock = Agent lock**: Locking the Bitwarden vault locks the agent
+- **Encrypted keys**: Private keys with passphrases are not currently supported
+
+### System Configuration
+
+To make the SSH agent available system-wide, create an environment.d file:
+
+```bash
+# For system-wide (all users)
+sudo tee /etc/environment.d/50-bitwarden-ssh-agent.conf << 'EOF'
+SSH_AUTH_SOCK=${XDG_RUNTIME_DIR}/bitwarden-keyring/ssh.sock
+EOF
+
+# Or for current user only
+mkdir -p ~/.config/environment.d
+cat > ~/.config/environment.d/50-bitwarden-ssh-agent.conf << 'EOF'
+SSH_AUTH_SOCK=${XDG_RUNTIME_DIR}/bitwarden-keyring/ssh.sock
+EOF
+```
+
+Log out and back in for the change to take effect.
+
+### Enabling SSH Agent for Systemd Service
+
+Create a systemd override:
+
+```bash
+mkdir -p ~/.config/systemd/user/bitwarden-keyring.service.d/
+cat > ~/.config/systemd/user/bitwarden-keyring.service.d/ssh-agent.conf << 'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/bitwarden-keyring --ssh-agent
+EOF
+systemctl --user daemon-reload
+```
+
 ## Command-Line Options
 
 | Flag                 | Default | Description                    |
@@ -202,6 +272,8 @@ When `--noctalia` is set but the agent is unavailable, bitwarden-keyring falls b
 | `--noctalia`         | false   | Enable Noctalia UI integration |
 | `--noctalia-socket`  | (auto)  | Custom Noctalia socket path    |
 | `--noctalia-timeout` | 120s    | Noctalia prompt timeout        |
+| `--ssh-agent`        | false   | Enable SSH agent               |
+| `--ssh-socket`       | (auto)  | Custom SSH agent socket path   |
 
 ## License
 
