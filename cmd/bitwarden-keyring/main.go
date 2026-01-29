@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 	secretdbus "github.com/joe/bitwarden-keyring/internal/dbus"
+	"github.com/joe/bitwarden-keyring/internal/ssh"
 )
 
 var (
@@ -22,7 +24,9 @@ var (
 	noctaliaFlag    = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
 	noctaliaSocket  = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-polkit-agent.sock)")
 	noctaliaTimeout = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
-	version         = "0.3.0"
+	sshAgent        = flag.Bool("ssh-agent", false, "Enable SSH agent")
+	sshSocket       = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
+	version         = "0.4.0"
 )
 
 func main() {
@@ -91,6 +95,24 @@ func main() {
 	log.Printf("Secret Service exported at %s", secretdbus.BusName)
 	log.Printf("Ready to serve secrets from Bitwarden vault")
 
+	// Start SSH agent if enabled
+	var sshServer *ssh.Server
+	if *sshAgent {
+		socketPath := *sshSocket
+		if socketPath == "" {
+			socketPath = ssh.DefaultSocketPath()
+		}
+
+		sshServer = ssh.NewServer(socketPath, bwClient)
+		sshServer.SetDebug(*debug)
+
+		if err := sshServer.Start(ctx); err != nil {
+			log.Fatalf("Failed to start SSH agent: %v", err)
+		}
+		log.Printf("SSH agent listening on %s", socketPath)
+		log.Printf("Set SSH_AUTH_SOCK=%s to use", socketPath)
+	}
+
 	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -98,6 +120,13 @@ func main() {
 	<-sigChan
 	fmt.Println()
 	log.Printf("Shutting down...")
+
+	// Stop SSH agent
+	if sshServer != nil {
+		if err := sshServer.Stop(); err != nil {
+			log.Printf("Warning: Failed to stop SSH agent: %v", err)
+		}
+	}
 
 	// Stop bw serve
 	if err := bwClient.Stop(); err != nil {

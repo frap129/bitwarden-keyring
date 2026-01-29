@@ -10,6 +10,7 @@ const (
 	ItemTypeSecureNote ItemType = 2
 	ItemTypeCard       ItemType = 3
 	ItemTypeIdentity   ItemType = 4
+	ItemTypeSSHKey     ItemType = 5
 )
 
 // Item represents a Bitwarden vault item
@@ -25,6 +26,7 @@ type Item struct {
 	SecureNote     *SecureNote `json:"secureNote,omitempty"`
 	Card           *Card       `json:"card,omitempty"`
 	Identity       *Identity   `json:"identity,omitempty"`
+	SSHKey         *SSHKey     `json:"sshKey,omitempty"`
 	Fields         []Field     `json:"fields,omitempty"`
 	Reprompt       int         `json:"reprompt"`
 	RevisionDate   time.Time   `json:"revisionDate"`
@@ -70,6 +72,13 @@ type Identity struct {
 	Email      *string `json:"email"`
 	Phone      *string `json:"phone"`
 	Company    *string `json:"company"`
+}
+
+// SSHKey represents an SSH key item
+type SSHKey struct {
+	PrivateKey     string `json:"privateKey"`     // OpenSSH or PKCS#8 format
+	PublicKey      string `json:"publicKey"`      // OpenSSH format
+	KeyFingerprint string `json:"keyFingerprint"` // SHA256 fingerprint
 }
 
 // Field represents a custom field on an item
