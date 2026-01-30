@@ -2,7 +2,9 @@ package dbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 
@@ -133,6 +135,18 @@ func (p *Prompt) doUnlock() {
 	// We don't need the result, just the unlock side-effect
 	_, err := p.bwClient.ListItems(ctx)
 	if err != nil {
+		// Log the error for debugging (D-Bus signal can't carry error details)
+		if errors.Is(err, bitwarden.ErrUserCancelled) {
+			log.Printf("Prompt unlock dismissed by user")
+		} else {
+			log.Printf("Prompt unlock failed: %v", err)
+		}
+
+		// Mark prompt done even on failure to avoid repeated completion
+		p.mu.Lock()
+		p.done = true
+		p.mu.Unlock()
+
 		p.emitCompleted(true, nil) // Dismissed/failed
 		return
 	}

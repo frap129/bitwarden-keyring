@@ -2,10 +2,12 @@ package dbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/godbus/dbus/v5"
+
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 	"github.com/joe/bitwarden-keyring/internal/mapping"
 )
@@ -226,14 +228,12 @@ func (s *Service) GetSecrets(items []dbus.ObjectPath, session dbus.ObjectPath) (
 
 	ctx := context.Background()
 
-	// Check if locked
-	locked, err := s.bwClient.IsLocked(ctx)
-	if err != nil {
+	// Trigger auto-unlock if needed
+	if err := s.bwClient.EnsureUnlocked(ctx); err != nil {
+		if errors.Is(err, bitwarden.ErrUserCancelled) || errors.Is(err, bitwarden.ErrVaultLocked) {
+			return nil, &dbus.Error{Name: ErrIsLocked, Body: []interface{}{"Vault is locked"}}
+		}
 		return nil, dbus.MakeFailedError(err)
-	}
-
-	if locked {
-		return nil, &dbus.Error{Name: ErrIsLocked, Body: []interface{}{"Vault is locked"}}
 	}
 
 	secrets := make(map[dbus.ObjectPath]Secret)

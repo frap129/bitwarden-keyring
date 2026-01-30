@@ -1,0 +1,592 @@
+package bitwarden
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type mockPrompter struct {
+	password   string
+	err        error
+	callCount  atomic.Int32
+	onlyOnce   bool // If true, returns error on subsequent calls
+	onceCalled atomic.Bool
+}
+
+func (m *mockPrompter) PromptForPassword() (string, error) {
+	m.callCount.Add(1)
+	if m.onlyOnce {
+		if m.onceCalled.Load() {
+			return "", errors.New("prompt called more than once")
+		}
+		m.onceCalled.Store(true)
+	}
+
+	return m.password, m.err
+}
+
+type blockingPrompter struct {
+	entered   chan struct{}
+	passwordC chan string
+	err       error
+	callCount atomic.Int32
+	once      atomic.Bool
+}
+
+func (p *blockingPrompter) PromptForPassword() (string, error) {
+	p.callCount.Add(1)
+	if p.once.Load() {
+		return "", errors.New("prompt called more than once")
+	}
+	p.once.Store(true)
+	close(p.entered)
+	password := <-p.passwordC
+	return password, p.err
+}
+
+// gatingErrCtx blocks on the first Err() call until allowed.
+// This lets tests coordinate exactly when the pre-lock ctx.Err() checkpoint returns.
+type gatingErrCtx struct {
+	context.Context
+	firstCalled      chan struct{}
+	allowFirstReturn chan struct{}
+	errCalls         atomic.Int32
+}
+
+func (c *gatingErrCtx) Err() error {
+	if c.errCalls.Add(1) == 1 {
+		close(c.firstCalled)
+		<-c.allowFirstReturn
+	}
+	return c.Context.Err()
+}
+
+// blockingErrCtx blocks every Err() call until gate is closed.
+// Useful to deterministically test that cancellation is checked at an explicit ctx.Err checkpoint.
+type blockingErrCtx struct {
+	context.Context
+	called chan struct{}
+	gate   chan struct{}
+}
+
+func (c *blockingErrCtx) Err() error {
+	select {
+	case <-c.called:
+		// already signaled
+	default:
+		close(c.called)
+	}
+	<-c.gate
+	return c.Context.Err()
+}
+
+// clientWithPrompter returns a test client with a mock prompter injected
+func clientWithPrompter(ts *httptest.Server, prompter passwordPrompter, autoUnlock bool) *Client {
+	c := &Client{
+		baseURL:    ts.URL,
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		session:    &SessionManager{},
+	}
+	c.autoUnlock.Store(autoUnlock)
+	c.prompter = prompter
+	return c
+}
+
+func TestEnsureUnlocked_AlreadyUnlocked(t *testing.T) {
+	var callCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// Return unlocked status
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"unlocked"}}}`))
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{}
+	c := clientWithPrompter(ts, prompter, true)
+
+	err := c.ensureUnlocked(context.Background())
+	if err != nil {
+		t.Fatalf("ensureUnlocked() error = %v, want nil", err)
+	}
+
+	// Verify IsLocked was called but prompter was not
+	if callCount != 1 {
+		t.Errorf("IsLocked called %d times, want 1", callCount)
+	}
+	if prompter.callCount.Load() != 0 {
+		t.Errorf("Prompter called %d times, want 0", prompter.callCount.Load())
+	}
+}
+
+func TestEnsureUnlocked_AutoUnlockDisabled_ReturnsErrVaultLocked(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Return locked status
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{}
+	c := clientWithPrompter(ts, prompter, false) // autoUnlock disabled
+
+	err := c.ensureUnlocked(context.Background())
+	if !errors.Is(err, ErrVaultLocked) {
+		t.Fatalf("ensureUnlocked() error = %v, want ErrVaultLocked", err)
+	}
+
+	// Verify prompter was not called when autoUnlock is disabled
+	if prompter.callCount.Load() != 0 {
+		t.Errorf("Prompter called %d times, want 0", prompter.callCount.Load())
+	}
+}
+
+func TestEnsureUnlocked_UnlocksSuccessfully(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var isLockedCalls, unlockCalls int
+	var unlockBody string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			isLockedCalls++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			unlockCalls++
+			if r.Method != http.MethodPost {
+				t.Fatalf("/unlock method = %s, want POST", r.Method)
+			}
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read /unlock body: %v", err)
+			}
+			unlockBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{password: "test-password"}
+	c := clientWithPrompter(ts, prompter, true)
+
+	err := c.ensureUnlocked(context.Background())
+	if err != nil {
+		t.Fatalf("ensureUnlocked() error = %v, want nil", err)
+	}
+
+	// Verify IsLocked was called (first check)
+	if isLockedCalls != 2 { // Once for quick check, once after lock
+		t.Errorf("IsLocked called %d times, want 2", isLockedCalls)
+	}
+	// Verify prompter was called once
+	if prompter.callCount.Load() != 1 {
+		t.Errorf("Prompter called %d times, want 1", prompter.callCount.Load())
+	}
+	// Verify unlock was called
+	if unlockCalls != 1 {
+		t.Errorf("Unlock called %d times, want 1", unlockCalls)
+	}
+	if !strings.Contains(unlockBody, `"password":"test-password"`) {
+		t.Fatalf("/unlock body %q missing password", unlockBody)
+	}
+	if got := c.session.GetSession(); got != "test-token" {
+		t.Fatalf("session token = %q, want %q", got, "test-token")
+	}
+}
+
+func TestEnsureUnlocked_UserCancellation(t *testing.T) {
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/unlock" {
+			atomic.AddInt32(&unlockCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{err: ErrUserCancelled}
+	c := clientWithPrompter(ts, prompter, true)
+
+	err := c.ensureUnlocked(context.Background())
+	if !errors.Is(err, ErrUserCancelled) {
+		t.Fatalf("ensureUnlocked() error = %v, want ErrUserCancelled", err)
+	}
+	if prompter.callCount.Load() != 1 {
+		t.Fatalf("prompter calls = %d, want 1", prompter.callCount.Load())
+	}
+	if atomic.LoadInt32(&unlockCalls) != 0 {
+		t.Fatalf("/unlock called %d times, want 0", unlockCalls)
+	}
+}
+
+func TestEnsureUnlocked_ConcurrentCalls_OnlyOnePrompt(t *testing.T) {
+	var isLockedCalls, unlockCalls int32
+	var unlocked atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			atomic.AddInt32(&isLockedCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			if unlocked.Load() {
+				w.Write([]byte(`{"success":true,"data":{"template":{"status":"unlocked"}}}`))
+			} else {
+				w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+			}
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			unlocked.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	// Use a prompter that returns successfully and counts calls
+	prompter := &mockPrompter{
+		password: "test-password",
+		onlyOnce: true, // Will error if called more than once
+	}
+
+	c := clientWithPrompter(ts, prompter, true)
+
+	// Start multiple concurrent calls
+	var wg sync.WaitGroup
+	results := make([]error, 5)
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx] = c.ensureUnlocked(context.Background())
+		}(i)
+	}
+
+	// Wait for all goroutines
+	wg.Wait()
+
+	// Verify all calls succeeded
+	for i, err := range results {
+		if err != nil {
+			t.Errorf("Call %d failed: %v", i, err)
+		}
+	}
+
+	// Verify only one prompt and one unlock (double-check locking should prevent multiple unlocks)
+	if prompter.callCount.Load() != 1 {
+		t.Errorf("Prompter called %d times, want 1", prompter.callCount.Load())
+	}
+	if atomic.LoadInt32(&unlockCalls) != 1 {
+		t.Errorf("Unlock called %d times, want 1", unlockCalls)
+	}
+}
+
+func TestEnsureUnlocked_ContextCancelled_BeforeLock(t *testing.T) {
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/unlock" {
+			atomic.AddInt32(&unlockCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{}
+	c := clientWithPrompter(ts, prompter, true)
+
+	base, cancel := context.WithCancel(context.Background())
+	called := make(chan struct{})
+	gate := make(chan struct{})
+	ctx := &blockingErrCtx{Context: base, called: called, gate: gate}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.ensureUnlocked(ctx)
+	}()
+
+	// Wait until ensureUnlocked reaches the explicit ctx.Err() checkpoint.
+	<-called
+	// Cancel while ensureUnlocked is blocked inside Err().
+	cancel()
+	close(gate)
+
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ensureUnlocked() error = %v, want context.Canceled", err)
+	}
+
+	// Verify prompter was not called
+	if prompter.callCount.Load() != 0 {
+		t.Errorf("Prompter called %d times, want 0", prompter.callCount.Load())
+	}
+	if atomic.LoadInt32(&unlockCalls) != 0 {
+		t.Fatalf("/unlock called %d times, want 0", unlockCalls)
+	}
+}
+
+func TestEnsureUnlocked_ContextCancelled_AfterLock(t *testing.T) {
+	var statusCalls int32
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			atomic.AddInt32(&statusCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{}
+	c := clientWithPrompter(ts, prompter, true)
+
+	// Force ensureUnlocked to block on unlockMu.Lock().
+	c.unlockMu.Lock()
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			c.unlockMu.Unlock()
+		}
+	})
+
+	base, cancel := context.WithCancel(context.Background())
+	ctx := &gatingErrCtx{
+		Context:          base,
+		firstCalled:      make(chan struct{}),
+		allowFirstReturn: make(chan struct{}),
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.ensureUnlocked(ctx)
+	}()
+
+	// Wait for checkpoint A to be reached, then allow it to return nil.
+	<-ctx.firstCalled
+	close(ctx.allowFirstReturn)
+
+	// Now cancel while the goroutine is blocked waiting for unlockMu.
+	cancel()
+
+	// Release unlockMu so the goroutine can acquire it and observe cancellation at checkpoint B.
+	c.unlockMu.Unlock()
+	locked = false
+	err := <-done
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ensureUnlocked() error = %v, want context.Canceled", err)
+	}
+	if prompter.callCount.Load() != 0 {
+		t.Fatalf("prompter calls = %d, want 0", prompter.callCount.Load())
+	}
+	if atomic.LoadInt32(&unlockCalls) != 0 {
+		t.Fatalf("/unlock called %d times, want 0", unlockCalls)
+	}
+	// Only the quick IsLocked should have run; the post-lock re-check must not run because we exit at checkpoint B.
+	if atomic.LoadInt32(&statusCalls) != 1 {
+		t.Fatalf("/status calls = %d, want 1", statusCalls)
+	}
+}
+
+func TestWithAutoUnlock_Success(t *testing.T) {
+	var statusCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/status" {
+			atomic.AddInt32(&statusCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"unlocked"}}}`))
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{}
+	c := clientWithPrompter(ts, prompter, true)
+
+	var called bool
+	err := c.withAutoUnlock(context.Background(), func() error {
+		called = true
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("withAutoUnlock() error = %v", err)
+	}
+	if !called {
+		t.Error("Inner function was not called")
+	}
+	if atomic.LoadInt32(&statusCalls) != 1 {
+		t.Fatalf("/status calls = %d, want 1", statusCalls)
+	}
+	if prompter.callCount.Load() != 0 {
+		t.Fatalf("prompter calls = %d, want 0", prompter.callCount.Load())
+	}
+}
+
+func TestWithAutoUnlock_PropogatesError(t *testing.T) {
+	var statusCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/status" {
+			atomic.AddInt32(&statusCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"unlocked"}}}`))
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{}
+	c := clientWithPrompter(ts, prompter, true)
+
+	innerErr := errors.New("inner error")
+	err := c.withAutoUnlock(context.Background(), func() error {
+		return innerErr
+	})
+
+	if !errors.Is(err, innerErr) {
+		t.Fatalf("withAutoUnlock() error = %v, want %v", err, innerErr)
+	}
+	if atomic.LoadInt32(&statusCalls) != 1 {
+		t.Fatalf("/status calls = %d, want 1", statusCalls)
+	}
+}
+
+func TestSetAutoUnlock_TogglesBehavior(t *testing.T) {
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &mockPrompter{password: "pw"}
+	c := clientWithPrompter(ts, prompter, true)
+
+	c.SetAutoUnlock(false)
+	err := c.ensureUnlocked(context.Background())
+	if !errors.Is(err, ErrVaultLocked) {
+		t.Fatalf("ensureUnlocked() error = %v, want ErrVaultLocked", err)
+	}
+	if prompter.callCount.Load() != 0 {
+		t.Fatalf("prompter calls = %d, want 0", prompter.callCount.Load())
+	}
+	if atomic.LoadInt32(&unlockCalls) != 0 {
+		t.Fatalf("/unlock calls = %d, want 0", unlockCalls)
+	}
+
+	c.SetAutoUnlock(true)
+	err = c.ensureUnlocked(context.Background())
+	if err != nil {
+		t.Fatalf("ensureUnlocked() error = %v, want nil", err)
+	}
+	if prompter.callCount.Load() != 1 {
+		t.Fatalf("prompter calls = %d, want 1", prompter.callCount.Load())
+	}
+	if atomic.LoadInt32(&unlockCalls) != 1 {
+		t.Fatalf("/unlock calls = %d, want 1", unlockCalls)
+	}
+}
+
+func TestWithAutoUnlock_DoesNotCallFnOnEnsureError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+	}))
+	defer ts.Close()
+
+	c := clientWithPrompter(ts, &mockPrompter{}, false)
+	var called bool
+	err := c.withAutoUnlock(context.Background(), func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, ErrVaultLocked) {
+		t.Fatalf("withAutoUnlock() error = %v, want ErrVaultLocked", err)
+	}
+	if called {
+		t.Fatal("fn was called, want not called")
+	}
+}
+
+func TestEnsureUnlocked_RecheckAfterLockAvoidsPrompt(t *testing.T) {
+	var unlockCalls int32
+	var statusCalls int32
+	var unlocked atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			atomic.AddInt32(&statusCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			if unlocked.Load() {
+				w.Write([]byte(`{"success":true,"data":{"template":{"status":"unlocked"}}}`))
+			} else {
+				w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+			}
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			unlocked.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	block := &blockingPrompter{
+		entered:   make(chan struct{}),
+		passwordC: make(chan string, 1),
+	}
+
+	c := clientWithPrompter(ts, block, true)
+
+	// Goroutine A will enter the prompt while holding unlockMu.
+	aDone := make(chan error, 1)
+	go func() { aDone <- c.ensureUnlocked(context.Background()) }()
+	<-block.entered
+
+	// Goroutine B starts while A holds the lock.
+	bDone := make(chan error, 1)
+	go func() { bDone <- c.ensureUnlocked(context.Background()) }()
+
+	// Allow A to unlock.
+	block.passwordC <- "pw"
+	if err := <-aDone; err != nil {
+		t.Fatalf("A ensureUnlocked error = %v", err)
+	}
+
+	if err := <-bDone; err != nil {
+		t.Fatalf("B ensureUnlocked error = %v", err)
+	}
+
+	// B should not prompt or unlock.
+	if block.callCount.Load() != 1 {
+		t.Fatalf("prompter calls = %d, want 1", block.callCount.Load())
+	}
+	if atomic.LoadInt32(&unlockCalls) != 1 {
+		t.Fatalf("/unlock calls = %d, want 1", unlockCalls)
+	}
+	if atomic.LoadInt32(&statusCalls) < 2 {
+		t.Fatalf("/status calls = %d, want >=2", statusCalls)
+	}
+}

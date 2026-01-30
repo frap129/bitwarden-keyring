@@ -11,8 +11,15 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// passwordPrompter provides a way to prompt for passwords.
+// It is implemented by SessionManager and can be overridden in tests.
+type passwordPrompter interface {
+	PromptForPassword() (string, error)
+}
 
 // Client provides access to the Bitwarden CLI REST API
 type Client struct {
@@ -22,7 +29,8 @@ type Client struct {
 	mu         sync.RWMutex
 	serveCmd   *exec.Cmd
 	unlockMu   sync.Mutex
-	autoUnlock bool
+	autoUnlock atomic.Bool
+	prompter   passwordPrompter // used for password prompting; defaults to session
 }
 
 // NewClient creates a new Bitwarden API client
@@ -32,21 +40,23 @@ func NewClient(port int) *Client {
 
 // NewClientWithConfig creates a new Bitwarden API client with custom session config
 func NewClientWithConfig(port int, sessionCfg SessionConfig) *Client {
-	return &Client{
+	c := &Client{
 		baseURL: fmt.Sprintf("http://127.0.0.1:%d", port),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		session:    NewSessionManagerWithConfig(sessionCfg),
-		autoUnlock: true,
+		session: NewSessionManagerWithConfig(sessionCfg),
 	}
+	c.autoUnlock.Store(true)
+	c.prompter = c.session
+	return c
 }
 
 // SetAutoUnlock enables or disables automatic unlocking with password prompt.
 // When disabled, operations that require an unlocked vault will return ErrVaultLocked.
 // This is useful for testing or programmatic control.
 func (c *Client) SetAutoUnlock(enabled bool) {
-	c.autoUnlock = enabled
+	c.autoUnlock.Store(enabled)
 }
 
 // StartServe starts the 'bw serve' process if not already running
@@ -188,7 +198,7 @@ func (c *Client) Lock(ctx context.Context) error {
 // Only prompts if autoUnlock is true. Returns ErrVaultLocked if autoUnlock is false.
 // Uses double-check locking to prevent concurrent password prompts.
 func (c *Client) ensureUnlocked(ctx context.Context) error {
-	if !c.autoUnlock {
+	if !c.autoUnlock.Load() {
 		locked, err := c.IsLocked(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to check vault status: %w", err)
@@ -208,9 +218,19 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 		return nil
 	}
 
+	// Check context before waiting on lock
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Serialize unlock attempts
 	c.unlockMu.Lock()
 	defer c.unlockMu.Unlock()
+
+	// Check context after acquiring lock (may have waited)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Re-check after acquiring lock (another goroutine may have unlocked)
 	locked, err = c.IsLocked(ctx)
@@ -221,8 +241,8 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 		return nil
 	}
 
-	// Prompt for password
-	password, err := c.session.PromptForPassword()
+	// Prompt for password (note: not cancellable)
+	password, err := c.prompter.PromptForPassword()
 	if err != nil {
 		return err // Preserves ErrUserCancelled
 	}
@@ -434,8 +454,8 @@ func (c *Client) DeleteItem(ctx context.Context, id string) error {
 	})
 }
 
-// ListFolders returns all folders in the vault
-func (c *Client) ListFolders(ctx context.Context) ([]Folder, error) {
+// listFoldersInternal performs the actual API call without auto-unlock logic.
+func (c *Client) listFoldersInternal(ctx context.Context) ([]Folder, error) {
 	resp, err := c.doRequest(ctx, "GET", "/list/object/folders", nil)
 	if err != nil {
 		return nil, err
@@ -448,6 +468,18 @@ func (c *Client) ListFolders(ctx context.Context) ([]Folder, error) {
 	}
 
 	return result.Data.Data, nil
+}
+
+// ListFolders returns all folders in the vault.
+// Automatically prompts for unlock if the vault is locked.
+func (c *Client) ListFolders(ctx context.Context) ([]Folder, error) {
+	var folders []Folder
+	err := c.withAutoUnlock(ctx, func() error {
+		var err error
+		folders, err = c.listFoldersInternal(ctx)
+		return err
+	})
+	return folders, err
 }
 
 // doRequest performs an HTTP request to the Bitwarden API
@@ -476,4 +508,10 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body io.Rea
 // SessionManager returns the session manager for this client
 func (c *Client) SessionManager() *SessionManager {
 	return c.session
+}
+
+// EnsureUnlocked ensures the vault is unlocked.
+// If auto-unlock is disabled and the vault is locked, returns ErrVaultLocked.
+func (c *Client) EnsureUnlocked(ctx context.Context) error {
+	return c.ensureUnlocked(ctx)
 }
