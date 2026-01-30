@@ -1,5 +1,5 @@
 # Binaries
-bitwarden-keyring
+/bitwarden-keyring
 *.exe
 
 # Build artifacts

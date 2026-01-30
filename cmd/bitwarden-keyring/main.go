@@ -26,7 +26,7 @@ var (
 	noctaliaFlag    = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
 	noctaliaSocket  = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-polkit-agent.sock)")
 	noctaliaTimeout = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
-	component       = flag.String("component", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
+	components      = flag.String("components", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
 	sshSocket       = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
 	version         = "0.4.0"
 )
@@ -35,6 +35,16 @@ var (
 var validComponents = map[string]bool{
 	"secrets": true,
 	"ssh":     true,
+}
+
+// validComponentsList returns a sorted, comma-separated list of valid component names
+func validComponentsList() string {
+	names := make([]string, 0, len(validComponents))
+	for c := range validComponents {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 // parseComponents parses the component flag and returns a map of enabled components.
@@ -57,7 +67,7 @@ func parseComponents(componentStr string) (map[string]bool, error) {
 			continue
 		}
 		if !validComponents[c] {
-			return nil, fmt.Errorf("unknown component: %s (valid: secrets, ssh)", c)
+			return nil, fmt.Errorf("unknown component: %s (valid: %s)", c, validComponentsList())
 		}
 		enabled[c] = true
 	}
@@ -77,9 +87,9 @@ func main() {
 	}
 
 	// Parse and validate components
-	enabledComponents, err := parseComponents(*component)
+	enabledComponents, err := parseComponents(*components)
 	if err != nil {
-		log.Fatalf("Invalid --component flag: %v", err)
+		log.Fatalf("Invalid --components flag: %v", err)
 	}
 
 	// Log enabled components

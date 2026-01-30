@@ -199,11 +199,20 @@ bitwarden-keyring can act as an SSH agent, serving keys stored in your Bitwarden
 
 ### Enable SSH Agent
 
-Start bitwarden-keyring with the `--ssh-agent` flag:
+By default, both the secrets and SSH components are enabled. To run only specific components:
 
 ```bash
-bitwarden-keyring --ssh-agent
+# Run only SSH agent (no D-Bus Secret Service)
+bitwarden-keyring --components=ssh
+
+# Run only secrets (no SSH agent)
+bitwarden-keyring --components=secrets
+
+# Run both (default behavior)
+bitwarden-keyring
 ```
+
+**Note:** When both components are enabled (default), both must start successfully or the service will exit.
 
 ### Verify It Works
 
@@ -272,29 +281,29 @@ Log out and back in for the change to take effect.
 
 ### Enabling SSH Agent for Systemd Service
 
-Create a systemd override:
+To disable the SSH component when using D-Bus activation, create a systemd override:
 
 ```bash
 mkdir -p ~/.config/systemd/user/bitwarden-keyring.service.d/
-cat > ~/.config/systemd/user/bitwarden-keyring.service.d/ssh-agent.conf << 'EOF'
+cat > ~/.config/systemd/user/bitwarden-keyring.service.d/secrets-only.conf << 'EOF'
 [Service]
 ExecStart=
-ExecStart=/usr/bin/bitwarden-keyring --ssh-agent
+ExecStart=/usr/bin/bitwarden-keyring --components=secrets
 EOF
 systemctl --user daemon-reload
 ```
 
 ## Command-Line Options
 
-| Flag                 | Default | Description                    |
-| -------------------- | ------- | ------------------------------ |
-| `--port`             | 8087    | Port for Bitwarden serve API   |
-| `--debug`            | false   | Enable debug logging           |
-| `--noctalia`         | false   | Enable Noctalia UI integration |
-| `--noctalia-socket`  | (auto)  | Custom Noctalia socket path    |
-| `--noctalia-timeout` | 120s    | Noctalia prompt timeout        |
-| `--ssh-agent`        | false   | Enable SSH agent               |
-| `--ssh-socket`       | (auto)  | Custom SSH agent socket path   |
+| Flag                 | Default | Description                                      |
+| -------------------- | ------- | ------------------------------------------------ |
+| `--port`             | 8087    | Port for Bitwarden serve API                     |
+| `--debug`            | false   | Enable debug logging                             |
+| `--noctalia`         | false   | Enable Noctalia UI integration                   |
+| `--noctalia-socket`  | (auto)  | Custom Noctalia socket path                      |
+| `--noctalia-timeout` | 120s    | Noctalia prompt timeout                          |
+| `--components`       | all     | Components to enable (comma-separated: secrets,ssh) |
+| `--ssh-socket`       | (auto)  | Custom SSH agent socket path                     |
 
 ## License
 
