@@ -1,6 +1,14 @@
 package bitwarden
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// Common errors
+var (
+	ErrVaultLocked = errors.New("vault is locked")
+)
 
 // ItemType represents the type of Bitwarden vault item
 type ItemType int

@@ -129,17 +129,11 @@ func (p *Prompt) Dismiss() *dbus.Error {
 func (p *Prompt) doUnlock() {
 	ctx := context.Background()
 
-	// Prompt for password
-	password, err := p.bwClient.SessionManager().PromptForPassword()
+	// ListItems triggers auto-unlock in the client
+	// We don't need the result, just the unlock side-effect
+	_, err := p.bwClient.ListItems(ctx)
 	if err != nil {
-		p.emitCompleted(true, nil)
-		return
-	}
-
-	// Unlock the vault
-	_, err = p.bwClient.Unlock(ctx, password)
-	if err != nil {
-		p.emitCompleted(true, nil)
+		p.emitCompleted(true, nil) // Dismissed/failed
 		return
 	}
 

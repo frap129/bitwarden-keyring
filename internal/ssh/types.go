@@ -14,14 +14,13 @@ import (
 
 // VaultClient defines the interface for Bitwarden operations needed by the SSH agent.
 // This interface allows for easier testing by providing a way to mock the client.
+// The client handles vault unlocking transparently - components don't need to check lock state.
 type VaultClient interface {
-	IsLocked(ctx context.Context) (bool, error)
 	ListItems(ctx context.Context) ([]bitwarden.Item, error)
 	CreateItem(ctx context.Context, req bitwarden.CreateItemRequest) (*bitwarden.Item, error)
 	DeleteItem(ctx context.Context, id string) error
 	Lock(ctx context.Context) error
 	Unlock(ctx context.Context, password string) (string, error)
-	SessionManager() *bitwarden.SessionManager
 }
 
 // DefaultSocketPath returns the default path for the SSH agent socket.

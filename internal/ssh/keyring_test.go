@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"testing"
 
 	cryptossh "golang.org/x/crypto/ssh"
@@ -24,13 +25,9 @@ type mockBitwardenClient struct {
 
 func (m *mockBitwardenClient) ListItems(ctx context.Context) ([]bitwarden.Item, error) {
 	if m.locked {
-		return nil, ErrVaultLocked
+		return nil, bitwarden.ErrVaultLocked
 	}
 	return m.items, nil
-}
-
-func (m *mockBitwardenClient) IsLocked(ctx context.Context) (bool, error) {
-	return m.locked, nil
 }
 
 func (m *mockBitwardenClient) Lock(ctx context.Context) error {
@@ -45,13 +42,9 @@ func (m *mockBitwardenClient) Unlock(ctx context.Context, password string) (stri
 	return "session", nil
 }
 
-func (m *mockBitwardenClient) SessionManager() *bitwarden.SessionManager {
-	return nil
-}
-
 func (m *mockBitwardenClient) CreateItem(ctx context.Context, req bitwarden.CreateItemRequest) (*bitwarden.Item, error) {
 	if m.locked {
-		return nil, ErrVaultLocked
+		return nil, bitwarden.ErrVaultLocked
 	}
 	m.createCalls++
 	item := &bitwarden.Item{
@@ -66,7 +59,7 @@ func (m *mockBitwardenClient) CreateItem(ctx context.Context, req bitwarden.Crea
 
 func (m *mockBitwardenClient) DeleteItem(ctx context.Context, id string) error {
 	if m.locked {
-		return ErrVaultLocked
+		return bitwarden.ErrVaultLocked
 	}
 	m.deleteCalls++
 	m.deleteItemIDs = append(m.deleteItemIDs, id)
@@ -280,8 +273,8 @@ func TestKeyring_Add_VaultLocked(t *testing.T) {
 		PrivateKey: priv,
 		Comment:    "test-key",
 	})
-	if err != ErrVaultLocked {
-		t.Errorf("Add() error = %v, want %v", err, ErrVaultLocked)
+	if !errors.Is(err, bitwarden.ErrVaultLocked) {
+		t.Errorf("Add() error = %v, want error containing %v", err, bitwarden.ErrVaultLocked)
 	}
 
 	// Verify CreateItem was not called
@@ -371,8 +364,8 @@ func TestKeyring_Remove_VaultLocked(t *testing.T) {
 	}
 
 	err = tk.Remove(signer.PublicKey())
-	if err != ErrVaultLocked {
-		t.Errorf("Remove() error = %v, want %v", err, ErrVaultLocked)
+	if !errors.Is(err, bitwarden.ErrVaultLocked) {
+		t.Errorf("Remove() error = %v, want error containing %v", err, bitwarden.ErrVaultLocked)
 	}
 }
 

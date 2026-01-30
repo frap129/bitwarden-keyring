@@ -16,14 +16,13 @@ import (
 
 // BitwardenClient defines the interface for Bitwarden operations needed by the Keyring.
 // This interface allows for easier testing by providing a way to mock the client.
+// The client handles vault unlocking transparently - components don't need to check lock state.
 type BitwardenClient interface {
-	IsLocked(ctx context.Context) (bool, error)
 	ListItems(ctx context.Context) ([]bitwarden.Item, error)
 	CreateItem(ctx context.Context, req bitwarden.CreateItemRequest) (*bitwarden.Item, error)
 	DeleteItem(ctx context.Context, id string) error
 	Lock(ctx context.Context) error
 	Unlock(ctx context.Context, password string) (string, error)
-	SessionManager() *bitwarden.SessionManager
 }
 
 // Keyring implements the agent.Agent interface using Bitwarden as the key store.
@@ -71,16 +70,7 @@ func (k *Keyring) refreshKeys(ctx context.Context) error {
 func (k *Keyring) List() ([]*agent.Key, error) {
 	ctx := context.Background()
 
-	// Check if vault is locked
-	locked, err := k.client.IsLocked(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check vault status: %w", err)
-	}
-	if locked {
-		return nil, ErrVaultLocked
-	}
-
-	// Refresh keys from Bitwarden
+	// Refresh keys from Bitwarden (client handles auto-unlock)
 	if err := k.refreshKeys(ctx); err != nil {
 		return nil, fmt.Errorf("failed to refresh keys: %w", err)
 	}
@@ -114,16 +104,7 @@ func (k *Keyring) Sign(key cryptossh.PublicKey, data []byte) (*cryptossh.Signatu
 func (k *Keyring) SignWithFlags(key cryptossh.PublicKey, data []byte, flags agent.SignatureFlags) (*cryptossh.Signature, error) {
 	ctx := context.Background()
 
-	// Check if vault is locked
-	locked, err := k.client.IsLocked(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check vault status: %w", err)
-	}
-	if locked {
-		return nil, ErrVaultLocked
-	}
-
-	// Refresh keys if cache is empty
+	// Refresh keys if cache is empty (client handles auto-unlock)
 	k.mu.RLock()
 	needsRefresh := len(k.keys) == 0
 	k.mu.RUnlock()
@@ -182,15 +163,6 @@ func (k *Keyring) Add(key agent.AddedKey) error {
 
 	ctx := context.Background()
 
-	// Check if vault is locked
-	locked, err := k.client.IsLocked(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to check vault status: %w", err)
-	}
-	if locked {
-		return ErrVaultLocked
-	}
-
 	// Create a signer from the private key to get the public key
 	signer, err := cryptossh.NewSignerFromKey(key.PrivateKey)
 	if err != nil {
@@ -200,7 +172,7 @@ func (k *Keyring) Add(key agent.AddedKey) error {
 	// Check for duplicate by fingerprint
 	fingerprint := cryptossh.FingerprintSHA256(signer.PublicKey())
 
-	// Refresh keys and check for existing key with same fingerprint
+	// Refresh keys and check for existing key with same fingerprint (client handles auto-unlock)
 	if err := k.refreshKeys(ctx); err != nil {
 		return fmt.Errorf("failed to refresh keys: %w", err)
 	}
@@ -232,7 +204,7 @@ func (k *Keyring) Add(key agent.AddedKey) error {
 		name = fingerprint
 	}
 
-	// Create the Bitwarden item
+	// Create the Bitwarden item (client handles auto-unlock)
 	req := bitwarden.CreateItemRequest{
 		Type: bitwarden.ItemTypeSSHKey,
 		Name: name,
@@ -271,16 +243,7 @@ func (k *Keyring) Remove(key cryptossh.PublicKey) error {
 
 	ctx := context.Background()
 
-	// Check if vault is locked
-	locked, err := k.client.IsLocked(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to check vault status: %w", err)
-	}
-	if locked {
-		return ErrVaultLocked
-	}
-
-	// Refresh keys from Bitwarden
+	// Refresh keys from Bitwarden (client handles auto-unlock)
 	if err := k.refreshKeys(ctx); err != nil {
 		return fmt.Errorf("failed to refresh keys: %w", err)
 	}
@@ -348,24 +311,12 @@ func (k *Keyring) Lock(passphrase []byte) error {
 // Unlock unlocks the Bitwarden vault and refreshes the key cache.
 //
 // Note: The passphrase parameter is ignored. This agent uses Bitwarden's
-// authentication mechanism instead. The SessionManager will prompt for the
-// master password via the configured prompt client (e.g., Noctalia).
+// authentication mechanism instead. The client will automatically prompt
+// for the master password if the vault is locked (via SessionManager).
 // This differs from ssh-agent's passphrase-based locking.
 func (k *Keyring) Unlock(passphrase []byte) error {
 	ctx := context.Background()
-
-	// Use the SessionManager's PromptForPassword to get the master password
-	// and then unlock the vault
-	password, err := k.client.SessionManager().PromptForPassword()
-	if err != nil {
-		return fmt.Errorf("failed to get password: %w", err)
-	}
-
-	if _, err := k.client.Unlock(ctx, password); err != nil {
-		return fmt.Errorf("failed to unlock vault: %w", err)
-	}
-
-	// Refresh keys after unlock
+	// Just refresh keys - the client handles auto-unlock transparently
 	return k.refreshKeys(ctx)
 }
 
@@ -373,16 +324,7 @@ func (k *Keyring) Unlock(passphrase []byte) error {
 func (k *Keyring) Signers() ([]cryptossh.Signer, error) {
 	ctx := context.Background()
 
-	// Check if vault is locked
-	locked, err := k.client.IsLocked(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check vault status: %w", err)
-	}
-	if locked {
-		return nil, ErrVaultLocked
-	}
-
-	// Refresh keys from Bitwarden
+	// Refresh keys from Bitwarden (client handles auto-unlock)
 	if err := k.refreshKeys(ctx); err != nil {
 		return nil, fmt.Errorf("failed to refresh keys: %w", err)
 	}

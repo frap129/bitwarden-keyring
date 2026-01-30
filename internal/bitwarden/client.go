@@ -21,6 +21,8 @@ type Client struct {
 	session    *SessionManager
 	mu         sync.RWMutex
 	serveCmd   *exec.Cmd
+	unlockMu   sync.Mutex
+	autoUnlock bool
 }
 
 // NewClient creates a new Bitwarden API client
@@ -35,8 +37,16 @@ func NewClientWithConfig(port int, sessionCfg SessionConfig) *Client {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		session: NewSessionManagerWithConfig(sessionCfg),
+		session:    NewSessionManagerWithConfig(sessionCfg),
+		autoUnlock: true,
 	}
+}
+
+// SetAutoUnlock enables or disables automatic unlocking with password prompt.
+// When disabled, operations that require an unlocked vault will return ErrVaultLocked.
+// This is useful for testing or programmatic control.
+func (c *Client) SetAutoUnlock(enabled bool) {
+	c.autoUnlock = enabled
 }
 
 // StartServe starts the 'bw serve' process if not already running
@@ -174,6 +184,65 @@ func (c *Client) Lock(ctx context.Context) error {
 	return nil
 }
 
+// ensureUnlocked checks if the vault is locked and prompts for unlock if needed.
+// Only prompts if autoUnlock is true. Returns ErrVaultLocked if autoUnlock is false.
+// Uses double-check locking to prevent concurrent password prompts.
+func (c *Client) ensureUnlocked(ctx context.Context) error {
+	if !c.autoUnlock {
+		locked, err := c.IsLocked(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to check vault status: %w", err)
+		}
+		if locked {
+			return ErrVaultLocked
+		}
+		return nil
+	}
+
+	// Quick check without lock
+	locked, err := c.IsLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check vault status: %w", err)
+	}
+	if !locked {
+		return nil
+	}
+
+	// Serialize unlock attempts
+	c.unlockMu.Lock()
+	defer c.unlockMu.Unlock()
+
+	// Re-check after acquiring lock (another goroutine may have unlocked)
+	locked, err = c.IsLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check vault status: %w", err)
+	}
+	if !locked {
+		return nil
+	}
+
+	// Prompt for password
+	password, err := c.session.PromptForPassword()
+	if err != nil {
+		return err // Preserves ErrUserCancelled
+	}
+
+	// Unlock the vault
+	if _, err := c.Unlock(ctx, password); err != nil {
+		return fmt.Errorf("failed to unlock vault: %w", err)
+	}
+
+	return nil
+}
+
+// withAutoUnlock wraps an operation with auto-unlock logic
+func (c *Client) withAutoUnlock(ctx context.Context, fn func() error) error {
+	if err := c.ensureUnlocked(ctx); err != nil {
+		return err
+	}
+	return fn()
+}
+
 // Sync synchronizes the vault with the server
 func (c *Client) Sync(ctx context.Context) error {
 	resp, err := c.doRequest(ctx, "POST", "/sync", nil)
@@ -184,8 +253,8 @@ func (c *Client) Sync(ctx context.Context) error {
 	return nil
 }
 
-// ListItems returns all items in the vault
-func (c *Client) ListItems(ctx context.Context) ([]Item, error) {
+// listItemsInternal performs the actual ListItems API call
+func (c *Client) listItemsInternal(ctx context.Context) ([]Item, error) {
 	resp, err := c.doRequest(ctx, "GET", "/list/object/items", nil)
 	if err != nil {
 		return nil, err
@@ -200,8 +269,20 @@ func (c *Client) ListItems(ctx context.Context) ([]Item, error) {
 	return result.Data.Data, nil
 }
 
-// SearchItems searches for items matching the given URL
-func (c *Client) SearchItems(ctx context.Context, searchURL string) ([]Item, error) {
+// ListItems returns all items in the vault.
+// Automatically prompts for unlock if the vault is locked.
+func (c *Client) ListItems(ctx context.Context) ([]Item, error) {
+	var items []Item
+	err := c.withAutoUnlock(ctx, func() error {
+		var err error
+		items, err = c.listItemsInternal(ctx)
+		return err
+	})
+	return items, err
+}
+
+// searchItemsInternal performs the actual SearchItems API call
+func (c *Client) searchItemsInternal(ctx context.Context, searchURL string) ([]Item, error) {
 	params := url.Values{}
 	params.Set("url", searchURL)
 
@@ -219,8 +300,20 @@ func (c *Client) SearchItems(ctx context.Context, searchURL string) ([]Item, err
 	return result.Data.Data, nil
 }
 
-// GetItem returns a specific item by ID
-func (c *Client) GetItem(ctx context.Context, id string) (*Item, error) {
+// SearchItems searches for items matching the given URL.
+// Automatically prompts for unlock if the vault is locked.
+func (c *Client) SearchItems(ctx context.Context, searchURL string) ([]Item, error) {
+	var items []Item
+	err := c.withAutoUnlock(ctx, func() error {
+		var err error
+		items, err = c.searchItemsInternal(ctx, searchURL)
+		return err
+	})
+	return items, err
+}
+
+// getItemInternal performs the actual GetItem API call
+func (c *Client) getItemInternal(ctx context.Context, id string) (*Item, error) {
 	resp, err := c.doRequest(ctx, "GET", "/object/item/"+id, nil)
 	if err != nil {
 		return nil, err
@@ -235,8 +328,20 @@ func (c *Client) GetItem(ctx context.Context, id string) (*Item, error) {
 	return &result.Data, nil
 }
 
-// CreateItem creates a new item in the vault
-func (c *Client) CreateItem(ctx context.Context, item CreateItemRequest) (*Item, error) {
+// GetItem returns a specific item by ID.
+// Automatically prompts for unlock if the vault is locked.
+func (c *Client) GetItem(ctx context.Context, id string) (*Item, error) {
+	var item *Item
+	err := c.withAutoUnlock(ctx, func() error {
+		var err error
+		item, err = c.getItemInternal(ctx, id)
+		return err
+	})
+	return item, err
+}
+
+// createItemInternal performs the actual CreateItem API call
+func (c *Client) createItemInternal(ctx context.Context, item CreateItemRequest) (*Item, error) {
 	body, err := json.Marshal(item)
 	if err != nil {
 		return nil, err
@@ -266,8 +371,20 @@ func (c *Client) CreateItem(ctx context.Context, item CreateItemRequest) (*Item,
 	return &result.Data, nil
 }
 
-// UpdateItem updates an existing item
-func (c *Client) UpdateItem(ctx context.Context, id string, item CreateItemRequest) (*Item, error) {
+// CreateItem creates a new item in the vault.
+// Automatically prompts for unlock if the vault is locked.
+func (c *Client) CreateItem(ctx context.Context, item CreateItemRequest) (*Item, error) {
+	var result *Item
+	err := c.withAutoUnlock(ctx, func() error {
+		var err error
+		result, err = c.createItemInternal(ctx, item)
+		return err
+	})
+	return result, err
+}
+
+// updateItemInternal performs the actual UpdateItem API call
+func (c *Client) updateItemInternal(ctx context.Context, id string, item CreateItemRequest) (*Item, error) {
 	body, err := json.Marshal(item)
 	if err != nil {
 		return nil, err
@@ -287,14 +404,34 @@ func (c *Client) UpdateItem(ctx context.Context, id string, item CreateItemReque
 	return &result.Data, nil
 }
 
-// DeleteItem deletes an item by ID
-func (c *Client) DeleteItem(ctx context.Context, id string) error {
+// UpdateItem updates an existing item.
+// Automatically prompts for unlock if the vault is locked.
+func (c *Client) UpdateItem(ctx context.Context, id string, item CreateItemRequest) (*Item, error) {
+	var result *Item
+	err := c.withAutoUnlock(ctx, func() error {
+		var err error
+		result, err = c.updateItemInternal(ctx, id, item)
+		return err
+	})
+	return result, err
+}
+
+// deleteItemInternal performs the actual DeleteItem API call
+func (c *Client) deleteItemInternal(ctx context.Context, id string) error {
 	resp, err := c.doRequest(ctx, "DELETE", "/object/item/"+id, nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	return nil
+}
+
+// DeleteItem deletes an item by ID.
+// Automatically prompts for unlock if the vault is locked.
+func (c *Client) DeleteItem(ctx context.Context, id string) error {
+	return c.withAutoUnlock(ctx, func() error {
+		return c.deleteItemInternal(ctx, id)
+	})
 }
 
 // ListFolders returns all folders in the vault
