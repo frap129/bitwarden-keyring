@@ -6,9 +6,10 @@ Before=default.target
 [Service]
 Type=dbus
 BusName=org.freedesktop.secrets
-ExecStart=/usr/bin/bitwarden-keyring
+ExecStart=bitwarden-keyring
 Restart=on-failure
 RestartSec=5
+RuntimeDirectory=bitwarden-keyring
 
 # Security hardening
 NoNewPrivileges=yes
