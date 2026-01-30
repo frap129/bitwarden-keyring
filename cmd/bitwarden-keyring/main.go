@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,10 +26,48 @@ var (
 	noctaliaFlag    = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
 	noctaliaSocket  = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-polkit-agent.sock)")
 	noctaliaTimeout = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
-	sshAgent        = flag.Bool("ssh-agent", false, "Enable SSH agent")
+	component       = flag.String("component", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
 	sshSocket       = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
 	version         = "0.4.0"
 )
+
+// validComponents defines the supported component names
+var validComponents = map[string]bool{
+	"secrets": true,
+	"ssh":     true,
+}
+
+// parseComponents parses the component flag and returns a map of enabled components.
+// If componentStr is empty, all components are enabled.
+func parseComponents(componentStr string) (map[string]bool, error) {
+	enabled := make(map[string]bool)
+
+	// If empty, enable all components
+	if componentStr == "" {
+		for c := range validComponents {
+			enabled[c] = true
+		}
+		return enabled, nil
+	}
+
+	// Parse comma-separated list
+	for _, c := range strings.Split(componentStr, ",") {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if !validComponents[c] {
+			return nil, fmt.Errorf("unknown component: %s (valid: secrets, ssh)", c)
+		}
+		enabled[c] = true
+	}
+
+	if len(enabled) == 0 {
+		return nil, fmt.Errorf("no components specified")
+	}
+
+	return enabled, nil
+}
 
 func main() {
 	flag.Parse()
@@ -36,7 +76,21 @@ func main() {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 
+	// Parse and validate components
+	enabledComponents, err := parseComponents(*component)
+	if err != nil {
+		log.Fatalf("Invalid --component flag: %v", err)
+	}
+
+	// Log enabled components
+	var componentList []string
+	for c := range enabledComponents {
+		componentList = append(componentList, c)
+	}
+	sort.Strings(componentList)
+
 	log.Printf("bitwarden-keyring %s starting...", version)
+	log.Printf("Enabled components: %s", strings.Join(componentList, ", "))
 
 	// Check if Bitwarden CLI is available
 	if _, err := exec.LookPath("bw"); err != nil {
@@ -73,31 +127,34 @@ func main() {
 		log.Printf("Make sure 'bw serve --port %d' is running or BW_SESSION is set", *port)
 	}
 
-	// Connect to session D-Bus
-	conn, err := dbus.ConnectSessionBus()
-	if err != nil {
-		log.Fatalf("Failed to connect to session bus: %v", err)
+	// Connect to session D-Bus (needed for secrets component)
+	var conn *dbus.Conn
+	if enabledComponents["secrets"] {
+		conn, err = dbus.ConnectSessionBus()
+		if err != nil {
+			log.Fatalf("Failed to connect to session bus: %v", err)
+		}
+		defer conn.Close()
+
+		log.Printf("Connected to session D-Bus")
+
+		// Create and export the service
+		service, err := secretdbus.NewService(conn, bwClient)
+		if err != nil {
+			log.Fatalf("Failed to create service: %v", err)
+		}
+
+		if err := service.Export(); err != nil {
+			log.Fatalf("Failed to export service: %v", err)
+		}
+
+		log.Printf("Secret Service exported at %s", secretdbus.BusName)
+		log.Printf("Ready to serve secrets from Bitwarden vault")
 	}
-	defer conn.Close()
-
-	log.Printf("Connected to session D-Bus")
-
-	// Create and export the service
-	service, err := secretdbus.NewService(conn, bwClient)
-	if err != nil {
-		log.Fatalf("Failed to create service: %v", err)
-	}
-
-	if err := service.Export(); err != nil {
-		log.Fatalf("Failed to export service: %v", err)
-	}
-
-	log.Printf("Secret Service exported at %s", secretdbus.BusName)
-	log.Printf("Ready to serve secrets from Bitwarden vault")
 
 	// Start SSH agent if enabled
 	var sshServer *ssh.Server
-	if *sshAgent {
+	if enabledComponents["ssh"] {
 		socketPath := *sshSocket
 		if socketPath == "" {
 			socketPath = ssh.DefaultSocketPath()
