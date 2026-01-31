@@ -18,6 +18,9 @@ import (
 // ErrUserCancelled indicates the user cancelled the password prompt
 var ErrUserCancelled = errors.New("user cancelled password prompt")
 
+// ErrNoSecurePromptAvailable indicates no secure password prompt methods are available
+var ErrNoSecurePromptAvailable = errors.New("no secure password prompt available (only dmenu found, use --allow-insecure-prompts to enable)")
+
 // isUserCancelled checks if the error indicates user cancelled the prompt.
 // CLI tools like zenity, kdialog, rofi exit with code 1 when cancelled.
 // Zenity also exits with code 5 on timeout, which we treat as cancellation.
@@ -44,23 +47,32 @@ type SessionConfig struct {
 	NoctaliaSocket string
 	// NoctaliaTimeout is the timeout for Noctalia password prompts
 	NoctaliaTimeout time.Duration
+	// AllowInsecurePrompts allows using insecure prompt methods like dmenu (default: false)
+	AllowInsecurePrompts bool
+	// SystemdAskPasswordPath is an optional absolute path to systemd-ask-password
+	SystemdAskPasswordPath string
 }
 
 // DefaultSessionConfig returns a SessionConfig with default values
 func DefaultSessionConfig() SessionConfig {
 	return SessionConfig{
-		NoctaliaEnabled: false,
-		NoctaliaSocket:  "",
-		NoctaliaTimeout: noctalia.DefaultTimeout,
+		NoctaliaEnabled:        false,
+		NoctaliaSocket:         "",
+		NoctaliaTimeout:        noctalia.DefaultTimeout,
+		AllowInsecurePrompts:   false,
+		SystemdAskPasswordPath: "",
 	}
 }
 
 // SessionManager handles Bitwarden session key management
 type SessionManager struct {
-	sessionKey      string
-	mu              sync.RWMutex
-	noctaliaClient  *noctalia.Client
-	noctaliaEnabled bool
+	sessionKey             string
+	mu                     sync.RWMutex
+	noctaliaClient         *noctalia.Client
+	noctaliaEnabled        bool
+	allowInsecurePrompts   bool
+	systemdAskPasswordPath string
+	pathDiscoveryWarned    bool
 }
 
 // NewSessionManager creates a new session manager with default config
@@ -71,7 +83,9 @@ func NewSessionManager() *SessionManager {
 // NewSessionManagerWithConfig creates a new session manager with the given config
 func NewSessionManagerWithConfig(cfg SessionConfig) *SessionManager {
 	sm := &SessionManager{
-		noctaliaEnabled: cfg.NoctaliaEnabled,
+		noctaliaEnabled:        cfg.NoctaliaEnabled,
+		allowInsecurePrompts:   cfg.AllowInsecurePrompts,
+		systemdAskPasswordPath: cfg.SystemdAskPasswordPath,
 	}
 
 	// Initialize Noctalia client if enabled
@@ -167,8 +181,42 @@ func (sm *SessionManager) deleteSessionFile() {
 	_ = os.Remove(sessionFile)
 }
 
+// promptMethod represents a password prompt method
+type promptMethod struct {
+	name string
+}
+
+// getPromptOrder returns the ordered list of prompt methods to try based on config
+func getPromptOrder(cfg SessionConfig) []promptMethod {
+	var prompts []promptMethod
+
+	// 1. Noctalia (if enabled)
+	if cfg.NoctaliaEnabled {
+		prompts = append(prompts, promptMethod{name: "noctalia"})
+	}
+
+	// 2. systemd-ask-password
+	prompts = append(prompts, promptMethod{name: "systemd-ask-password"})
+
+	// 3. zenity
+	prompts = append(prompts, promptMethod{name: "zenity"})
+
+	// 4. kdialog
+	prompts = append(prompts, promptMethod{name: "kdialog"})
+
+	// 5. rofi
+	prompts = append(prompts, promptMethod{name: "rofi"})
+
+	// 6. dmenu (only if AllowInsecurePrompts)
+	if cfg.AllowInsecurePrompts {
+		prompts = append(prompts, promptMethod{name: "dmenu"})
+	}
+
+	return prompts
+}
+
 // PromptForPassword prompts the user for their master password using a GUI dialog
-// It tries various GUI methods, falling back through the chain
+// It tries various GUI methods, falling back through the chain in order of security
 func (sm *SessionManager) PromptForPassword() (string, error) {
 	// Try Noctalia first if enabled
 	if sm.noctaliaEnabled && sm.noctaliaClient != nil {
@@ -183,6 +231,23 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 		if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
 			// Only log non-connection errors (connection errors just mean agent isn't running)
 			log.Printf("Noctalia prompt failed: %v, trying fallback methods", err)
+		}
+	}
+
+	// Log one-time warning about PATH discovery
+	if !sm.pathDiscoveryWarned {
+		log.Printf("DEBUG: Using PATH discovery for prompt tools - consider specifying absolute paths")
+		sm.pathDiscoveryWarned = true
+	}
+
+	// Try systemd-ask-password (secure, works with Plymouth/console)
+	if commandExists("systemd-ask-password") {
+		password, err := sm.promptSystemd()
+		if err == nil {
+			return password, nil
+		}
+		if errors.Is(err, ErrUserCancelled) {
+			return "", err
 		}
 	}
 
@@ -219,8 +284,8 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 		}
 	}
 
-	// Try dmenu (fallback for tiling WMs)
-	if commandExists("dmenu") {
+	// Try dmenu (insecure - only if explicitly allowed)
+	if sm.allowInsecurePrompts && commandExists("dmenu") {
 		password, err := sm.promptDmenu()
 		if err == nil {
 			return password, nil
@@ -230,18 +295,12 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 		}
 	}
 
-	// Try systemd-ask-password (works with Plymouth/console)
-	if commandExists("systemd-ask-password") {
-		password, err := sm.promptSystemd()
-		if err == nil {
-			return password, nil
-		}
-		if errors.Is(err, ErrUserCancelled) {
-			return "", err
-		}
+	// Check if only dmenu is available but not allowed
+	if !sm.allowInsecurePrompts && commandExists("dmenu") {
+		return "", ErrNoSecurePromptAvailable
 	}
 
-	return "", fmt.Errorf("no password prompt method available (install zenity, kdialog, or rofi)")
+	return "", fmt.Errorf("no password prompt method available (install zenity, kdialog, rofi, or systemd-ask-password)")
 }
 
 // promptNoctalia uses the Noctalia agent for a password dialog
@@ -333,7 +392,12 @@ func (sm *SessionManager) promptDmenu() (string, error) {
 
 // promptSystemd uses systemd-ask-password for password input
 func (sm *SessionManager) promptSystemd() (string, error) {
-	cmd := exec.Command("systemd-ask-password",
+	cmdPath := "systemd-ask-password"
+	if sm.systemdAskPasswordPath != "" {
+		cmdPath = sm.systemdAskPasswordPath
+	}
+
+	cmd := exec.Command(cmdPath,
 		"--timeout=120",
 		"--icon=dialog-password",
 		"Bitwarden Master Password:",

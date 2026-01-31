@@ -22,17 +22,19 @@ import (
 )
 
 var (
-	port            = flag.Int("port", 0, "DEPRECATED: use --bw-port instead")
-	bwPort          = flag.Int("bw-port", 0, "Port for Bitwarden serve API (0 = auto-select)")
-	bwStartTimeout  = flag.Duration("bw-start-timeout", 10*time.Second, "Timeout for bw serve to start and become ready")
-	debug           = flag.Bool("debug", false, "Enable debug logging")
-	debugHTTP       = flag.Bool("debug-http", false, "Enable HTTP body logging for errors (requires --debug to be effective)")
-	noctaliaFlag    = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
-	noctaliaSocket  = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-polkit-agent.sock)")
-	noctaliaTimeout = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
-	components      = flag.String("components", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
-	sshSocket       = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
-	version         = "0.4.0"
+	port                   = flag.Int("port", 0, "DEPRECATED: use --bw-port instead")
+	bwPort                 = flag.Int("bw-port", 0, "Port for Bitwarden serve API (0 = auto-select)")
+	bwStartTimeout         = flag.Duration("bw-start-timeout", 10*time.Second, "Timeout for bw serve to start and become ready")
+	debug                  = flag.Bool("debug", false, "Enable debug logging")
+	debugHTTP              = flag.Bool("debug-http", false, "Enable HTTP body logging for errors (requires --debug to be effective)")
+	noctaliaFlag           = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
+	noctaliaSocket         = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-keyring.sock)")
+	noctaliaTimeout        = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
+	components             = flag.String("components", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
+	sshSocket              = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
+	allowInsecurePrompts   = flag.Bool("allow-insecure-prompts", false, "Allow insecure password prompt methods like dmenu")
+	systemdAskPasswordPath = flag.String("systemd-ask-password-path", "", "Absolute path to systemd-ask-password binary")
+	version                = "0.4.0"
 )
 
 // validComponents defines the supported component names
@@ -137,11 +139,18 @@ func main() {
 		noctaliaEnabled = true
 	}
 
+	// Validate systemd-ask-password-path if provided
+	if *systemdAskPasswordPath != "" && !strings.HasPrefix(*systemdAskPasswordPath, "/") {
+		log.Fatalf("--systemd-ask-password-path must be an absolute path, got: %s", *systemdAskPasswordPath)
+	}
+
 	// Create session config
 	sessionCfg := bitwarden.SessionConfig{
-		NoctaliaEnabled: noctaliaEnabled,
-		NoctaliaSocket:  *noctaliaSocket,
-		NoctaliaTimeout: *noctaliaTimeout,
+		NoctaliaEnabled:        noctaliaEnabled,
+		NoctaliaSocket:         *noctaliaSocket,
+		NoctaliaTimeout:        *noctaliaTimeout,
+		AllowInsecurePrompts:   *allowInsecurePrompts,
+		SystemdAskPasswordPath: *systemdAskPasswordPath,
 	}
 
 	if noctaliaEnabled {
