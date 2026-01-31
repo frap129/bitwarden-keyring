@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -76,6 +77,9 @@ type Client struct {
 	session    *SessionManager
 	mu         sync.RWMutex
 	serveCmd   *exec.Cmd
+	serveDone  chan error // closed/sent when Wait() returns
+	serveErr   error      // last exit error
+	servePID   int        // process ID
 	unlockMu   sync.Mutex
 	autoUnlock atomic.Bool
 	debug      atomic.Bool
@@ -118,15 +122,16 @@ func (c *Client) SetDebug(enabled bool) {
 // StartServe starts the 'bw serve' process if not already running
 func (c *Client) StartServe(ctx context.Context, port int) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	// Check if already running
 	if c.serveCmd != nil && c.serveCmd.Process != nil {
+		c.mu.Unlock()
 		return nil
 	}
 
 	// Check if bw is available
 	if _, err := exec.LookPath("bw"); err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("bitwarden CLI (bw) not found in PATH: %w", err)
 	}
 
@@ -139,13 +144,61 @@ func (c *Client) StartServe(ctx context.Context, port int) error {
 	}
 
 	if err := cmd.Start(); err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("failed to start bw serve: %w", err)
 	}
 
 	c.serveCmd = cmd
+	c.servePID = cmd.Process.Pid
+	c.serveDone = make(chan error, 1)
+	c.serveErr = nil
+
+	// Unlock before waitForReady (which makes HTTP calls)
+	c.mu.Unlock()
+
+	// Spawn goroutine to wait for process exit
+	go func() {
+		err := cmd.Wait()
+		c.mu.Lock()
+		c.serveErr = err
+		c.serveCmd = nil
+		c.servePID = 0
+		c.mu.Unlock()
+		c.serveDone <- err
+	}()
 
 	// Wait for server to be ready
-	return c.waitForReady(ctx)
+	if err := c.waitForReady(ctx); err != nil {
+		// Readiness failed - stop the process to prevent zombies
+		_ = c.Stop()
+		return err
+	}
+
+	return nil
+}
+
+// ServeHealthy returns an error if the bw serve process is not healthy.
+// It checks if the process was never started, has exited, or failed readiness.
+func (c *Client) ServeHealthy() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Check if serve was never started
+	if c.serveCmd == nil && c.servePID == 0 && c.serveDone == nil {
+		return fmt.Errorf("bw serve not started")
+	}
+
+	// Check if process has exited
+	if c.serveErr != nil {
+		return fmt.Errorf("bw serve process exited: %w", c.serveErr)
+	}
+
+	// Check if process is nil (may have been stopped)
+	if c.serveCmd == nil {
+		return fmt.Errorf("bw serve process not running")
+	}
+
+	return nil
 }
 
 // waitForReady waits for the bw serve API to be responsive
@@ -153,14 +206,10 @@ func (c *Client) waitForReady(ctx context.Context) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	timeout := time.After(10 * time.Second)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-timeout:
-			return fmt.Errorf("timeout waiting for bw serve to start")
 		case <-ticker.C:
 			_, err := c.Status(ctx)
 			if err == nil {
@@ -170,18 +219,59 @@ func (c *Client) waitForReady(ctx context.Context) error {
 	}
 }
 
-// Stop stops the bw serve process
+// Stop stops the bw serve process gracefully with SIGTERM, then SIGKILL if needed.
+// Always waits for the process to exit (reaps zombie).
 func (c *Client) Stop() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	cmd := c.serveCmd
+	done := c.serveDone
+	pid := c.servePID
+	c.mu.Unlock()
 
-	if c.serveCmd != nil && c.serveCmd.Process != nil {
-		if err := c.serveCmd.Process.Kill(); err != nil {
-			return err
-		}
-		c.serveCmd = nil
+	if cmd == nil || cmd.Process == nil {
+		return nil
 	}
-	return nil
+
+	// Send SIGTERM
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		// Process may already be dead
+		if done != nil {
+			select {
+			case <-done:
+				return nil
+			default:
+			}
+		}
+	}
+
+	// Wait up to 3 seconds for graceful shutdown
+	select {
+	case <-done:
+		// Process exited gracefully
+		return nil
+	case <-time.After(3 * time.Second):
+		// Timeout - send SIGKILL
+	}
+
+	// Send SIGKILL
+	if err := cmd.Process.Kill(); err != nil {
+		// Process may already be dead
+		if done != nil {
+			select {
+			case <-done:
+				return nil
+			default:
+			}
+		}
+	}
+
+	// Wait up to 1 second for SIGKILL to take effect
+	select {
+	case <-done:
+		return nil
+	case <-time.After(1 * time.Second):
+		return fmt.Errorf("process %d did not exit after SIGKILL", pid)
+	}
 }
 
 // Status returns the current vault status
@@ -295,6 +385,11 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 	}
 	if !locked {
 		return nil
+	}
+
+	// Check if serve is healthy before prompting for password
+	if err := c.ServeHealthy(); err != nil {
+		return fmt.Errorf("backend not healthy: %w", err)
 	}
 
 	// Prompt for password (note: not cancellable)

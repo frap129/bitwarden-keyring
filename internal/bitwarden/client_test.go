@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -100,6 +102,17 @@ func clientWithPrompter(ts *httptest.Server, prompter passwordPrompter, autoUnlo
 	return c
 }
 
+// makeServeHealthy simulates a healthy serve process for testing
+func makeServeHealthy(c *Client) {
+	// Create a dummy "healthy" serve state
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.serveCmd = &exec.Cmd{} // Non-nil indicates serve was started
+	c.servePID = 12345       // Fake PID
+	c.serveDone = make(chan error, 1)
+	c.serveErr = nil
+}
+
 func TestEnsureUnlocked_AlreadyUnlocked(t *testing.T) {
 	var callCount int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +191,7 @@ func TestEnsureUnlocked_UnlocksSuccessfully(t *testing.T) {
 
 	prompter := &mockPrompter{password: "test-password"}
 	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c) // Simulate healthy serve
 
 	err := c.ensureUnlocked(context.Background())
 	if err != nil {
@@ -217,6 +231,7 @@ func TestEnsureUnlocked_UserCancellation(t *testing.T) {
 
 	prompter := &mockPrompter{err: ErrUserCancelled}
 	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c) // Simulate healthy serve
 
 	err := c.ensureUnlocked(context.Background())
 	if !errors.Is(err, ErrUserCancelled) {
@@ -260,6 +275,7 @@ func TestEnsureUnlocked_ConcurrentCalls_OnlyOnePrompt(t *testing.T) {
 	}
 
 	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c) // Simulate healthy serve
 
 	// Start multiple concurrent calls
 	var wg sync.WaitGroup
@@ -482,6 +498,7 @@ func TestSetAutoUnlock_TogglesBehavior(t *testing.T) {
 
 	prompter := &mockPrompter{password: "pw"}
 	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c) // Simulate healthy serve
 
 	c.SetAutoUnlock(false)
 	err := c.ensureUnlocked(context.Background())
@@ -559,6 +576,7 @@ func TestEnsureUnlocked_RecheckAfterLockAvoidsPrompt(t *testing.T) {
 	}
 
 	c := clientWithPrompter(ts, block, true)
+	makeServeHealthy(c) // Simulate healthy serve
 
 	// Goroutine A will enter the prompt while holding unlockMu.
 	aDone := make(chan error, 1)
@@ -750,4 +768,173 @@ func TestSetDebug_ControlsLogging(t *testing.T) {
 	if c.debug.Load() {
 		t.Error("debug should be false after SetDebug(false)")
 	}
+}
+
+// --- Process Lifecycle Tests (M3) ---
+
+func TestServeHealthy_NeverStarted(t *testing.T) {
+	c := NewClient(8087)
+
+	err := c.ServeHealthy()
+	if err == nil {
+		t.Fatal("ServeHealthy() should return error when serve never started")
+	}
+	if !strings.Contains(err.Error(), "not started") && !strings.Contains(err.Error(), "never started") {
+		t.Errorf("ServeHealthy() error = %v, want error about not started", err)
+	}
+}
+
+func TestServeHealthy_ProcessExited(t *testing.T) {
+	c := NewClient(8087)
+
+	// Simulate a process that started but then exited
+	c.mu.Lock()
+	c.serveDone = make(chan error, 1)
+	c.serveErr = errors.New("process exited")
+	c.serveCmd = nil // Process is gone
+	c.servePID = 0
+	c.mu.Unlock()
+
+	err := c.ServeHealthy()
+	if err == nil {
+		t.Fatal("ServeHealthy() should return error when process exited")
+	}
+	if !strings.Contains(err.Error(), "exited") {
+		t.Errorf("ServeHealthy() error = %v, want error about process exited", err)
+	}
+}
+
+func TestEnsureUnlocked_RequiresHealthyServe(t *testing.T) {
+	// Create a server that returns "locked" status
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+	}))
+	defer ts.Close()
+
+	c := clientWithPrompter(ts, &mockPrompter{password: "test"}, true)
+
+	// ServeHealthy should fail because serve never started
+	// This will fail when it tries to prompt for password
+	err := c.ensureUnlocked(context.Background())
+	if err == nil {
+		t.Fatal("ensureUnlocked() should fail when serve not healthy")
+	}
+	if !strings.Contains(err.Error(), "not healthy") && !strings.Contains(err.Error(), "not started") {
+		t.Errorf("ensureUnlocked() error = %v, want error about backend health", err)
+	}
+}
+
+func TestStop_SendsSIGTERM_ThenSIGKILL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow test in short mode")
+	}
+
+	// This test verifies Stop sends SIGTERM, waits, then SIGKILL if needed
+	// We'll use a real process that ignores SIGTERM
+	ctx := context.Background()
+	c := NewClient(8087)
+
+	// Start a process that ignores SIGTERM (sleep ignores it on some systems)
+	// We'll use a shell script that traps TERM
+	cmd := exec.CommandContext(ctx, "sh", "-c", "trap '' TERM; sleep 100")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Failed to start test process: %v", err)
+	}
+
+	c.mu.Lock()
+	c.serveCmd = cmd
+	c.servePID = cmd.Process.Pid
+	c.serveDone = make(chan error, 1)
+	c.mu.Unlock()
+
+	// Spawn goroutine to wait for process
+	go func() {
+		err := cmd.Wait()
+		c.serveDone <- err
+	}()
+
+	// Give process time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop should send SIGTERM, wait 3s, then SIGKILL
+	start := time.Now()
+	err := c.Stop()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("Stop() error = %v", err)
+	}
+
+	// Should take at least 3 seconds (SIGTERM timeout) but less than 5
+	if elapsed < 3*time.Second {
+		t.Errorf("Stop() took %v, expected >= 3s (SIGTERM timeout)", elapsed)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("Stop() took %v, expected < 5s (should SIGKILL after 3s)", elapsed)
+	}
+
+	// Process should be dead
+	if cmd.Process != nil {
+		if err := cmd.Process.Signal(syscall.Signal(0)); err == nil {
+			t.Error("Process still alive after Stop()")
+		}
+	}
+}
+
+func TestStop_ReapsZombie(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow test in short mode")
+	}
+
+	ctx := context.Background()
+	c := NewClient(8087)
+
+	// Start a process that exits immediately
+	cmd := exec.CommandContext(ctx, "true")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Failed to start test process: %v", err)
+	}
+
+	c.mu.Lock()
+	c.serveCmd = cmd
+	c.servePID = cmd.Process.Pid
+	c.serveDone = make(chan error, 1)
+	c.mu.Unlock()
+
+	// Spawn goroutine to wait
+	go func() {
+		err := cmd.Wait()
+		c.serveDone <- err
+	}()
+
+	// Wait for process to exit
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop should reap the zombie
+	err := c.Stop()
+	if err != nil {
+		t.Errorf("Stop() error = %v", err)
+	}
+
+	// Verify serveDone was consumed (reaped)
+	select {
+	case <-c.serveDone:
+		t.Error("serveDone should be consumed after Stop()")
+	default:
+		// Good - channel should be drained
+	}
+}
+
+func TestStartServe_FailClosed_StopsOnReadinessFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow test in short mode")
+	}
+
+	_ = NewClient(9999) // Use a port we control
+
+	// Start a fake bw serve that exits immediately (simulate failure)
+	// We can't easily test this without mocking exec.Command
+	// For now, this test documents the expected behavior
+	t.Skip("TODO: implement with exec.Command mocking or integration test")
 }
