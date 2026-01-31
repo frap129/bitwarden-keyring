@@ -159,13 +159,15 @@ func Decrypt(ciphertext, key, iv []byte) ([]byte, error) {
 }
 
 // pkcs7Pad applies PKCS7 padding to data
+// Returns a new slice with padding applied, does not mutate the input.
 func pkcs7Pad(data []byte, blockSize int) []byte {
 	padding := blockSize - (len(data) % blockSize)
-	padBytes := make([]byte, padding)
-	for i := range padBytes {
-		padBytes[i] = byte(padding)
+	result := make([]byte, len(data)+padding)
+	copy(result, data)
+	for i := 0; i < padding; i++ {
+		result[len(data)+i] = byte(padding)
 	}
-	return append(data, padBytes...)
+	return result
 }
 
 // pkcs7Unpad removes PKCS7 padding from data

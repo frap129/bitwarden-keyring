@@ -1,14 +1,10 @@
 package dbus
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
-	"math"
 	"math/big"
 
 	"golang.org/x/crypto/hkdf"
@@ -66,72 +62,4 @@ func (dg *dhGroup) keygenHKDFSHA256AES128(theirPublic *big.Int, myPrivate *big.I
 		return nil, err
 	}
 	return aesKey, nil
-}
-
-// padPKCS7 pads data to the given block size using PKCS7
-func padPKCS7(src []byte, size int) []byte {
-	rem := len(src) % size
-	n := size - rem
-	if n > math.MaxUint8 {
-		panic(fmt.Sprintf("cannot pad over %d bytes, but got %d", math.MaxUint8, n))
-	}
-	padded := make([]byte, len(src)+n)
-	copy(padded, src)
-	for i := len(src); i < len(padded); i++ {
-		padded[i] = byte(n)
-	}
-	return padded
-}
-
-// unpadPKCS7 removes PKCS7 padding from data
-func unpadPKCS7(src []byte, size int) ([]byte, error) {
-	if len(src) == 0 {
-		return nil, errors.New("cannot unpad empty data")
-	}
-	n := src[len(src)-1]
-	if len(src)%size != 0 {
-		return nil, fmt.Errorf("expected PKCS7 padding for block size %d, but have %d bytes", size, len(src))
-	}
-	if len(src) <= int(n) {
-		return nil, fmt.Errorf("cannot unpad %d bytes out of a total of %d", n, len(src))
-	}
-	src = src[:len(src)-int(n)]
-	return src, nil
-}
-
-// aescbcEncrypt encrypts data using AES-CBC with PKCS7 padding
-func aescbcEncrypt(data, key []byte) (iv, ciphertext []byte, err error) {
-	data = padPKCS7(data, aes.BlockSize)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, nil, err
-	}
-	iv = make([]byte, aes.BlockSize)
-	ciphertext = make([]byte, len(data))
-	if _, err := io.ReadFull(cryptorand.Reader, iv); err != nil {
-		return nil, nil, err
-	}
-	mode := cipher.NewCBCEncrypter(block, iv)
-	mode.CryptBlocks(ciphertext, data)
-	return iv, ciphertext, nil
-}
-
-// aescbcDecrypt decrypts data using AES-CBC with PKCS7 padding
-func aescbcDecrypt(iv, ciphertext, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	if len(iv) != aes.BlockSize {
-		return nil, fmt.Errorf("iv length does not match AES block size")
-	}
-	if len(ciphertext)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("ciphertext is not a multiple of AES block size")
-	}
-	// Make a copy to avoid modifying the input
-	plaintext := make([]byte, len(ciphertext))
-	copy(plaintext, ciphertext)
-	mode := cipher.NewCBCDecrypter(block, iv)
-	mode.CryptBlocks(plaintext, plaintext)
-	return unpadPKCS7(plaintext, aes.BlockSize)
 }

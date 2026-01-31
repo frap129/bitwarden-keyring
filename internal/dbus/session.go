@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 
 	"github.com/godbus/dbus/v5"
+
+	"github.com/joe/bitwarden-keyring/internal/crypto"
 )
 
 const (
@@ -173,7 +175,7 @@ func (s *Session) EncryptSecret(plaintext []byte) ([]byte, []byte, error) {
 		return nil, nil, fmt.Errorf("session not initialized for encryption")
 	}
 
-	iv, ciphertext, err := aescbcEncrypt(plaintext, s.aesKey)
+	ciphertext, iv, err := crypto.Encrypt(plaintext, s.aesKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -191,7 +193,7 @@ func (s *Session) DecryptSecret(ciphertext, parameters []byte) ([]byte, error) {
 		return nil, fmt.Errorf("session not initialized for decryption")
 	}
 
-	return aescbcDecrypt(parameters, ciphertext, s.aesKey)
+	return crypto.Decrypt(ciphertext, s.aesKey, parameters)
 }
 
 // Close closes the session (D-Bus method)
