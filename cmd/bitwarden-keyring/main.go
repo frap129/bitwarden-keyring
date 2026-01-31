@@ -34,6 +34,8 @@ var (
 	sshSocket              = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
 	allowInsecurePrompts   = flag.Bool("allow-insecure-prompts", false, "Allow insecure password prompt methods like dmenu")
 	systemdAskPasswordPath = flag.String("systemd-ask-password-path", "", "Absolute path to systemd-ask-password binary")
+	sessionStore           = flag.String("session-store", "memory", "Session storage mode: 'memory' or 'file' (default: memory)")
+	sessionFile            = flag.String("session-file", "", "Custom session file path (default: $XDG_CONFIG_HOME/bitwarden-keyring/session)")
 	version                = "0.4.0"
 )
 
@@ -144,6 +146,11 @@ func main() {
 		log.Fatalf("--systemd-ask-password-path must be an absolute path, got: %s", *systemdAskPasswordPath)
 	}
 
+	// Validate session-store
+	if *sessionStore != "memory" && *sessionStore != "file" {
+		log.Fatalf("--session-store must be 'memory' or 'file', got: %s", *sessionStore)
+	}
+
 	// Create session config
 	sessionCfg := bitwarden.SessionConfig{
 		NoctaliaEnabled:        noctaliaEnabled,
@@ -151,6 +158,8 @@ func main() {
 		NoctaliaTimeout:        *noctaliaTimeout,
 		AllowInsecurePrompts:   *allowInsecurePrompts,
 		SystemdAskPasswordPath: *systemdAskPasswordPath,
+		SessionStore:           *sessionStore,
+		SessionFile:            *sessionFile,
 	}
 
 	if noctaliaEnabled {

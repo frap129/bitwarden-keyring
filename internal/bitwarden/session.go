@@ -51,6 +51,10 @@ type SessionConfig struct {
 	AllowInsecurePrompts bool
 	// SystemdAskPasswordPath is an optional absolute path to systemd-ask-password
 	SystemdAskPasswordPath string
+	// SessionStore specifies where to store the session: "memory" or "file" (default: "memory")
+	SessionStore string
+	// SessionFile is the path to the session file (used when SessionStore is "file")
+	SessionFile string
 }
 
 // DefaultSessionConfig returns a SessionConfig with default values
@@ -61,6 +65,8 @@ func DefaultSessionConfig() SessionConfig {
 		NoctaliaTimeout:        noctalia.DefaultTimeout,
 		AllowInsecurePrompts:   false,
 		SystemdAskPasswordPath: "",
+		SessionStore:           "memory",
+		SessionFile:            "",
 	}
 }
 
@@ -73,6 +79,8 @@ type SessionManager struct {
 	allowInsecurePrompts   bool
 	systemdAskPasswordPath string
 	pathDiscoveryWarned    bool
+	sessionStore           string
+	sessionFile            string
 }
 
 // NewSessionManager creates a new session manager with default config
@@ -86,6 +94,13 @@ func NewSessionManagerWithConfig(cfg SessionConfig) *SessionManager {
 		noctaliaEnabled:        cfg.NoctaliaEnabled,
 		allowInsecurePrompts:   cfg.AllowInsecurePrompts,
 		systemdAskPasswordPath: cfg.SystemdAskPasswordPath,
+		sessionStore:           cfg.SessionStore,
+		sessionFile:            cfg.SessionFile,
+	}
+
+	// Default to "memory" if not specified
+	if sm.sessionStore == "" {
+		sm.sessionStore = "memory"
 	}
 
 	// Initialize Noctalia client if enabled
@@ -117,8 +132,10 @@ func (sm *SessionManager) SetSession(key string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.sessionKey = key
-	// Also persist to file
-	sm.saveSessionToFile(key)
+	// Only persist to file if SessionStore is "file"
+	if sm.sessionStore == "file" {
+		sm.saveSessionToFile(key)
+	}
 }
 
 // ClearSession clears the stored session key
@@ -126,7 +143,10 @@ func (sm *SessionManager) ClearSession() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.sessionKey = ""
-	sm.deleteSessionFile()
+	// Only delete file if SessionStore is "file"
+	if sm.sessionStore == "file" {
+		sm.deleteSessionFile()
+	}
 }
 
 // HasSession returns whether a session key is available
@@ -144,8 +164,25 @@ func (sm *SessionManager) loadSession() {
 		return
 	}
 
+	// Only try to load from file if SessionStore is "file"
+	if sm.sessionStore != "file" {
+		return
+	}
+
 	// Try to load from session file
 	sessionFile := sm.getSessionFilePath()
+
+	// Reject symlinks for security
+	fileInfo, err := os.Lstat(sessionFile)
+	if err != nil {
+		return // File doesn't exist or can't be accessed
+	}
+
+	if fileInfo.Mode()&os.ModeSymlink != 0 {
+		log.Printf("Warning: Session file is a symlink, rejecting: %s", sessionFile)
+		return
+	}
+
 	data, err := os.ReadFile(sessionFile)
 	if err == nil {
 		sm.sessionKey = strings.TrimSpace(string(data))
@@ -154,6 +191,11 @@ func (sm *SessionManager) loadSession() {
 
 // getSessionFilePath returns the path to the session file
 func (sm *SessionManager) getSessionFilePath() string {
+	// Use configured path if provided
+	if sm.sessionFile != "" {
+		return sm.sessionFile
+	}
+
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		configDir = os.Getenv("HOME")
@@ -169,6 +211,16 @@ func (sm *SessionManager) saveSessionToFile(key string) {
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return
+	}
+
+	// Check directory permissions for security
+	dirInfo, err := os.Stat(dir)
+	if err == nil {
+		mode := dirInfo.Mode().Perm()
+		// Warn if directory has group or world write permissions
+		if mode&0022 != 0 {
+			log.Printf("Warning: Session directory has insecure permissions (group/world-writable): %s (mode: %04o)", dir, mode)
+		}
 	}
 
 	// Write session file with restricted permissions
