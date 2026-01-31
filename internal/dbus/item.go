@@ -22,13 +22,21 @@ type Item struct {
 	mu             sync.RWMutex
 }
 
+// itemEntry represents an item in the process of being exported or already exported
+type itemEntry struct {
+	item  *Item
+	ready chan struct{}
+	err   error
+}
+
 // ItemManager manages item objects
 type ItemManager struct {
 	conn           *dbus.Conn
 	bwClient       *bitwarden.Client
 	sessionManager *SessionManager
-	items          map[dbus.ObjectPath]*Item
+	items          map[dbus.ObjectPath]*itemEntry
 	mu             sync.RWMutex
+	exportFunc     func(*Item) error // for testing; defaults to exportItem
 }
 
 // NewItemManager creates a new item manager
@@ -37,7 +45,7 @@ func NewItemManager(conn *dbus.Conn, bwClient *bitwarden.Client, sessionManager 
 		conn:           conn,
 		bwClient:       bwClient,
 		sessionManager: sessionManager,
-		items:          make(map[dbus.ObjectPath]*Item),
+		items:          make(map[dbus.ObjectPath]*itemEntry),
 	}
 }
 
@@ -45,17 +53,53 @@ func NewItemManager(conn *dbus.Conn, bwClient *bitwarden.Client, sessionManager 
 func (im *ItemManager) GetOrCreateItem(bwItem *bitwarden.Item, collection *Collection) (*Item, error) {
 	path := ItemPathFromID(bwItem.ID)
 
-	im.mu.Lock()
-	defer im.mu.Unlock()
+	// Fast path: check if entry exists
+	im.mu.RLock()
+	entry, exists := im.items[path]
+	im.mu.RUnlock()
 
-	if item, ok := im.items[path]; ok {
-		// Update the backing item
-		item.mu.Lock()
-		item.bwItem = bwItem
-		item.mu.Unlock()
-		return item, nil
+	if exists {
+		// Wait for ready (export to complete or fail)
+		<-entry.ready
+
+		// Check if export failed
+		if entry.err != nil {
+			return nil, entry.err
+		}
+
+		// Update the backing item under item's lock (not manager's lock)
+		entry.item.mu.Lock()
+		entry.item.bwItem = bwItem
+		entry.item.mu.Unlock()
+		return entry.item, nil
 	}
 
+	// Create path: insert placeholder, unlock, export, signal ready
+	entry = &itemEntry{
+		ready: make(chan struct{}),
+	}
+
+	im.mu.Lock()
+	// Double-check: another goroutine might have created it
+	if existing, ok := im.items[path]; ok {
+		im.mu.Unlock()
+		// Wait for the other goroutine's export
+		<-existing.ready
+		if existing.err != nil {
+			return nil, existing.err
+		}
+		// Update the backing item
+		existing.item.mu.Lock()
+		existing.item.bwItem = bwItem
+		existing.item.mu.Unlock()
+		return existing.item, nil
+	}
+
+	// We won the race, insert placeholder
+	im.items[path] = entry
+	im.mu.Unlock()
+
+	// Now export without holding the lock
 	item := &Item{
 		conn:           im.conn,
 		path:           path,
@@ -66,33 +110,77 @@ func (im *ItemManager) GetOrCreateItem(bwItem *bitwarden.Item, collection *Colle
 		itemManager:    im,
 	}
 
-	if err := im.exportItem(item); err != nil {
+	// Use injected export function if set (for testing), else use real export
+	exportFn := im.exportFunc
+	if exportFn == nil {
+		exportFn = im.exportItem
+	}
+
+	err := exportFn(item)
+	if err != nil {
+		// Export failed: set error, close ready, delete entry
+		entry.err = err
+		close(entry.ready)
+
+		im.mu.Lock()
+		delete(im.items, path)
+		im.mu.Unlock()
+
 		return nil, err
 	}
 
-	im.items[path] = item
+	// Success: set item, close ready
+	entry.item = item
+	close(entry.ready)
+
 	return item, nil
 }
 
 // GetItem retrieves an item by path
 func (im *ItemManager) GetItem(path dbus.ObjectPath) (*Item, bool) {
 	im.mu.RLock()
-	defer im.mu.RUnlock()
-	item, ok := im.items[path]
-	return item, ok
+	entry, ok := im.items[path]
+	im.mu.RUnlock()
+
+	if !ok {
+		return nil, false
+	}
+
+	// Wait for ready
+	<-entry.ready
+
+	// Check if export failed
+	if entry.err != nil {
+		return nil, false
+	}
+
+	return entry.item, true
 }
 
 // RemoveItem removes an item and unexports all its D-Bus interfaces
 func (im *ItemManager) RemoveItem(path dbus.ObjectPath) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
+	// First, get the entry outside the lock
+	im.mu.RLock()
+	entry, ok := im.items[path]
+	im.mu.RUnlock()
 
-	if _, ok := im.items[path]; ok {
-		// Unexport all interfaces that were exported
+	if !ok {
+		return
+	}
+
+	// Wait for export to complete (or fail)
+	<-entry.ready
+
+	// Now delete and unexport
+	im.mu.Lock()
+	delete(im.items, path)
+	im.mu.Unlock()
+
+	// Unexport all interfaces that were exported (only if export succeeded and conn exists)
+	if entry.err == nil && im.conn != nil {
 		im.conn.Export(nil, path, ItemInterface)
 		im.conn.Export(nil, path, PropertiesInterface)
 		im.conn.Export(nil, path, "org.freedesktop.DBus.Introspectable")
-		delete(im.items, path)
 	}
 }
 
