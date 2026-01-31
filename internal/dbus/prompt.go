@@ -14,12 +14,15 @@ import (
 
 // Prompt represents an unlock prompt
 type Prompt struct {
-	conn     *dbus.Conn
-	path     dbus.ObjectPath
-	bwClient *bitwarden.Client
-	objects  []dbus.ObjectPath
-	done     bool
-	mu       sync.Mutex
+	conn      *dbus.Conn
+	path      dbus.ObjectPath
+	bwClient  *bitwarden.Client
+	objects   []dbus.ObjectPath
+	done      bool
+	mu        sync.Mutex
+	startOnce sync.Once
+	manager   *PromptManager     // back-reference for cleanup
+	cancel    context.CancelFunc // cancel function to stop in-flight operations
 }
 
 // PromptManager manages prompt objects
@@ -50,6 +53,7 @@ func (pm *PromptManager) CreateUnlockPrompt(objects []dbus.ObjectPath) (*Prompt,
 		path:     path,
 		bwClient: pm.bwClient,
 		objects:  objects,
+		manager:  pm, // back-reference for cleanup
 	}
 
 	pm.mu.Lock()
@@ -68,24 +72,16 @@ func (pm *PromptManager) CreateUnlockPrompt(objects []dbus.ObjectPath) (*Prompt,
 
 // exportPrompt exports a prompt to D-Bus
 func (pm *PromptManager) exportPrompt(prompt *Prompt) error {
-	if err := pm.conn.Export(prompt, prompt.path, PromptInterface); err != nil {
-		return err
-	}
-
-	if err := pm.conn.Export(introspectable(PromptIntrospectXML), prompt.path, "org.freedesktop.DBus.Introspectable"); err != nil {
-		return err
-	}
-
-	return nil
+	return exportDBusObject(pm.conn, prompt, prompt.path, PromptInterface, PromptIntrospectXML, false)
 }
 
-// RemovePrompt removes a prompt
+// RemovePrompt removes a prompt and unexports all its D-Bus interfaces
 func (pm *PromptManager) RemovePrompt(path dbus.ObjectPath) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	if _, ok := pm.prompts[path]; ok {
-		pm.conn.Export(nil, path, PromptInterface)
+		unexportDBusObject(pm.conn, path, PromptInterface, false)
 		delete(pm.prompts, path)
 	}
 }
@@ -98,14 +94,20 @@ func (p *Prompt) Path() dbus.ObjectPath {
 // Prompt triggers the prompt (D-Bus method)
 func (p *Prompt) Prompt(windowID string) *dbus.Error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.done {
+		p.mu.Unlock()
 		return nil
 	}
+	p.mu.Unlock()
 
-	// Try to unlock the vault
-	go p.doUnlock()
+	// Use sync.Once to ensure only one unlock goroutine starts
+	p.startOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		p.mu.Lock()
+		p.cancel = cancel
+		p.mu.Unlock()
+		go p.doUnlock(ctx)
+	})
 
 	return nil
 }
@@ -113,28 +115,41 @@ func (p *Prompt) Prompt(windowID string) *dbus.Error {
 // Dismiss dismisses the prompt (D-Bus method)
 func (p *Prompt) Dismiss() *dbus.Error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.done {
+		p.mu.Unlock()
 		return nil
 	}
-
 	p.done = true
+	cancel := p.cancel
+	p.mu.Unlock()
+
+	// Cancel any in-flight operations
+	if cancel != nil {
+		cancel()
+	}
 
 	// Emit Completed signal with dismissed=true
 	p.emitCompleted(true, nil)
+
+	// Cleanup: remove from manager and unexport
+	if p.manager != nil {
+		p.manager.RemovePrompt(p.path)
+	}
 
 	return nil
 }
 
 // doUnlock performs the actual unlock operation
-func (p *Prompt) doUnlock() {
-	ctx := context.Background()
-
+func (p *Prompt) doUnlock(ctx context.Context) {
 	// ListItems triggers auto-unlock in the client
 	// We don't need the result, just the unlock side-effect
 	_, err := p.bwClient.ListItems(ctx)
 	if err != nil {
+		// Check if context was cancelled (dismiss was called)
+		if errors.Is(err, context.Canceled) {
+			log.Printf("Prompt unlock cancelled")
+			return // Dismiss already handled completion
+		}
 		// Log the error for debugging (D-Bus signal can't carry error details)
 		if errors.Is(err, bitwarden.ErrUserCancelled) {
 			log.Printf("Prompt unlock dismissed by user")
@@ -142,22 +157,34 @@ func (p *Prompt) doUnlock() {
 			log.Printf("Prompt unlock failed: %v", err)
 		}
 
-		// Mark prompt done even on failure to avoid repeated completion
-		p.mu.Lock()
-		p.done = true
-		p.mu.Unlock()
-
-		p.emitCompleted(true, nil) // Dismissed/failed
+		p.completeOnce(true, nil) // Dismissed/failed
 		return
 	}
 
 	p.mu.Lock()
-	p.done = true
 	objects := p.objects
 	p.mu.Unlock()
 
 	// Emit Completed signal with the unlocked objects
-	p.emitCompleted(false, objects)
+	p.completeOnce(false, objects)
+}
+
+// completeOnce completes the prompt exactly once, emitting the signal and cleaning up
+func (p *Prompt) completeOnce(dismissed bool, objects []dbus.ObjectPath) {
+	p.mu.Lock()
+	if p.done {
+		p.mu.Unlock()
+		return
+	}
+	p.done = true
+	p.mu.Unlock()
+
+	p.emitCompleted(dismissed, objects)
+
+	// Cleanup: remove from manager and unexport
+	if p.manager != nil {
+		p.manager.RemovePrompt(p.path)
+	}
 }
 
 // emitCompleted emits the Completed signal

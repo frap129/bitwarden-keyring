@@ -45,14 +45,28 @@ type DHKeyPair struct {
 	PrivateKey *big.Int
 }
 
-// GenerateDHKeyPair generates a new DH key pair and computes the shared secret
+// GenerateDHKeyPair generates a new DH key pair and computes the shared secret.
+// The peerPublicKey may be shorter than DHKeyBytes if leading zeros were omitted
+// (common with big-endian integer serialization). Keys longer than DHKeyBytes are rejected.
 func GenerateDHKeyPair(peerPublicKey []byte) (*DHKeyPair, error) {
-	if len(peerPublicKey) != DHKeyBytes {
-		return nil, fmt.Errorf("invalid peer public key size: expected %d, got %d", DHKeyBytes, len(peerPublicKey))
+	if len(peerPublicKey) == 0 {
+		return nil, fmt.Errorf("invalid peer public key: empty")
+	}
+	if len(peerPublicKey) > DHKeyBytes {
+		return nil, fmt.Errorf("invalid peer public key size: expected at most %d, got %d", DHKeyBytes, len(peerPublicKey))
+	}
+
+	// Left-pad with zeros if shorter than DHKeyBytes (leading zeros may have been omitted)
+	var padded []byte
+	if len(peerPublicKey) < DHKeyBytes {
+		padded = make([]byte, DHKeyBytes)
+		copy(padded[DHKeyBytes-len(peerPublicKey):], peerPublicKey)
+	} else {
+		padded = peerPublicKey
 	}
 
 	// Parse peer's public key
-	peerPubKeyInt := new(big.Int).SetBytes(peerPublicKey)
+	peerPubKeyInt := new(big.Int).SetBytes(padded)
 
 	// Validate peer public key is in valid range (1 < peer < p-1)
 	one := big.NewInt(1)
@@ -88,6 +102,57 @@ func GenerateDHKeyPair(peerPublicKey []byte) (*DHKeyPair, error) {
 		SharedKey:  sharedKeyBytes,
 		PrivateKey: ourPrivKey,
 	}, nil
+}
+
+// ComputeSharedSecret computes the shared secret with a new peer public key
+// using this key pair's existing private key. This is used when the other party
+// sends their public key after we've already generated our key pair.
+//
+// This method is essential for proper DH key exchange:
+// 1. Party A generates key pair (with dummy peer key)
+// 2. Party A sends public key to Party B
+// 3. Party B generates key pair using A's public key (B now has shared secret)
+// 4. Party B sends public key to Party A
+// 5. Party A calls ComputeSharedSecret with B's public key (A now has shared secret)
+// Both parties now have the same shared secret.
+func (kp *DHKeyPair) ComputeSharedSecret(peerPublicKey []byte) ([]byte, error) {
+	if kp.PrivateKey == nil {
+		return nil, fmt.Errorf("private key not available")
+	}
+	if len(peerPublicKey) == 0 {
+		return nil, fmt.Errorf("invalid peer public key: empty")
+	}
+	if len(peerPublicKey) > DHKeyBytes {
+		return nil, fmt.Errorf("invalid peer public key size: expected at most %d, got %d", DHKeyBytes, len(peerPublicKey))
+	}
+
+	// Left-pad with zeros if shorter than DHKeyBytes
+	var padded []byte
+	if len(peerPublicKey) < DHKeyBytes {
+		padded = make([]byte, DHKeyBytes)
+		copy(padded[DHKeyBytes-len(peerPublicKey):], peerPublicKey)
+	} else {
+		padded = peerPublicKey
+	}
+
+	// Parse peer's public key
+	peerPubKeyInt := new(big.Int).SetBytes(padded)
+
+	// Validate peer public key range (1 < peer < p-1)
+	one := big.NewInt(1)
+	pMinus1 := new(big.Int).Sub(modp1024Prime, one)
+	if peerPubKeyInt.Cmp(one) <= 0 || peerPubKeyInt.Cmp(pMinus1) >= 0 {
+		return nil, fmt.Errorf("invalid peer public key: out of range")
+	}
+
+	// Compute shared secret: peer_pubkey^privkey mod p
+	sharedSecret := new(big.Int).Exp(peerPubKeyInt, kp.PrivateKey, modp1024Prime)
+
+	// Convert to fixed-size byte array
+	sharedKeyBytes := make([]byte, DHKeyBytes)
+	sharedSecret.FillBytes(sharedKeyBytes)
+
+	return sharedKeyBytes, nil
 }
 
 // DeriveAESKey derives a 128-bit AES key from the shared secret using HKDF-SHA256

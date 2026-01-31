@@ -33,6 +33,19 @@ func isUserCancelled(err error) bool {
 	return false
 }
 
+// runPromptCommand executes a GUI prompt command and returns the trimmed output.
+// If the command fails with a user cancellation (exit code 1 or 5), it returns ErrUserCancelled.
+func runPromptCommand(cmd *exec.Cmd) (string, error) {
+	output, err := cmd.Output()
+	if err != nil {
+		if isUserCancelled(err) {
+			return "", ErrUserCancelled
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 // commandExists checks if a command is available in PATH
 func commandExists(name string) bool {
 	_, err := exec.LookPath(name)
@@ -154,6 +167,11 @@ func (sm *SessionManager) HasSession() bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.sessionKey != ""
+}
+
+// SystemdAskPasswordPath returns the configured path for systemd-ask-password.
+func (sm *SessionManager) SystemdAskPasswordPath() string {
+	return sm.systemdAskPasswordPath
 }
 
 // loadSession attempts to load session from environment or file
@@ -373,55 +391,31 @@ func (sm *SessionManager) promptNoctalia() (string, error) {
 
 // promptZenity uses zenity for a GTK password dialog
 func (sm *SessionManager) promptZenity() (string, error) {
-	cmd := exec.Command("zenity",
+	return runPromptCommand(exec.Command("zenity",
 		"--password",
 		"--title=Bitwarden Keyring",
 		"--text=Enter your Bitwarden Master Password:",
 		"--timeout=120",
-	)
-	output, err := cmd.Output()
-	if err != nil {
-		if isUserCancelled(err) {
-			return "", ErrUserCancelled
-		}
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
+	))
 }
 
 // promptKDialog uses kdialog for a KDE password dialog
 func (sm *SessionManager) promptKDialog() (string, error) {
-	cmd := exec.Command("kdialog",
+	return runPromptCommand(exec.Command("kdialog",
 		"--password",
 		"Enter your Bitwarden Master Password:",
 		"--title", "Bitwarden Keyring",
-	)
-	output, err := cmd.Output()
-	if err != nil {
-		if isUserCancelled(err) {
-			return "", ErrUserCancelled
-		}
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
+	))
 }
 
 // promptRofi uses rofi in dmenu mode for password input
 func (sm *SessionManager) promptRofi() (string, error) {
-	cmd := exec.Command("rofi",
+	return runPromptCommand(exec.Command("rofi",
 		"-dmenu",
 		"-password",
 		"-p", "Bitwarden Master Password",
 		"-theme-str", "entry { placeholder: \"\"; }",
-	)
-	output, err := cmd.Output()
-	if err != nil {
-		if isUserCancelled(err) {
-			return "", ErrUserCancelled
-		}
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
+	))
 }
 
 // promptDmenu uses dmenu for password input (no masking, less secure)
@@ -448,18 +442,9 @@ func (sm *SessionManager) promptSystemd() (string, error) {
 	if sm.systemdAskPasswordPath != "" {
 		cmdPath = sm.systemdAskPasswordPath
 	}
-
-	cmd := exec.Command(cmdPath,
+	return runPromptCommand(exec.Command(cmdPath,
 		"--timeout=120",
 		"--icon=dialog-password",
 		"Bitwarden Master Password:",
-	)
-	output, err := cmd.Output()
-	if err != nil {
-		if isUserCancelled(err) {
-			return "", ErrUserCancelled
-		}
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
+	))
 }

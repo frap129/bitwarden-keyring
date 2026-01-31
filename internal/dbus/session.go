@@ -2,7 +2,6 @@ package dbus
 
 import (
 	"fmt"
-	"math/big"
 	"sync"
 	"sync/atomic"
 
@@ -21,7 +20,8 @@ type Session struct {
 	conn      *dbus.Conn
 	path      dbus.ObjectPath
 	algorithm string
-	aesKey    []byte // AES key for encrypted sessions (nil for plain)
+	aesKey    []byte          // AES key for encrypted sessions (nil for plain)
+	manager   *SessionManager // back-reference for cleanup
 }
 
 // SessionManager manages active sessions
@@ -55,22 +55,17 @@ func (sm *SessionManager) CreateSession(algorithm string, input []byte) (*Sessio
 		output = dbus.MakeVariant("")
 
 	case AlgorithmDH:
-		// DH key exchange
-		group := rfc2409SecondOakleyGroup()
-		private, public, err := group.NewKeypair()
+		// DH key exchange using the crypto package
+		dhPair, err := crypto.GenerateDHKeyPair(input)
 		if err != nil {
-			return nil, dbus.Variant{}, fmt.Errorf("DH keypair generation failed: %w", err)
+			return nil, dbus.Variant{}, fmt.Errorf("DH key exchange failed: %w", err)
 		}
 
-		// Output is our public key (big-endian bytes)
-		output = dbus.MakeVariant(public.Bytes())
-
-		// Parse client's public key
-		theirPublic := new(big.Int)
-		theirPublic.SetBytes(input)
+		// Output is our public key
+		output = dbus.MakeVariant(dhPair.PublicKey)
 
 		// Derive AES key from shared secret
-		aesKey, err = group.keygenHKDFSHA256AES128(theirPublic, private)
+		aesKey, err = crypto.DeriveAESKey(dhPair.SharedKey)
 		if err != nil {
 			return nil, dbus.Variant{}, fmt.Errorf("key derivation failed: %w", err)
 		}
@@ -84,6 +79,7 @@ func (sm *SessionManager) CreateSession(algorithm string, input []byte) (*Sessio
 		path:      path,
 		algorithm: algorithm,
 		aesKey:    aesKey,
+		manager:   sm, // back-reference for cleanup
 	}
 
 	sm.mu.Lock()
@@ -109,7 +105,17 @@ func (sm *SessionManager) GetSession(path dbus.ObjectPath) (*Session, bool) {
 	return session, ok
 }
 
-// CloseSession closes and removes a session
+// GetSessionOrError retrieves a session by path or returns a D-Bus error.
+// This is a convenience wrapper for D-Bus methods that need to validate sessions.
+func (sm *SessionManager) GetSessionOrError(path dbus.ObjectPath) (*Session, *dbus.Error) {
+	session, ok := sm.GetSession(path)
+	if !ok {
+		return nil, &dbus.Error{Name: ErrNoSession, Body: []interface{}{"Invalid session"}}
+	}
+	return session, nil
+}
+
+// CloseSession closes and removes a session, unexports all D-Bus interfaces
 func (sm *SessionManager) CloseSession(path dbus.ObjectPath) error {
 	sm.mu.Lock()
 	session, ok := sm.sessions[path]
@@ -122,31 +128,15 @@ func (sm *SessionManager) CloseSession(path dbus.ObjectPath) error {
 		return fmt.Errorf("session not found: %s", path)
 	}
 
-	// Unexport the session object
-	sm.conn.Export(nil, session.path, SessionInterface)
+	// Unexport all session D-Bus interfaces
+	unexportDBusObject(sm.conn, session.path, SessionInterface, false)
 
 	return nil
 }
 
 // exportSession exports a session object to D-Bus
 func (sm *SessionManager) exportSession(session *Session) error {
-	// Export the session methods
-	err := sm.conn.Export(session, session.path, SessionInterface)
-	if err != nil {
-		return err
-	}
-
-	// Export introspection
-	err = sm.conn.Export(
-		introspectable(SessionIntrospectXML),
-		session.path,
-		"org.freedesktop.DBus.Introspectable",
-	)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return exportDBusObject(sm.conn, session, session.path, SessionInterface, SessionIntrospectXML, false)
 }
 
 // Path returns the session's object path
@@ -198,7 +188,9 @@ func (s *Session) DecryptSecret(ciphertext, parameters []byte) ([]byte, error) {
 
 // Close closes the session (D-Bus method)
 func (s *Session) Close() *dbus.Error {
-	// The actual cleanup is handled by SessionManager
+	if s.manager != nil {
+		_ = s.manager.CloseSession(s.path)
+	}
 	return nil
 }
 

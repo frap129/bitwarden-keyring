@@ -174,3 +174,236 @@ func TestPKCS7PadDoesNotMutateCaller(t *testing.T) {
 		}
 	}
 }
+
+// --- DH Key Pair Tests ---
+
+func TestGenerateDHKeyPair_FullSizeKey(t *testing.T) {
+	// Create a valid 128-byte peer public key (a small valid value, left-padded)
+	peerKey := make([]byte, DHKeyBytes)
+	peerKey[DHKeyBytes-1] = 0x42 // Valid: 66 (greater than 1, less than p-1)
+
+	result, err := GenerateDHKeyPair(peerKey)
+	if err != nil {
+		t.Fatalf("GenerateDHKeyPair failed: %v", err)
+	}
+
+	// Verify output sizes are fixed at 128 bytes
+	if len(result.PublicKey) != DHKeyBytes {
+		t.Errorf("PublicKey size = %d, want %d", len(result.PublicKey), DHKeyBytes)
+	}
+	if len(result.SharedKey) != DHKeyBytes {
+		t.Errorf("SharedKey size = %d, want %d", len(result.SharedKey), DHKeyBytes)
+	}
+}
+
+func TestGenerateDHKeyPair_AcceptsShortKey(t *testing.T) {
+	// Real clients may omit leading zeros from big-endian integers.
+	// A valid public key like 0x42 (66) would be sent as just []byte{0x42}.
+	shortKey := []byte{0x42} // Valid: 66 (greater than 1, less than p-1)
+
+	result, err := GenerateDHKeyPair(shortKey)
+	if err != nil {
+		t.Fatalf("GenerateDHKeyPair should accept short keys: %v", err)
+	}
+
+	// Verify output sizes are still fixed at 128 bytes
+	if len(result.PublicKey) != DHKeyBytes {
+		t.Errorf("PublicKey size = %d, want %d", len(result.PublicKey), DHKeyBytes)
+	}
+	if len(result.SharedKey) != DHKeyBytes {
+		t.Errorf("SharedKey size = %d, want %d", len(result.SharedKey), DHKeyBytes)
+	}
+}
+
+func TestGenerateDHKeyPair_AcceptsVariableLengthKeys(t *testing.T) {
+	// Test various valid key lengths (all represent the same value: 1000)
+	testCases := []struct {
+		name string
+		key  []byte
+	}{
+		{"2 bytes", []byte{0x03, 0xE8}},             // 1000 in 2 bytes
+		{"3 bytes", []byte{0x00, 0x03, 0xE8}},       // 1000 in 3 bytes (with leading zero)
+		{"4 bytes", []byte{0x00, 0x00, 0x03, 0xE8}}, // 1000 in 4 bytes
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := GenerateDHKeyPair(tc.key)
+			if err != nil {
+				t.Fatalf("GenerateDHKeyPair failed for %s: %v", tc.name, err)
+			}
+			if len(result.PublicKey) != DHKeyBytes {
+				t.Errorf("PublicKey size = %d, want %d", len(result.PublicKey), DHKeyBytes)
+			}
+		})
+	}
+}
+
+func TestGenerateDHKeyPair_RejectsOversizedKey(t *testing.T) {
+	// Keys longer than 128 bytes should be rejected
+	oversizedKey := make([]byte, DHKeyBytes+1)
+	oversizedKey[0] = 0x01 // Non-zero to be a valid integer
+
+	_, err := GenerateDHKeyPair(oversizedKey)
+	if err == nil {
+		t.Error("GenerateDHKeyPair should reject keys > 128 bytes")
+	}
+}
+
+func TestGenerateDHKeyPair_RejectsEmptyKey(t *testing.T) {
+	_, err := GenerateDHKeyPair([]byte{})
+	if err == nil {
+		t.Error("GenerateDHKeyPair should reject empty keys")
+	}
+}
+
+func TestGenerateDHKeyPair_RejectsZeroKey(t *testing.T) {
+	// Key value of 0 is invalid (must be > 1)
+	zeroKey := make([]byte, DHKeyBytes)
+
+	_, err := GenerateDHKeyPair(zeroKey)
+	if err == nil {
+		t.Error("GenerateDHKeyPair should reject zero key (out of range)")
+	}
+}
+
+func TestGenerateDHKeyPair_RejectsOneKey(t *testing.T) {
+	// Key value of 1 is invalid (must be > 1)
+	oneKey := make([]byte, DHKeyBytes)
+	oneKey[DHKeyBytes-1] = 0x01
+
+	_, err := GenerateDHKeyPair(oneKey)
+	if err == nil {
+		t.Error("GenerateDHKeyPair should reject key value 1 (out of range)")
+	}
+}
+
+func TestGenerateDHKeyPair_RejectsShortOneKey(t *testing.T) {
+	// Short key representing value 1 is also invalid
+	oneKey := []byte{0x01}
+
+	_, err := GenerateDHKeyPair(oneKey)
+	if err == nil {
+		t.Error("GenerateDHKeyPair should reject short key value 1 (out of range)")
+	}
+}
+
+func TestDeriveAESKey_ProducesCorrectSize(t *testing.T) {
+	// Use a valid shared secret
+	sharedSecret := bytes.Repeat([]byte{0x42}, DHKeyBytes)
+
+	aesKey, err := DeriveAESKey(sharedSecret)
+	if err != nil {
+		t.Fatalf("DeriveAESKey failed: %v", err)
+	}
+
+	if len(aesKey) != AESKeyBytes {
+		t.Errorf("AES key size = %d, want %d", len(aesKey), AESKeyBytes)
+	}
+}
+
+func TestDHKeyExchange_Roundtrip(t *testing.T) {
+	// Simulate a proper DH key exchange between two parties
+	// This test verifies both parties derive the SAME shared secret
+
+	// Party A generates initial key pair with a dummy peer key
+	dummyPeerA := make([]byte, DHKeyBytes)
+	dummyPeerA[DHKeyBytes-1] = 0x42
+
+	pairA, err := GenerateDHKeyPair(dummyPeerA)
+	if err != nil {
+		t.Fatalf("Party A key generation failed: %v", err)
+	}
+
+	// Party B generates key pair using Party A's public key
+	pairB, err := GenerateDHKeyPair(pairA.PublicKey)
+	if err != nil {
+		t.Fatalf("Party B key generation failed: %v", err)
+	}
+
+	// Party A computes shared secret using B's public key WITH A's ORIGINAL private key
+	sharedKeyA, err := pairA.ComputeSharedSecret(pairB.PublicKey)
+	if err != nil {
+		t.Fatalf("Party A shared secret computation failed: %v", err)
+	}
+
+	// CRITICAL: Verify the shared secrets match
+	if !bytes.Equal(sharedKeyA, pairB.SharedKey) {
+		t.Errorf("Shared secrets don't match!\nA: %x\nB: %x", sharedKeyA, pairB.SharedKey)
+	}
+
+	// Derive AES keys and verify they match
+	aesKeyA, err := DeriveAESKey(sharedKeyA)
+	if err != nil {
+		t.Fatalf("Party A AES derivation failed: %v", err)
+	}
+	aesKeyB, err := DeriveAESKey(pairB.SharedKey)
+	if err != nil {
+		t.Fatalf("Party B AES derivation failed: %v", err)
+	}
+
+	if !bytes.Equal(aesKeyA, aesKeyB) {
+		t.Errorf("AES keys don't match!\nA: %x\nB: %x", aesKeyA, aesKeyB)
+	}
+
+	// Verify cross-party encryption works
+	plaintext := []byte("secret message from Party A")
+	ciphertext, iv, err := Encrypt(plaintext, aesKeyA)
+	if err != nil {
+		t.Fatalf("Encryption with A's key failed: %v", err)
+	}
+	decrypted, err := Decrypt(ciphertext, aesKeyB, iv)
+	if err != nil {
+		t.Fatalf("Decryption with B's key failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Errorf("Cross-party encryption failed: got %q, want %q", decrypted, plaintext)
+	}
+}
+
+func TestComputeSharedSecret_Validation(t *testing.T) {
+	dummyPeer := make([]byte, DHKeyBytes)
+	dummyPeer[DHKeyBytes-1] = 0x42
+
+	pair, err := GenerateDHKeyPair(dummyPeer)
+	if err != nil {
+		t.Fatalf("Key generation failed: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		peerKey []byte
+		wantErr bool
+	}{
+		{"empty key", []byte{}, true},
+		{"zero key", make([]byte, DHKeyBytes), true},
+		{"key value 1", []byte{0x01}, true},
+		{"oversized key", make([]byte, DHKeyBytes+1), true},
+		{"valid short key", []byte{0x42}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := pair.ComputeSharedSecret(tt.peerKey)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ComputeSharedSecret() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestComputeSharedSecret_NilPrivateKey(t *testing.T) {
+	pair := &DHKeyPair{
+		PublicKey:  make([]byte, DHKeyBytes),
+		SharedKey:  make([]byte, DHKeyBytes),
+		PrivateKey: nil,
+	}
+
+	validPeer := make([]byte, DHKeyBytes)
+	validPeer[DHKeyBytes-1] = 0x42
+
+	_, err := pair.ComputeSharedSecret(validPeer)
+	if err == nil {
+		t.Error("ComputeSharedSecret should fail with nil private key")
+	}
+}

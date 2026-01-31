@@ -12,10 +12,10 @@ import (
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
 
-// VaultClient defines the interface for Bitwarden operations needed by the SSH agent.
+// BitwardenClient defines the interface for Bitwarden operations needed by the SSH agent.
 // This interface allows for easier testing by providing a way to mock the client.
 // The client handles vault unlocking transparently - components don't need to check lock state.
-type VaultClient interface {
+type BitwardenClient interface {
 	ListItems(ctx context.Context) ([]bitwarden.Item, error)
 	CreateItem(ctx context.Context, req bitwarden.CreateItemRequest) (*bitwarden.Item, error)
 	DeleteItem(ctx context.Context, id string) error
@@ -73,3 +73,10 @@ var (
 	ErrNotSSHKeyItem         = errors.New("item is not an SSH key")
 	ErrAlreadyStarted        = errors.New("server already started")
 )
+
+// ItemLister is a minimal interface for listing items from a Bitwarden-like source.
+// This is satisfied by BitwardenClient and allows ListSSHKeys to accept any client
+// that can list items, enabling easier testing and composition.
+type ItemLister interface {
+	ListItems(ctx context.Context) ([]bitwarden.Item, error)
+}

@@ -14,17 +14,6 @@ import (
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
 
-// BitwardenClient defines the interface for Bitwarden operations needed by the Keyring.
-// This interface allows for easier testing by providing a way to mock the client.
-// The client handles vault unlocking transparently - components don't need to check lock state.
-type BitwardenClient interface {
-	ListItems(ctx context.Context) ([]bitwarden.Item, error)
-	CreateItem(ctx context.Context, req bitwarden.CreateItemRequest) (*bitwarden.Item, error)
-	DeleteItem(ctx context.Context, id string) error
-	Lock(ctx context.Context) error
-	Unlock(ctx context.Context, password string) (string, error)
-}
-
 // Keyring implements the agent.Agent interface using Bitwarden as the key store.
 type Keyring struct {
 	client BitwardenClient

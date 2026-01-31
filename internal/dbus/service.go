@@ -9,7 +9,6 @@ import (
 	"github.com/godbus/dbus/v5"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
-	"github.com/joe/bitwarden-keyring/internal/mapping"
 )
 
 // toDBusError converts backend errors to D-Bus errors with safe messages.
@@ -184,36 +183,11 @@ func (s *Service) SearchItems(attributes map[string]string) ([]dbus.ObjectPath, 
 
 // searchItemsInternal performs the actual search
 func (s *Service) searchItemsInternal(ctx context.Context, attributes map[string]string) ([]dbus.ObjectPath, error) {
-	uri := mapping.BuildURIFromAttributes(attributes)
-
-	var items []bitwarden.Item
-	var err error
-
-	if uri != "" {
-		items, err = s.bwClient.SearchItems(ctx, uri)
-	} else {
-		items, err = s.bwClient.ListItems(ctx)
-	}
-
+	coll, err := s.collectionManager.EnsureDefaultCollection()
 	if err != nil {
 		return nil, err
 	}
-
-	coll, _ := s.collectionManager.GetCollection(DefaultCollectionPath)
-
-	var results []dbus.ObjectPath
-	for _, item := range items {
-		if mapping.MatchesAttributes(&item, attributes) {
-			itemCopy := item
-			dbusItem, err := s.itemManager.GetOrCreateItem(&itemCopy, coll)
-			if err != nil {
-				continue
-			}
-			results = append(results, dbusItem.Path())
-		}
-	}
-
-	return results, nil
+	return searchAndFilterItems(ctx, s.bwClient, s.itemManager, coll, attributes)
 }
 
 // Unlock unlocks the specified objects (D-Bus method)
@@ -254,8 +228,8 @@ func (s *Service) Lock(objects []dbus.ObjectPath) ([]dbus.ObjectPath, dbus.Objec
 // GetSecrets gets secrets for multiple items (D-Bus method)
 func (s *Service) GetSecrets(items []dbus.ObjectPath, session dbus.ObjectPath) (map[dbus.ObjectPath]Secret, *dbus.Error) {
 	// Validate session
-	if _, ok := s.sessionManager.GetSession(session); !ok {
-		return nil, &dbus.Error{Name: ErrNoSession, Body: []interface{}{"Invalid session"}}
+	if _, dbusErr := s.sessionManager.GetSessionOrError(session); dbusErr != nil {
+		return nil, dbusErr
 	}
 
 	ctx := context.Background()

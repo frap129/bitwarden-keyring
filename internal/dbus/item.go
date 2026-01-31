@@ -178,27 +178,13 @@ func (im *ItemManager) RemoveItem(path dbus.ObjectPath) {
 
 	// Unexport all interfaces that were exported (only if export succeeded and conn exists)
 	if entry.err == nil && im.conn != nil {
-		im.conn.Export(nil, path, ItemInterface)
-		im.conn.Export(nil, path, PropertiesInterface)
-		im.conn.Export(nil, path, "org.freedesktop.DBus.Introspectable")
+		unexportDBusObject(im.conn, path, ItemInterface, true)
 	}
 }
 
 // exportItem exports an item to D-Bus
 func (im *ItemManager) exportItem(item *Item) error {
-	if err := im.conn.Export(item, item.path, ItemInterface); err != nil {
-		return err
-	}
-
-	if err := im.conn.Export(item, item.path, PropertiesInterface); err != nil {
-		return err
-	}
-
-	if err := im.conn.Export(introspectable(ItemIntrospectXML), item.path, "org.freedesktop.DBus.Introspectable"); err != nil {
-		return err
-	}
-
-	return nil
+	return exportDBusObject(im.conn, item, item.path, ItemInterface, ItemIntrospectXML, true)
 }
 
 // ItemPathFromID creates an item path from a Bitwarden item ID
@@ -250,9 +236,9 @@ func (i *Item) GetSecret(sessionPath dbus.ObjectPath) (Secret, *dbus.Error) {
 	}
 
 	// Get session for encryption
-	session, ok := i.sessionManager.GetSession(sessionPath)
-	if !ok {
-		return Secret{}, &dbus.Error{Name: ErrNoSession, Body: []interface{}{"Invalid session"}}
+	session, dbusErr := i.sessionManager.GetSessionOrError(sessionPath)
+	if dbusErr != nil {
+		return Secret{}, dbusErr
 	}
 
 	plaintext := []byte(*i.bwItem.Login.Password)
@@ -278,9 +264,9 @@ func (i *Item) SetSecret(secret Secret) *dbus.Error {
 	ctx := context.Background()
 
 	// Decrypt the secret if using encrypted session
-	session, ok := i.sessionManager.GetSession(secret.Session)
-	if !ok {
-		return &dbus.Error{Name: ErrNoSession, Body: []interface{}{"Invalid session"}}
+	session, dbusErr := i.sessionManager.GetSessionOrError(secret.Session)
+	if dbusErr != nil {
+		return dbusErr
 	}
 
 	decryptedValue, err := session.DecryptSecret(secret.Value, secret.Parameters)
@@ -325,12 +311,7 @@ func (i *Item) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 	// without holding the lock
 	if property == "Locked" {
 		ctx := context.Background()
-		locked, err := i.bwClient.IsLocked(ctx)
-		if err != nil {
-			// Default to locked=true on error (safe default)
-			locked = true
-		}
-		return dbus.MakeVariant(locked), nil
+		return dbus.MakeVariant(i.bwClient.IsLockedSafe(ctx)), nil
 	}
 
 	i.mu.RLock()
@@ -425,11 +406,7 @@ func (i *Item) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error) {
 
 	// Check lock state before holding the lock
 	ctx := context.Background()
-	locked, err := i.bwClient.IsLocked(ctx)
-	if err != nil {
-		// Default to locked=true on error (safe default)
-		locked = true
-	}
+	locked := i.bwClient.IsLockedSafe(ctx)
 
 	i.mu.RLock()
 	defer i.mu.RUnlock()

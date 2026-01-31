@@ -54,15 +54,11 @@ func ParseSSHKeyWithPassphrase(item *bitwarden.Item, passphrase []byte) (cryptos
 	return signer, nil
 }
 
-// KeyLister defines the interface for listing items from Bitwarden.
-type KeyLister interface {
-	ListItems(ctx context.Context) ([]bitwarden.Item, error)
-}
-
 // ListSSHKeys retrieves all SSH key items from the Bitwarden vault
 // and returns them with their parsed signers. Parse errors are collected
 // in the result struct so callers can decide how to handle them.
-func ListSSHKeys(ctx context.Context, client KeyLister) (*ListSSHKeysResult, error) {
+// The client parameter accepts any type satisfying ItemLister (including BitwardenClient).
+func ListSSHKeys(ctx context.Context, client ItemLister) (*ListSSHKeysResult, error) {
 	items, err := client.ListItems(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list items: %w", err)

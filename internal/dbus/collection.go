@@ -103,19 +103,7 @@ func (cm *CollectionManager) GetDefaultAlias() dbus.ObjectPath {
 
 // exportCollection exports a collection to D-Bus
 func (cm *CollectionManager) exportCollection(coll *Collection) error {
-	if err := cm.conn.Export(coll, coll.path, CollectionInterface); err != nil {
-		return err
-	}
-
-	if err := cm.conn.Export(coll, coll.path, PropertiesInterface); err != nil {
-		return err
-	}
-
-	if err := cm.conn.Export(introspectable(CollectionIntrospectXML), coll.path, "org.freedesktop.DBus.Introspectable"); err != nil {
-		return err
-	}
-
-	return nil
+	return exportDBusObject(cm.conn, coll, coll.path, CollectionInterface, CollectionIntrospectXML, true)
 }
 
 // Path returns the collection's object path
@@ -149,33 +137,9 @@ func (c *Collection) Delete() (dbus.ObjectPath, *dbus.Error) {
 func (c *Collection) SearchItems(attributes map[string]string) ([]dbus.ObjectPath, *dbus.Error) {
 	ctx := context.Background()
 
-	// Build search parameters from attributes
-	uri := mapping.BuildURIFromAttributes(attributes)
-
-	var items []bitwarden.Item
-	var err error
-
-	if uri != "" {
-		items, err = c.bwClient.SearchItems(ctx, uri)
-	} else {
-		items, err = c.bwClient.ListItems(ctx)
-	}
-
+	results, err := searchAndFilterItems(ctx, c.bwClient, c.itemManager, c, attributes)
 	if err != nil {
 		return nil, toDBusError(err)
-	}
-
-	// Filter by attributes
-	var results []dbus.ObjectPath
-	for _, item := range items {
-		if mapping.MatchesAttributes(&item, attributes) {
-			itemCopy := item
-			dbusItem, err := c.itemManager.GetOrCreateItem(&itemCopy, c)
-			if err != nil {
-				continue
-			}
-			results = append(results, dbusItem.Path())
-		}
 	}
 
 	return results, nil
@@ -186,9 +150,9 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 	ctx := context.Background()
 
 	// Decrypt the secret if using encrypted session
-	session, ok := c.sessionManager.GetSession(secret.Session)
-	if !ok {
-		return NoPrompt, NoPrompt, &dbus.Error{Name: ErrNoSession, Body: []interface{}{"Invalid session"}}
+	session, dbusErr := c.sessionManager.GetSessionOrError(secret.Session)
+	if dbusErr != nil {
+		return NoPrompt, NoPrompt, dbusErr
 	}
 
 	decryptedValue, err := session.DecryptSecret(secret.Value, secret.Parameters)
@@ -305,22 +269,9 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 	case "Items":
 		// Return all item paths, ensuring each item is exported
 		ctx := context.Background()
-		items, err := c.bwClient.ListItems(ctx)
+		paths, err := getLoginItemPaths(ctx, c.bwClient, c.itemManager, c)
 		if err != nil {
 			return dbus.Variant{}, toDBusError(err)
-		}
-
-		paths := make([]dbus.ObjectPath, 0, len(items))
-		for _, item := range items {
-			if item.Type == bitwarden.ItemTypeLogin {
-				// Ensure item is exported before returning its path
-				itemCopy := item
-				dbusItem, err := c.itemManager.GetOrCreateItem(&itemCopy, c)
-				if err != nil {
-					continue // Skip items that can't be exported
-				}
-				paths = append(paths, dbusItem.Path())
-			}
 		}
 		return dbus.MakeVariant(paths), nil
 
@@ -329,12 +280,7 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 
 	case "Locked":
 		ctx := context.Background()
-		// Default to locked=true on error (safe default)
-		locked, err := c.bwClient.IsLocked(ctx)
-		if err != nil {
-			locked = true
-		}
-		return dbus.MakeVariant(locked), nil
+		return dbus.MakeVariant(c.bwClient.IsLockedSafe(ctx)), nil
 
 	case "Created":
 		return dbus.MakeVariant(uint64(0)), nil
@@ -381,28 +327,12 @@ func (c *Collection) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error)
 
 	ctx := context.Background()
 
-	// Default to locked=true on error (safe default)
-	locked, err := c.bwClient.IsLocked(ctx)
-	if err != nil {
-		locked = true
-	}
+	locked := c.bwClient.IsLockedSafe(ctx)
 
-	// Return empty items list on error
-	items, err := c.bwClient.ListItems(ctx)
+	// Get item paths, using empty list on error
+	paths, err := getLoginItemPaths(ctx, c.bwClient, c.itemManager, c)
 	if err != nil {
-		items = nil
-	}
-	paths := make([]dbus.ObjectPath, 0, len(items))
-	for _, item := range items {
-		if item.Type == bitwarden.ItemTypeLogin {
-			// Ensure item is exported before returning its path
-			itemCopy := item
-			dbusItem, err := c.itemManager.GetOrCreateItem(&itemCopy, c)
-			if err != nil {
-				continue // Skip items that can't be exported
-			}
-			paths = append(paths, dbusItem.Path())
-		}
+		paths = nil
 	}
 
 	props := map[string]dbus.Variant{

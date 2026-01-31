@@ -17,6 +17,24 @@ import (
 	"time"
 )
 
+// jsonBody marshals v to JSON and returns a reader for HTTP request bodies.
+// This is a convenience helper to avoid repeated json.Marshal + bytes.NewReader patterns.
+func jsonBody(v interface{}) (io.Reader, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(data), nil
+}
+
+// decodeJSON reads JSON from r into v with a descriptive error message.
+func decodeJSON(r io.Reader, v interface{}, what string) error {
+	if err := json.NewDecoder(r).Decode(v); err != nil {
+		return fmt.Errorf("failed to decode %s: %w", what, err)
+	}
+	return nil
+}
+
 // APIError represents a sanitized API error that never leaks HTTP response bodies.
 // Use DebugDetails() to access the body for logging when debug mode is enabled.
 type APIError struct {
@@ -283,8 +301,8 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	defer resp.Body.Close()
 
 	var status StatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return nil, fmt.Errorf("failed to decode status response: %w", err)
+	if err := decodeJSON(resp.Body, &status, "status response"); err != nil {
+		return nil, err
 	}
 
 	return &status, nil
@@ -299,23 +317,34 @@ func (c *Client) IsLocked(ctx context.Context) (bool, error) {
 	return status.Data.Template.Status == "locked", nil
 }
 
+// IsLockedSafe returns whether the vault is currently locked, defaulting to true on error.
+// This is useful for D-Bus property getters that should return a safe default rather than
+// surfacing errors. Do not use this where errors should be propagated (e.g., in operations
+// that need to know the precise lock state before proceeding).
+func (c *Client) IsLockedSafe(ctx context.Context) bool {
+	locked, err := c.IsLocked(ctx)
+	if err != nil {
+		return true // Safe default: assume locked on error
+	}
+	return locked
+}
+
 // Unlock unlocks the vault with the provided password
 func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
-	payload := UnlockRequest{Password: password}
-	body, err := json.Marshal(payload)
+	body, err := jsonBody(UnlockRequest{Password: password})
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := c.doRequest(ctx, "POST", "/unlock", bytes.NewReader(body))
+	resp, err := c.doRequest(ctx, "POST", "/unlock", body)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	var result UnlockResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to decode unlock response: %w", err)
+	if err := decodeJSON(resp.Body, &result, "unlock response"); err != nil {
+		return "", err
 	}
 
 	if !result.Success {
@@ -433,8 +462,8 @@ func (c *Client) listItemsInternal(ctx context.Context) ([]Item, error) {
 	defer resp.Body.Close()
 
 	var result ListResponse[Item]
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode items response: %w", err)
+	if err := decodeJSON(resp.Body, &result, "items response"); err != nil {
+		return nil, err
 	}
 
 	return result.Data.Data, nil
@@ -464,8 +493,8 @@ func (c *Client) searchItemsInternal(ctx context.Context, searchURL string) ([]I
 	defer resp.Body.Close()
 
 	var result ListResponse[Item]
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode search response: %w", err)
+	if err := decodeJSON(resp.Body, &result, "search response"); err != nil {
+		return nil, err
 	}
 
 	return result.Data.Data, nil
@@ -492,8 +521,8 @@ func (c *Client) getItemInternal(ctx context.Context, id string) (*Item, error) 
 	defer resp.Body.Close()
 
 	var result APIResponse[Item]
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode item response: %w", err)
+	if err := decodeJSON(resp.Body, &result, "item response"); err != nil {
+		return nil, err
 	}
 
 	return &result.Data, nil
@@ -513,26 +542,20 @@ func (c *Client) GetItem(ctx context.Context, id string) (*Item, error) {
 
 // createItemInternal performs the actual CreateItem API call
 func (c *Client) createItemInternal(ctx context.Context, item CreateItemRequest) (*Item, error) {
-	body, err := json.Marshal(item)
+	body, err := jsonBody(item)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := c.doRequest(ctx, "POST", "/object/item", bytes.NewReader(body))
+	resp, err := c.doRequest(ctx, "POST", "/object/item", body)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Read raw response for decoding
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
 	var result APIResponse[Item]
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to decode create response: %w", err)
+	if err := decodeJSON(resp.Body, &result, "create item response"); err != nil {
+		return nil, err
 	}
 
 	if result.Data.ID == "" {
@@ -556,20 +579,20 @@ func (c *Client) CreateItem(ctx context.Context, item CreateItemRequest) (*Item,
 
 // updateItemInternal performs the actual UpdateItem API call
 func (c *Client) updateItemInternal(ctx context.Context, id string, item CreateItemRequest) (*Item, error) {
-	body, err := json.Marshal(item)
+	body, err := jsonBody(item)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := c.doRequest(ctx, "PUT", "/object/item/"+id, bytes.NewReader(body))
+	resp, err := c.doRequest(ctx, "PUT", "/object/item/"+id, body)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var result APIResponse[Item]
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode update response: %w", err)
+	if err := decodeJSON(resp.Body, &result, "update response"); err != nil {
+		return nil, err
 	}
 
 	return &result.Data, nil
@@ -614,8 +637,8 @@ func (c *Client) listFoldersInternal(ctx context.Context) ([]Folder, error) {
 	defer resp.Body.Close()
 
 	var result ListResponse[Folder]
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode folders response: %w", err)
+	if err := decodeJSON(resp.Body, &result, "folders response"); err != nil {
+		return nil, err
 	}
 
 	return result.Data.Data, nil
