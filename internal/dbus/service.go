@@ -12,6 +12,38 @@ import (
 	"github.com/joe/bitwarden-keyring/internal/mapping"
 )
 
+// toDBusError converts backend errors to D-Bus errors with safe messages.
+// It maps specific errors to their D-Bus equivalents and redacts generic errors
+// to prevent information leakage.
+func toDBusError(err error) *dbus.Error {
+	if err == nil {
+		return nil
+	}
+
+	// Map ErrVaultLocked to IsLocked error
+	if errors.Is(err, bitwarden.ErrVaultLocked) {
+		return &dbus.Error{
+			Name: ErrIsLocked,
+			Body: []interface{}{"Vault is locked"},
+		}
+	}
+
+	// Map ErrUserCancelled to PromptDismissed error
+	if errors.Is(err, bitwarden.ErrUserCancelled) {
+		return &dbus.Error{
+			Name: "org.freedesktop.Secret.Error.PromptDismissed",
+			Body: []interface{}{"Prompt was dismissed"},
+		}
+	}
+
+	// For all other errors (including APIError), return a generic "backend error"
+	// This prevents leaking HTTP bodies or other sensitive information
+	return &dbus.Error{
+		Name: "org.freedesktop.Secret.Error.Failed",
+		Body: []interface{}{"backend error"},
+	}
+}
+
 // Service implements the org.freedesktop.Secret.Service interface
 type Service struct {
 	conn              *dbus.Conn
@@ -108,7 +140,7 @@ func (s *Service) OpenSession(algorithm string, input dbus.Variant) (dbus.Varian
 
 	session, output, err := s.sessionManager.CreateSession(algorithm, inputBytes)
 	if err != nil {
-		return dbus.Variant{}, NoPrompt, dbus.MakeFailedError(err)
+		return dbus.Variant{}, NoPrompt, toDBusError(err)
 	}
 
 	return output, session.Path(), nil
@@ -119,7 +151,7 @@ func (s *Service) CreateCollection(properties map[string]dbus.Variant, alias str
 	// We only support the default collection for now
 	coll, err := s.collectionManager.EnsureDefaultCollection()
 	if err != nil {
-		return NoPrompt, NoPrompt, dbus.MakeFailedError(err)
+		return NoPrompt, NoPrompt, toDBusError(err)
 	}
 
 	return coll.Path(), NoPrompt, nil
@@ -132,7 +164,7 @@ func (s *Service) SearchItems(attributes map[string]string) ([]dbus.ObjectPath, 
 	// Check if vault is locked
 	locked, err := s.bwClient.IsLocked(ctx)
 	if err != nil {
-		return nil, nil, dbus.MakeFailedError(err)
+		return nil, nil, toDBusError(err)
 	}
 
 	if locked {
@@ -144,7 +176,7 @@ func (s *Service) SearchItems(attributes map[string]string) ([]dbus.ObjectPath, 
 	// Return items in unlocked, empty locked
 	items, err := s.searchItemsInternal(ctx, attributes)
 	if err != nil {
-		return nil, nil, dbus.MakeFailedError(err)
+		return nil, nil, toDBusError(err)
 	}
 
 	return items, nil, nil
@@ -191,7 +223,7 @@ func (s *Service) Unlock(objects []dbus.ObjectPath) ([]dbus.ObjectPath, dbus.Obj
 	// Check if already unlocked
 	locked, err := s.bwClient.IsLocked(ctx)
 	if err != nil {
-		return nil, NoPrompt, dbus.MakeFailedError(err)
+		return nil, NoPrompt, toDBusError(err)
 	}
 
 	if !locked {
@@ -202,7 +234,7 @@ func (s *Service) Unlock(objects []dbus.ObjectPath) ([]dbus.ObjectPath, dbus.Obj
 	// Create a prompt for unlocking
 	prompt, err := s.promptManager.CreateUnlockPrompt(objects)
 	if err != nil {
-		return nil, NoPrompt, dbus.MakeFailedError(err)
+		return nil, NoPrompt, toDBusError(err)
 	}
 
 	return nil, prompt.Path(), nil
@@ -213,7 +245,7 @@ func (s *Service) Lock(objects []dbus.ObjectPath) ([]dbus.ObjectPath, dbus.Objec
 	ctx := context.Background()
 
 	if err := s.bwClient.Lock(ctx); err != nil {
-		return nil, NoPrompt, dbus.MakeFailedError(err)
+		return nil, NoPrompt, toDBusError(err)
 	}
 
 	return objects, NoPrompt, nil
@@ -233,7 +265,7 @@ func (s *Service) GetSecrets(items []dbus.ObjectPath, session dbus.ObjectPath) (
 		if errors.Is(err, bitwarden.ErrUserCancelled) || errors.Is(err, bitwarden.ErrVaultLocked) {
 			return nil, &dbus.Error{Name: ErrIsLocked, Body: []interface{}{"Vault is locked"}}
 		}
-		return nil, dbus.MakeFailedError(err)
+		return nil, toDBusError(err)
 	}
 
 	secrets := make(map[dbus.ObjectPath]Secret)
@@ -272,7 +304,7 @@ func (s *Service) SetAlias(name string, collection dbus.ObjectPath) *dbus.Error 
 // Get implements org.freedesktop.DBus.Properties.Get
 func (s *Service) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 	if iface != ServiceInterface {
-		return dbus.Variant{}, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	switch property {
@@ -281,19 +313,19 @@ func (s *Service) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 		return dbus.MakeVariant(paths), nil
 
 	default:
-		return dbus.Variant{}, dbus.MakeFailedError(fmt.Errorf("unknown property: %s", property))
+		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown property: %s", property))
 	}
 }
 
 // Set implements org.freedesktop.DBus.Properties.Set
 func (s *Service) Set(iface, property string, value dbus.Variant) *dbus.Error {
-	return dbus.MakeFailedError(fmt.Errorf("property %s is read-only", property))
+	return toDBusError(fmt.Errorf("property %s is read-only", property))
 }
 
 // GetAll implements org.freedesktop.DBus.Properties.GetAll
 func (s *Service) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error) {
 	if iface != ServiceInterface {
-		return nil, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return nil, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	props := map[string]dbus.Variant{

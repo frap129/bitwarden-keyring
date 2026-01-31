@@ -142,7 +142,7 @@ func hasMeaningfulAttrs(attrs map[string]string) bool {
 // Delete deletes the collection (D-Bus method)
 func (c *Collection) Delete() (dbus.ObjectPath, *dbus.Error) {
 	// We don't support deleting the default collection
-	return NoPrompt, dbus.MakeFailedError(fmt.Errorf("cannot delete default collection"))
+	return NoPrompt, toDBusError(fmt.Errorf("cannot delete default collection"))
 }
 
 // SearchItems searches for items matching the given attributes (D-Bus method)
@@ -162,7 +162,7 @@ func (c *Collection) SearchItems(attributes map[string]string) ([]dbus.ObjectPat
 	}
 
 	if err != nil {
-		return nil, dbus.MakeFailedError(err)
+		return nil, toDBusError(err)
 	}
 
 	// Filter by attributes
@@ -193,7 +193,7 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 
 	decryptedValue, err := session.DecryptSecret(secret.Value, secret.Parameters)
 	if err != nil {
-		return NoPrompt, NoPrompt, dbus.MakeFailedError(fmt.Errorf("failed to decrypt secret: %w", err))
+		return NoPrompt, NoPrompt, toDBusError(fmt.Errorf("failed to decrypt secret: %w", err))
 	}
 
 	// Extract label from properties
@@ -222,7 +222,7 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 		items, err := c.bwClient.ListItems(ctx)
 		if err != nil {
 			// If we can't list items, we can't safely replace - fail the operation
-			return NoPrompt, NoPrompt, dbus.MakeFailedError(
+			return NoPrompt, NoPrompt, toDBusError(
 				fmt.Errorf("cannot check for existing items: %w", err))
 		}
 		for _, item := range items {
@@ -240,12 +240,12 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 
 				updated, err := c.bwClient.UpdateItem(ctx, item.ID, req)
 				if err != nil {
-					return NoPrompt, NoPrompt, dbus.MakeFailedError(err)
+					return NoPrompt, NoPrompt, toDBusError(err)
 				}
 
 				dbusItem, err := c.itemManager.GetOrCreateItem(updated, c)
 				if err != nil {
-					return NoPrompt, NoPrompt, dbus.MakeFailedError(err)
+					return NoPrompt, NoPrompt, toDBusError(err)
 				}
 
 				// Emit ItemChanged signal for updated item
@@ -278,12 +278,12 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 
 	created, err := c.bwClient.CreateItem(ctx, req)
 	if err != nil {
-		return NoPrompt, NoPrompt, dbus.MakeFailedError(err)
+		return NoPrompt, NoPrompt, toDBusError(err)
 	}
 
 	dbusItem, err := c.itemManager.GetOrCreateItem(created, c)
 	if err != nil {
-		return NoPrompt, NoPrompt, dbus.MakeFailedError(err)
+		return NoPrompt, NoPrompt, toDBusError(err)
 	}
 
 	// Emit ItemCreated signal for new item
@@ -295,7 +295,7 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 // Get implements org.freedesktop.DBus.Properties.Get
 func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 	if iface != CollectionInterface {
-		return dbus.Variant{}, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	c.mu.RLock()
@@ -307,7 +307,7 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 		ctx := context.Background()
 		items, err := c.bwClient.ListItems(ctx)
 		if err != nil {
-			return dbus.Variant{}, dbus.MakeFailedError(err)
+			return dbus.Variant{}, toDBusError(err)
 		}
 
 		paths := make([]dbus.ObjectPath, 0, len(items))
@@ -343,14 +343,14 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 		return dbus.MakeVariant(uint64(0)), nil
 
 	default:
-		return dbus.Variant{}, dbus.MakeFailedError(fmt.Errorf("unknown property: %s", property))
+		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown property: %s", property))
 	}
 }
 
 // Set implements org.freedesktop.DBus.Properties.Set
 func (c *Collection) Set(iface, property string, value dbus.Variant) *dbus.Error {
 	if iface != CollectionInterface {
-		return dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	c.mu.Lock()
@@ -360,20 +360,20 @@ func (c *Collection) Set(iface, property string, value dbus.Variant) *dbus.Error
 	case "Label":
 		label, ok := value.Value().(string)
 		if !ok {
-			return dbus.MakeFailedError(fmt.Errorf("invalid label type"))
+			return toDBusError(fmt.Errorf("invalid label type"))
 		}
 		c.label = label
 		return nil
 
 	default:
-		return dbus.MakeFailedError(fmt.Errorf("unknown or read-only property: %s", property))
+		return toDBusError(fmt.Errorf("unknown or read-only property: %s", property))
 	}
 }
 
 // GetAll implements org.freedesktop.DBus.Properties.GetAll
 func (c *Collection) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error) {
 	if iface != CollectionInterface {
-		return nil, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return nil, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	c.mu.RLock()

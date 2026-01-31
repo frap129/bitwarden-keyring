@@ -590,3 +590,164 @@ func TestEnsureUnlocked_RecheckAfterLockAvoidsPrompt(t *testing.T) {
 		t.Fatalf("/status calls = %d, want >=2", statusCalls)
 	}
 }
+
+// --- Error Sanitization Tests ---
+
+func TestAPIError_Error_NeverLeaksBody(t *testing.T) {
+	apiErr := &APIError{
+		StatusCode: 401,
+		Path:       "/unlock",
+		debugBody:  `{"error":"invalid password","password":"secret123"}`,
+	}
+
+	errMsg := apiErr.Error()
+
+	// Verify error message is safe
+	if errMsg != "API error 401 on /unlock" {
+		t.Errorf("Error() = %q, want %q", errMsg, "API error 401 on /unlock")
+	}
+
+	// Verify body is NOT in error message
+	if strings.Contains(errMsg, "secret123") {
+		t.Error("Error() leaked sensitive data from body")
+	}
+	if strings.Contains(errMsg, "password") {
+		t.Error("Error() leaked password field name")
+	}
+}
+
+func TestAPIError_DebugDetails_ReturnsBody(t *testing.T) {
+	body := `{"error":"test error"}`
+	apiErr := &APIError{
+		StatusCode: 400,
+		Path:       "/test",
+		debugBody:  body,
+	}
+
+	details := apiErr.DebugDetails()
+	if details != body {
+		t.Errorf("DebugDetails() = %q, want %q", details, body)
+	}
+}
+
+func TestLogHTTPBodySnippet_TruncatesLongBody(t *testing.T) {
+	// Create a body longer than 512 bytes
+	longBody := strings.Repeat("x", 600)
+
+	snippet := logHTTPBodySnippet("test", longBody)
+
+	// Should be truncated and capped at 512 bytes
+	if len(snippet) > 512 {
+		t.Errorf("logHTTPBodySnippet length = %d, want <= 512", len(snippet))
+	}
+
+	// Should contain truncation indicator
+	if !strings.Contains(snippet, "[truncated") {
+		t.Error("logHTTPBodySnippet missing [truncated indicator")
+	}
+}
+
+func TestLogHTTPBodySnippet_RedactsPassword(t *testing.T) {
+	body := `{"password":"secret123","username":"user"}`
+
+	snippet := logHTTPBodySnippet("test", body)
+
+	// Should redact password value
+	if strings.Contains(snippet, "secret123") {
+		t.Error("logHTTPBodySnippet failed to redact password")
+	}
+
+	// Should keep username
+	if !strings.Contains(snippet, "username") {
+		t.Error("logHTTPBodySnippet over-redacted username field")
+	}
+}
+
+func TestLogHTTPBodySnippet_RedactsToken(t *testing.T) {
+	body := `{"token":"abc123def456","data":"public"}`
+
+	snippet := logHTTPBodySnippet("test", body)
+
+	if strings.Contains(snippet, "abc123") {
+		t.Error("logHTTPBodySnippet failed to redact token")
+	}
+
+	if !strings.Contains(snippet, "data") {
+		t.Error("logHTTPBodySnippet over-redacted data field")
+	}
+}
+
+func TestLogHTTPBodySnippet_RedactsSession(t *testing.T) {
+	body := `{"session":"sessionkey123","public":"value"}`
+
+	snippet := logHTTPBodySnippet("test", body)
+
+	if strings.Contains(snippet, "sessionkey123") {
+		t.Error("logHTTPBodySnippet failed to redact session")
+	}
+}
+
+func TestLogHTTPBodySnippet_RedactsAuthorization(t *testing.T) {
+	body := `{"authorization":"Bearer token123","action":"list"}`
+
+	snippet := logHTTPBodySnippet("test", body)
+
+	if strings.Contains(snippet, "token123") {
+		t.Error("logHTTPBodySnippet failed to redact authorization")
+	}
+}
+
+func TestLogHTTPBodySnippet_RedactsRaw(t *testing.T) {
+	body := `{"raw":"sensitive_raw_data","name":"test"}`
+
+	snippet := logHTTPBodySnippet("test", body)
+
+	if strings.Contains(snippet, "sensitive_raw_data") {
+		t.Error("logHTTPBodySnippet failed to redact raw")
+	}
+}
+
+func TestLogHTTPBodySnippet_RedactsKey(t *testing.T) {
+	body := `{"key":"secret_key_123","id":"public_id"}`
+
+	snippet := logHTTPBodySnippet("test", body)
+
+	if strings.Contains(snippet, "secret_key") {
+		t.Error("logHTTPBodySnippet failed to redact key")
+	}
+}
+
+func TestLogHTTPBodySnippet_ShortBodyNotTruncated(t *testing.T) {
+	body := "short body"
+
+	snippet := logHTTPBodySnippet("test", body)
+
+	if strings.Contains(snippet, "[truncated") {
+		t.Error("logHTTPBodySnippet truncated short body")
+	}
+
+	if !strings.Contains(snippet, body) {
+		t.Error("logHTTPBodySnippet didn't preserve short body")
+	}
+}
+
+func TestSetDebug_ControlsLogging(t *testing.T) {
+	c := NewClient(8087)
+
+	// Initially debug should be false
+	if c.debug.Load() {
+		t.Error("debug should be false initially")
+	}
+
+	// Set to true
+	c.SetDebug(true)
+	if !c.debug.Load() {
+		t.Error("debug should be true after SetDebug(true)")
+	}
+
+	// Set to false
+	c.SetDebug(false)
+	if c.debug.Load() {
+		t.Error("debug should be false after SetDebug(false)")
+	}
+}

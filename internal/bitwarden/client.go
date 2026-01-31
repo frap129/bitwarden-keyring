@@ -10,15 +10,63 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// APIError represents a sanitized API error that never leaks HTTP response bodies.
+// Use DebugDetails() to access the body for logging when debug mode is enabled.
+type APIError struct {
+	StatusCode int
+	Path       string
+	debugBody  string // never exposed in Error()
+}
+
+// Error returns a safe error message without leaking the HTTP response body.
+func (e *APIError) Error() string {
+	return fmt.Sprintf("API error %d on %s", e.StatusCode, e.Path)
+}
+
+// DebugDetails returns the HTTP response body for debug logging.
+func (e *APIError) DebugDetails() string {
+	return e.debugBody
+}
+
 // passwordPrompter provides a way to prompt for passwords.
 // It is implemented by SessionManager and can be overridden in tests.
 type passwordPrompter interface {
 	PromptForPassword() (string, error)
+}
+
+// logHTTPBodySnippet returns a truncated and redacted snippet of an HTTP body for debug logging.
+// It truncates to at most 512 bytes total (including truncation marker and prefix) and redacts sensitive fields
+// like password, token, etc. The prefix is prepended to the output for context.
+func logHTTPBodySnippet(prefix, body string) string {
+	const maxLen = 512
+	const truncationMarker = "[truncated...]"
+
+	// Account for prefix and separator in total length
+	prefixLen := len(prefix) + len(": ")
+	maxBodyLen := maxLen - prefixLen
+
+	// Truncate if needed, accounting for the marker
+	if len(body) > maxBodyLen {
+		// Leave room for the truncation marker
+		availableLen := maxBodyLen - len(truncationMarker)
+		if availableLen > 0 {
+			body = body[:availableLen] + truncationMarker
+		} else {
+			body = truncationMarker
+		}
+	}
+
+	// Redact sensitive patterns: password, raw, token, session, authorization, key
+	redactionPattern := regexp.MustCompile(`(?i)"(password|raw|token|session|authorization|key)"\s*:\s*"([^"]*)"`)
+	redacted := redactionPattern.ReplaceAllString(body, `"$1":"[redacted]"`)
+
+	return prefix + ": " + redacted
 }
 
 // Client provides access to the Bitwarden CLI REST API
@@ -30,6 +78,7 @@ type Client struct {
 	serveCmd   *exec.Cmd
 	unlockMu   sync.Mutex
 	autoUnlock atomic.Bool
+	debug      atomic.Bool
 	prompter   passwordPrompter // used for password prompting; defaults to session
 }
 
@@ -57,6 +106,13 @@ func NewClientWithConfig(port int, sessionCfg SessionConfig) *Client {
 // This is useful for testing or programmatic control.
 func (c *Client) SetAutoUnlock(enabled bool) {
 	c.autoUnlock.Store(enabled)
+}
+
+// SetDebug enables or disables HTTP body logging for errors.
+// When enabled, APIError.DebugDetails() will contain response bodies (up to 4096 bytes),
+// which are redacted but should only be logged with --debug flag.
+func (c *Client) SetDebug(enabled bool) {
+	c.debug.Store(enabled)
 }
 
 // StartServe starts the 'bw serve' process if not already running
@@ -373,7 +429,7 @@ func (c *Client) createItemInternal(ctx context.Context, item CreateItemRequest)
 	}
 	defer resp.Body.Close()
 
-	// Read raw response for debugging
+	// Read raw response for decoding
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
@@ -381,11 +437,11 @@ func (c *Client) createItemInternal(ctx context.Context, item CreateItemRequest)
 
 	var result APIResponse[Item]
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to decode create response: %w (body: %s)", err, string(respBody))
+		return nil, fmt.Errorf("failed to decode create response: %w", err)
 	}
 
 	if result.Data.ID == "" {
-		return nil, fmt.Errorf("created item has no ID (body: %s)", string(respBody))
+		return nil, fmt.Errorf("created item has no ID")
 	}
 
 	return &result.Data, nil
@@ -498,8 +554,21 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body io.Rea
 
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+		// Read at most 4096 bytes of the response body
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		bodyStr := string(bodyBytes)
+
+		apiErr := &APIError{
+			StatusCode: resp.StatusCode,
+			Path:       path,
+			debugBody:  bodyStr,
+		}
+
+		if c.debug.Load() {
+			fmt.Fprintf(os.Stderr, "HTTP error %d on %s: %s\n", resp.StatusCode, path, logHTTPBodySnippet("Response", bodyStr))
+		}
+
+		return nil, apiErr
 	}
 
 	return resp, nil

@@ -140,7 +140,7 @@ func (i *Item) Delete() (dbus.ObjectPath, *dbus.Error) {
 	i.mu.RUnlock()
 
 	if err := i.bwClient.DeleteItem(ctx, id); err != nil {
-		return NoPrompt, dbus.MakeFailedError(err)
+		return NoPrompt, toDBusError(err)
 	}
 
 	// Remove from manager and unexport all interfaces
@@ -158,7 +158,7 @@ func (i *Item) GetSecret(sessionPath dbus.ObjectPath) (Secret, *dbus.Error) {
 	defer i.mu.RUnlock()
 
 	if i.bwItem.Login == nil || i.bwItem.Login.Password == nil {
-		return Secret{}, dbus.MakeFailedError(fmt.Errorf("item has no password"))
+		return Secret{}, toDBusError(fmt.Errorf("item has no password"))
 	}
 
 	// Get session for encryption
@@ -172,7 +172,7 @@ func (i *Item) GetSecret(sessionPath dbus.ObjectPath) (Secret, *dbus.Error) {
 	// Encrypt if needed
 	value, params, err := session.EncryptSecret(plaintext)
 	if err != nil {
-		return Secret{}, dbus.MakeFailedError(err)
+		return Secret{}, toDBusError(err)
 	}
 
 	secret := Secret{
@@ -197,7 +197,7 @@ func (i *Item) SetSecret(secret Secret) *dbus.Error {
 
 	decryptedValue, err := session.DecryptSecret(secret.Value, secret.Parameters)
 	if err != nil {
-		return dbus.MakeFailedError(fmt.Errorf("failed to decrypt secret: %w", err))
+		return toDBusError(fmt.Errorf("failed to decrypt secret: %w", err))
 	}
 
 	i.mu.Lock()
@@ -205,7 +205,7 @@ func (i *Item) SetSecret(secret Secret) *dbus.Error {
 
 	// Guard against nil Login struct
 	if i.bwItem.Login == nil {
-		return dbus.MakeFailedError(fmt.Errorf("item has no login credentials"))
+		return toDBusError(fmt.Errorf("item has no login credentials"))
 	}
 
 	password := string(decryptedValue)
@@ -216,7 +216,7 @@ func (i *Item) SetSecret(secret Secret) *dbus.Error {
 
 	updated, err := i.bwClient.UpdateItem(ctx, i.bwItem.ID, req)
 	if err != nil {
-		return dbus.MakeFailedError(err)
+		return toDBusError(err)
 	}
 
 	i.bwItem = updated
@@ -230,7 +230,7 @@ func (i *Item) SetSecret(secret Secret) *dbus.Error {
 // Get implements org.freedesktop.DBus.Properties.Get
 func (i *Item) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 	if iface != ItemInterface {
-		return dbus.Variant{}, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	// Handle Locked property separately since it needs to query bwClient
@@ -263,14 +263,14 @@ func (i *Item) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 		return dbus.MakeVariant(uint64(i.bwItem.RevisionDate.Unix())), nil
 
 	default:
-		return dbus.Variant{}, dbus.MakeFailedError(fmt.Errorf("unknown property: %s", property))
+		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown property: %s", property))
 	}
 }
 
 // Set implements org.freedesktop.DBus.Properties.Set
 func (i *Item) Set(iface, property string, value dbus.Variant) *dbus.Error {
 	if iface != ItemInterface {
-		return dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	ctx := context.Background()
@@ -282,7 +282,7 @@ func (i *Item) Set(iface, property string, value dbus.Variant) *dbus.Error {
 	case "Label":
 		label, ok := value.Value().(string)
 		if !ok {
-			return dbus.MakeFailedError(fmt.Errorf("invalid label type"))
+			return toDBusError(fmt.Errorf("invalid label type"))
 		}
 		i.bwItem.Name = label
 
@@ -291,7 +291,7 @@ func (i *Item) Set(iface, property string, value dbus.Variant) *dbus.Error {
 
 		updated, err := i.bwClient.UpdateItem(ctx, i.bwItem.ID, req)
 		if err != nil {
-			return dbus.MakeFailedError(err)
+			return toDBusError(err)
 		}
 		i.bwItem = updated
 
@@ -303,7 +303,7 @@ func (i *Item) Set(iface, property string, value dbus.Variant) *dbus.Error {
 	case "Attributes":
 		attrs, ok := value.Value().(map[string]string)
 		if !ok {
-			return dbus.MakeFailedError(fmt.Errorf("invalid attributes type: expected map[string]string"))
+			return toDBusError(fmt.Errorf("invalid attributes type: expected map[string]string"))
 		}
 
 		// Update item from attributes
@@ -315,7 +315,7 @@ func (i *Item) Set(iface, property string, value dbus.Variant) *dbus.Error {
 		// Save to Bitwarden
 		updated, err := i.bwClient.UpdateItem(ctx, i.bwItem.ID, req)
 		if err != nil {
-			return dbus.MakeFailedError(fmt.Errorf("failed to update item: %w", err))
+			return toDBusError(fmt.Errorf("failed to update item: %w", err))
 		}
 		i.bwItem = updated
 
@@ -325,14 +325,14 @@ func (i *Item) Set(iface, property string, value dbus.Variant) *dbus.Error {
 		return nil
 
 	default:
-		return dbus.MakeFailedError(fmt.Errorf("unknown or read-only property: %s", property))
+		return toDBusError(fmt.Errorf("unknown or read-only property: %s", property))
 	}
 }
 
 // GetAll implements org.freedesktop.DBus.Properties.GetAll
 func (i *Item) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error) {
 	if iface != ItemInterface {
-		return nil, dbus.MakeFailedError(fmt.Errorf("unknown interface: %s", iface))
+		return nil, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
 	// Check lock state before holding the lock

@@ -23,6 +23,7 @@ import (
 var (
 	port            = flag.Int("port", 8087, "Port for Bitwarden serve API")
 	debug           = flag.Bool("debug", false, "Enable debug logging")
+	debugHTTP       = flag.Bool("debug-http", false, "Enable HTTP body logging for errors (requires --debug to be effective)")
 	noctaliaFlag    = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
 	noctaliaSocket  = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-polkit-agent.sock)")
 	noctaliaTimeout = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
@@ -126,6 +127,11 @@ func main() {
 
 	// Create Bitwarden client with session config
 	bwClient := bitwarden.NewClientWithConfig(*port, sessionCfg)
+
+	// Enable HTTP body logging if both --debug and --debug-http are set
+	if *debug && *debugHTTP {
+		bwClient.SetDebug(true)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
