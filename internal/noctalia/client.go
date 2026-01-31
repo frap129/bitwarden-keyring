@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -75,12 +76,79 @@ func defaultSocketPath() string {
 
 // IsAvailable checks if the Noctalia agent socket exists and is accessible
 func (c *Client) IsAvailable() bool {
-	info, err := os.Stat(c.socketPath)
+	return c.ValidateSocket() == nil
+}
+
+// ValidateSocket validates that the socket exists and has secure permissions.
+// It checks:
+// - Socket is not a symbolic link
+// - Path is actually a socket
+// - Socket is owned by the current user
+// - Socket is not group or world writable
+// - Parent directory is owned by current user and not group/world writable
+func (c *Client) ValidateSocket() error {
+	// Use Lstat to detect symlinks (doesn't follow them)
+	info, err := os.Lstat(c.socketPath)
 	if err != nil {
-		return false
+		if os.IsNotExist(err) {
+			return ErrSocketNotFound
+		}
+		return fmt.Errorf("failed to stat socket: %w", err)
 	}
-	// Check if it's a socket
-	return info.Mode()&os.ModeSocket != 0
+
+	// Reject symbolic links
+	if info.Mode()&os.ModeSymlink != 0 {
+		return ErrSocketSymlink
+	}
+
+	// Verify it's actually a socket
+	if info.Mode()&os.ModeSocket == 0 {
+		return ErrSocketNotSocket
+	}
+
+	// Get the underlying syscall stat to check UID
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("failed to get socket stat info")
+	}
+
+	// Verify socket is owned by current user
+	currentUID := uint32(os.Getuid())
+	if stat.Uid != currentUID {
+		return ErrSocketOwner
+	}
+
+	// Check socket permissions - reject group or world writable
+	mode := info.Mode().Perm()
+	if mode&0022 != 0 { // Check group-write (020) and world-write (002) bits
+		return ErrSocketPermissions
+	}
+
+	// Validate parent directory
+	parentDir := filepath.Dir(c.socketPath)
+	parentInfo, err := os.Lstat(parentDir)
+	if err != nil {
+		return fmt.Errorf("failed to stat parent directory: %w", err)
+	}
+
+	// Get parent directory stat
+	parentStat, ok := parentInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("failed to get parent directory stat info")
+	}
+
+	// Verify parent directory is owned by current user
+	if parentStat.Uid != currentUID {
+		return ErrSocketParentOwner
+	}
+
+	// Check parent directory permissions - reject group or world writable
+	parentMode := parentInfo.Mode().Perm()
+	if parentMode&0022 != 0 {
+		return ErrSocketParentPerms
+	}
+
+	return nil
 }
 
 // SocketPath returns the configured socket path
@@ -92,8 +160,9 @@ func (c *Client) SocketPath() string {
 // the user to enter their password. The connection is kept open until a response
 // is received or the context is cancelled.
 func (c *Client) RequestPassword(ctx context.Context, title, message string) (string, error) {
-	if !c.IsAvailable() {
-		return "", ErrSocketNotFound
+	// Validate socket security before attempting connection
+	if err := c.ValidateSocket(); err != nil {
+		return "", err
 	}
 
 	// Generate unique cookie for this request

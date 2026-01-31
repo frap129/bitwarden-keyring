@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -287,5 +288,131 @@ func TestGenerateCookie(t *testing.T) {
 	cookie2, _ := generateCookie()
 	if cookie1 == cookie2 {
 		t.Error("generateCookie() produced duplicate cookies")
+	}
+}
+
+func TestClient_ValidateSocket_RejectsSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	socketPath := filepath.Join(tmpDir, "real.sock")
+	symlinkPath := filepath.Join(tmpDir, "link.sock")
+
+	// Create real socket
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Create symlink pointing to the socket
+	if err := os.Symlink(socketPath, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	client := NewClient(WithSocketPath(symlinkPath))
+	err = client.ValidateSocket()
+
+	if !errors.Is(err, ErrSocketSymlink) {
+		t.Errorf("ValidateSocket() error = %v, want ErrSocketSymlink", err)
+	}
+}
+
+func TestClient_ValidateSocket_RejectsWorldWritable(t *testing.T) {
+	tmpDir := t.TempDir()
+	socketPath := filepath.Join(tmpDir, "test.sock")
+
+	// Create socket
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Make socket world-writable
+	if err := os.Chmod(socketPath, 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	client := NewClient(WithSocketPath(socketPath))
+	err = client.ValidateSocket()
+
+	if !errors.Is(err, ErrSocketPermissions) {
+		t.Errorf("ValidateSocket() error = %v, want ErrSocketPermissions", err)
+	}
+}
+
+func TestClient_ValidateSocket_RejectsGroupWritable(t *testing.T) {
+	tmpDir := t.TempDir()
+	socketPath := filepath.Join(tmpDir, "test.sock")
+
+	// Create socket
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Make socket group-writable
+	if err := os.Chmod(socketPath, 0770); err != nil {
+		t.Fatal(err)
+	}
+
+	client := NewClient(WithSocketPath(socketPath))
+	err = client.ValidateSocket()
+
+	if !errors.Is(err, ErrSocketPermissions) {
+		t.Errorf("ValidateSocket() error = %v, want ErrSocketPermissions", err)
+	}
+}
+
+func TestClient_ValidateSocket_RejectsBadParentDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "subdir")
+	if err := os.Mkdir(subDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	socketPath := filepath.Join(subDir, "test.sock")
+
+	// Create socket
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Make parent directory world-writable
+	if err := os.Chmod(subDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	client := NewClient(WithSocketPath(socketPath))
+	err = client.ValidateSocket()
+
+	if !errors.Is(err, ErrSocketParentPerms) {
+		t.Errorf("ValidateSocket() error = %v, want ErrSocketParentPerms", err)
+	}
+}
+
+func TestClient_ValidateSocket_AcceptsValid(t *testing.T) {
+	tmpDir := t.TempDir()
+	socketPath := filepath.Join(tmpDir, "test.sock")
+
+	// Create socket with safe permissions (user only)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Ensure socket has safe permissions
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := NewClient(WithSocketPath(socketPath))
+	err = client.ValidateSocket()
+
+	if err != nil {
+		t.Errorf("ValidateSocket() unexpected error for valid socket: %v", err)
 	}
 }

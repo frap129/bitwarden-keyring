@@ -54,4 +54,22 @@ var (
 
 	// ErrCookieMismatch indicates the response cookie doesn't match the request
 	ErrCookieMismatch = errors.New("response cookie does not match request")
+
+	// ErrSocketSymlink indicates the socket path is a symbolic link
+	ErrSocketSymlink = errors.New("socket is a symbolic link")
+
+	// ErrSocketNotSocket indicates the path exists but is not a socket
+	ErrSocketNotSocket = errors.New("path is not a socket")
+
+	// ErrSocketPermissions indicates the socket has unsafe permissions
+	ErrSocketPermissions = errors.New("socket has unsafe permissions (group or world writable)")
+
+	// ErrSocketOwner indicates the socket is owned by a different user
+	ErrSocketOwner = errors.New("socket owned by different user")
+
+	// ErrSocketParentPerms indicates the parent directory has unsafe permissions
+	ErrSocketParentPerms = errors.New("parent directory has unsafe permissions (group or world writable)")
+
+	// ErrSocketParentOwner indicates the parent directory is owned by a different user
+	ErrSocketParentOwner = errors.New("socket parent directory owned by different user")
 )
