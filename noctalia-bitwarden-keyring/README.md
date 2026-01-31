@@ -18,7 +18,7 @@ This plugin integrates with [bitwarden-keyring](https://github.com/frap129/bitwa
    ```bash
    # Copy to Noctalia plugins directory
    mkdir -p ~/.config/noctalia/plugins
-   cp -r noctalia-plugin ~/.config/noctalia/plugins/bitwarden-keyring
+   cp -r noctalia-bitwarden-keyring ~/.config/noctalia/plugins/bitwarden-keyring
    ```
 
 2. **Enable the plugin in Noctalia settings**
