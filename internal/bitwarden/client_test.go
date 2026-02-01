@@ -3,10 +3,14 @@ package bitwarden
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -967,6 +971,126 @@ func TestStartServe_FailClosed_StopsOnReadinessFailure(t *testing.T) {
 	// We can't easily test this without mocking exec.Command
 	// For now, this test documents the expected behavior
 	t.Skip("TODO: implement with exec.Command mocking or integration test")
+}
+
+func TestStartServe_CancelContextAfterReady_DoesNotStopServe(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow test in short mode")
+	}
+
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+
+	// Install a `bw` shim in PATH that implements `bw serve`.
+	shimDir := t.TempDir()
+	bwPath := filepath.Join(shimDir, "bw")
+	shim := `#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" != "serve" ]; then
+  echo "unsupported command: ${1:-}" 1>&2
+  exit 2
+fi
+
+host="127.0.0.1"
+port=""
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --hostname)
+      host="$2"; shift 2 ;;
+    --port)
+      port="$2"; shift 2 ;;
+    *)
+      shift ;;
+  esac
+done
+
+if [ -z "$port" ]; then
+  echo "missing --port" 1>&2
+  exit 2
+fi
+
+export BW_SHIM_PORT="$port"
+
+exec python3 - <<'PY'
+import http.server
+import json
+import socketserver
+
+HOST = "127.0.0.1"
+PORT = int(__import__("os").environ["BW_SHIM_PORT"])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/status":
+            body = json.dumps({"success": True, "data": {"template": {"status": "locked"}}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # Silence test output
+        return
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer((HOST, PORT), Handler) as httpd:
+    httpd.serve_forever()
+PY
+`
+
+	if err := os.WriteFile(bwPath, []byte(shim), 0o755); err != nil {
+		t.Fatalf("write bw shim: %v", err)
+	}
+
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Pick a port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	// Start serve with a startup timeout context, then cancel it after readiness.
+	c := NewClient(port)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Pass chosen port to the shim via env.
+	c.mu.Lock()
+	// StartServe uses os.Environ when starting the process. We can't directly set Cmd.Env here,
+	// so we use an env var that the shim reads.
+	c.mu.Unlock()
+	t.Setenv("BW_SHIM_PORT", fmt.Sprintf("%d", port))
+
+	if err := c.StartServe(ctx, port); err != nil {
+		t.Fatalf("StartServe() error = %v", err)
+	}
+
+	// Canceling ctx after readiness should not stop the serve process.
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := c.ServeHealthy(); err != nil {
+		t.Fatalf("ServeHealthy() after ctx cancel error = %v", err)
+	}
+
+	if _, err := c.Status(context.Background()); err != nil {
+		t.Fatalf("Status() after ctx cancel error = %v", err)
+	}
+
+	if err := c.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
 }
 
 // --- Password Retry Tests ---

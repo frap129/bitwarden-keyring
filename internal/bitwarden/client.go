@@ -163,7 +163,10 @@ func (c *Client) StartServe(ctx context.Context, port int) error {
 		return fmt.Errorf("bitwarden CLI (bw) not found in PATH: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "bw", "serve", "--hostname", "127.0.0.1", "--port", fmt.Sprintf("%d", port))
+	// NOTE: Do not bind the lifetime of the long-running `bw serve` process to the
+	// caller-provided context. Callers typically pass a startup timeout context
+	// that is canceled after readiness. We use ctx only for readiness checks.
+	cmd := exec.Command("bw", "serve", "--hostname", "127.0.0.1", "--port", fmt.Sprintf("%d", port))
 
 	// Pass through session key if available
 	sessionKey := c.session.GetSession()
