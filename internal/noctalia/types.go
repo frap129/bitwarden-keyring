@@ -32,6 +32,23 @@ const (
 	ResultConfirmed = "confirmed" // User confirmed (for confirm_only requests)
 )
 
+// Message type constants
+const (
+	MessageTypeRequest  = "keyring_request"
+	MessageTypeResponse = "keyring_response"
+	MessageTypeResult   = "keyring_result"
+)
+
+// KeyringResult is sent from the Go client back to the plugin after an unlock attempt.
+// This enables two-phase communication for password retry support.
+type KeyringResult struct {
+	Type    string `json:"type"`            // Always "keyring_result"
+	ID      string `json:"id"`              // Matches the request cookie
+	Success bool   `json:"success"`         // Whether unlock succeeded
+	Error   string `json:"error,omitempty"` // Error message if !Success
+	Retry   bool   `json:"retry,omitempty"` // Whether retry is allowed (only when !Success)
+}
+
 // Error types for Noctalia IPC operations
 var (
 	// ErrSocketNotFound indicates the Noctalia agent socket does not exist

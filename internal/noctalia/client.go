@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -156,24 +157,162 @@ func (c *Client) SocketPath() string {
 	return c.socketPath
 }
 
-// RequestPassword sends a password request to the Noctalia agent and waits for
-// the user to enter their password. The connection is kept open until a response
-// is received or the context is cancelled.
-func (c *Client) RequestPassword(ctx context.Context, title, message string) (string, error) {
+// PasswordSession represents an active password prompt session with the Noctalia plugin.
+// It keeps the connection open to enable two-phase communication for password retry support.
+type PasswordSession struct {
+	conn   net.Conn
+	cookie string
+	closed bool
+	mu     sync.Mutex
+}
+
+// SendResult sends the unlock result back to the plugin.
+// This should be called after attempting to unlock the vault with the password.
+// If success is true, the plugin will close the dialog.
+// If success is false and retry is true, the plugin will show the error and allow retry.
+// The session is automatically closed after sending the result.
+func (s *PasswordSession) SendResult(success bool, errMsg string, retry bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return errors.New("session already closed")
+	}
+
+	result := KeyringResult{
+		Type:    MessageTypeResult,
+		ID:      s.cookie,
+		Success: success,
+		Error:   errMsg,
+		Retry:   retry,
+	}
+
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		s.close()
+		return fmt.Errorf("failed to marshal result: %w", err)
+	}
+	resultBytes = append(resultBytes, '\n')
+
+	// Set a write deadline to avoid blocking forever
+	if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		s.close()
+		return fmt.Errorf("failed to set write deadline: %w", err)
+	}
+
+	if _, err := s.conn.Write(resultBytes); err != nil {
+		s.close()
+		return fmt.Errorf("failed to send result: %w", err)
+	}
+
+	// Close after sending success result, keep open for retry
+	if success || !retry {
+		s.close()
+	}
+
+	return nil
+}
+
+// WaitForRetry waits for the user to submit a new password after a failed attempt.
+// This should only be called after SendResult(false, errMsg, true).
+// Returns the new password or an error if the user cancels or times out.
+func (s *PasswordSession) WaitForRetry(ctx context.Context, timeout time.Duration) (string, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return "", errors.New("session already closed")
+	}
+	conn := s.conn
+	cookie := s.cookie
+	s.mu.Unlock()
+
+	// Set read deadline
+	deadline := time.Now().Add(timeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return "", fmt.Errorf("failed to set read deadline: %w", err)
+	}
+
+	// Wait for response
+	reader := bufio.NewReader(conn)
+	respLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		s.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return "", ErrTimeout
+		}
+		if errors.Is(err, io.EOF) {
+			return "", ErrCancelled
+		}
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Parse response
+	var resp KeyringResponse
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		s.Close()
+		return "", fmt.Errorf("%w: invalid JSON response: %v", ErrProtocolError, err)
+	}
+
+	// Validate response
+	if resp.Type != MessageTypeResponse {
+		s.Close()
+		return "", fmt.Errorf("%w: unexpected response type: %s", ErrProtocolError, resp.Type)
+	}
+
+	if resp.ID != cookie {
+		s.Close()
+		return "", fmt.Errorf("%w: expected %s, got %s", ErrCookieMismatch, cookie, resp.ID)
+	}
+
+	switch resp.Result {
+	case ResultOK:
+		return resp.Password, nil
+	case ResultCancelled:
+		s.Close()
+		return "", ErrCancelled
+	default:
+		s.Close()
+		return "", fmt.Errorf("%w: unknown result: %s", ErrProtocolError, resp.Result)
+	}
+}
+
+// Close closes the session connection.
+func (s *PasswordSession) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.close()
+}
+
+// close closes the connection (must be called with lock held)
+func (s *PasswordSession) close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.conn.Close()
+}
+
+// RequestPasswordWithSession sends a password request to the Noctalia agent and returns
+// a session that can be used to send unlock results and handle retries.
+// The caller must close the session when done.
+func (c *Client) RequestPasswordWithSession(ctx context.Context, title, message string) (string, *PasswordSession, error) {
 	// Validate socket security before attempting connection
 	if err := c.ValidateSocket(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Generate unique cookie for this request
 	cookie, err := generateCookie()
 	if err != nil {
-		return "", fmt.Errorf("failed to generate cookie: %w", err)
+		return "", nil, fmt.Errorf("failed to generate cookie: %w", err)
 	}
 
 	// Create request
 	req := KeyringRequest{
-		Type:        "keyring_request",
+		Type:        MessageTypeRequest,
 		Cookie:      cookie,
 		Title:       title,
 		Message:     message,
@@ -186,9 +325,8 @@ func (c *Client) RequestPassword(ctx context.Context, title, message string) (st
 	dialer := net.Dialer{Timeout: connectTimeout}
 	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrConnectionFailed, err)
+		return "", nil, fmt.Errorf("%w: %v", ErrConnectionFailed, err)
 	}
-	defer conn.Close()
 
 	// Set read deadline based on timeout
 	deadline := time.Now().Add(c.timeout)
@@ -196,60 +334,76 @@ func (c *Client) RequestPassword(ctx context.Context, title, message string) (st
 		deadline = d
 	}
 	if err := conn.SetReadDeadline(deadline); err != nil {
-		return "", fmt.Errorf("failed to set read deadline: %w", err)
+		conn.Close()
+		return "", nil, fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
 	// Send request as newline-delimited JSON
 	reqBytes, err := json.Marshal(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		conn.Close()
+		return "", nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 	reqBytes = append(reqBytes, '\n')
 
 	if _, err := conn.Write(reqBytes); err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
+		conn.Close()
+		return "", nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
 	// Wait for response (blocking read, connection stays open)
 	reader := bufio.NewReader(conn)
 	respLine, err := reader.ReadBytes('\n')
 	if err != nil {
+		conn.Close()
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return "", ErrTimeout
+			return "", nil, ErrTimeout
 		}
 		// Connection closed without response = user cancelled (closed the window)
 		if errors.Is(err, io.EOF) {
-			return "", ErrCancelled
+			return "", nil, ErrCancelled
 		}
-		return "", fmt.Errorf("failed to read response: %w", err)
+		return "", nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	// Parse response
 	var resp KeyringResponse
 	if err := json.Unmarshal(respLine, &resp); err != nil {
-		return "", fmt.Errorf("%w: invalid JSON response: %v", ErrProtocolError, err)
+		conn.Close()
+		return "", nil, fmt.Errorf("%w: invalid JSON response: %v", ErrProtocolError, err)
 	}
 
 	// Validate response type
-	if resp.Type != "keyring_response" {
-		return "", fmt.Errorf("%w: unexpected response type: %s", ErrProtocolError, resp.Type)
+	if resp.Type != MessageTypeResponse {
+		conn.Close()
+		return "", nil, fmt.Errorf("%w: unexpected response type: %s", ErrProtocolError, resp.Type)
 	}
 
 	// Validate cookie matches
 	if resp.ID != cookie {
-		return "", fmt.Errorf("%w: expected %s, got %s", ErrCookieMismatch, cookie, resp.ID)
+		conn.Close()
+		return "", nil, fmt.Errorf("%w: expected %s, got %s", ErrCookieMismatch, cookie, resp.ID)
+	}
+
+	// Create session to keep connection open
+	session := &PasswordSession{
+		conn:   conn,
+		cookie: cookie,
 	}
 
 	// Handle result
 	switch resp.Result {
 	case ResultOK:
-		return resp.Password, nil
+		return resp.Password, session, nil
 	case ResultCancelled:
-		return "", ErrCancelled
+		session.Close()
+		return "", nil, ErrCancelled
 	case ResultConfirmed:
-		return "", ErrConfirmOnly
+		session.Close()
+		return "", nil, ErrConfirmOnly
 	default:
-		return "", fmt.Errorf("%w: unknown result: %s", ErrProtocolError, resp.Result)
+		session.Close()
+		return "", nil, fmt.Errorf("%w: unknown result: %s", ErrProtocolError, resp.Result)
 	}
 }
 
@@ -261,4 +415,16 @@ func generateCookie() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// RequestPassword is a convenience wrapper that requests a password without session support.
+// For retry support, use RequestPasswordWithSession instead.
+func (c *Client) RequestPassword(ctx context.Context, title, message string) (string, error) {
+	password, session, err := c.RequestPasswordWithSession(ctx, title, message)
+	if err != nil {
+		return "", err
+	}
+	// Close session immediately since caller doesn't need it
+	session.Close()
+	return password, nil
 }

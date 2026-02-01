@@ -92,6 +92,7 @@ type SessionManager struct {
 	mu                     sync.RWMutex
 	noctaliaClient         *noctalia.Client
 	noctaliaEnabled        bool
+	noctaliaSession        *noctalia.PasswordSession // Active Noctalia session for retry support
 	allowInsecurePrompts   bool
 	systemdAskPasswordPath string
 	pathDiscoveryWarned    bool
@@ -303,16 +304,17 @@ func getPromptOrder(cfg SessionConfig) []promptMethod {
 // PromptForPassword prompts the user for their master password using a GUI dialog.
 // If errMsg is non-empty, it's displayed as part of the prompt (for retry feedback).
 // It tries various GUI methods, falling back through the chain in order of security.
-func (sm *SessionManager) PromptForPassword(errMsg string) (string, error) {
+// Returns the password, an optional ResultNotifier for two-phase communication, and an error.
+func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
 	// Try Noctalia first if enabled
 	if sm.noctaliaEnabled && sm.noctaliaClient != nil {
-		password, err := sm.promptNoctalia(errMsg)
+		password, notifier, err := sm.promptNoctalia(errMsg)
 		if err == nil {
-			return password, nil
+			return password, notifier, nil
 		}
 		if errors.Is(err, noctalia.ErrCancelled) {
 			// User explicitly cancelled - don't try fallback methods
-			return "", ErrUserCancelled
+			return "", nil, ErrUserCancelled
 		}
 		if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
 			// Only log non-connection errors (connection errors just mean agent isn't running)
@@ -330,10 +332,10 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, error) {
 	if commandExists("systemd-ask-password") {
 		password, err := sm.promptSystemd(errMsg)
 		if err == nil {
-			return password, nil
+			return password, nil, nil
 		}
 		if errors.Is(err, ErrUserCancelled) {
-			return "", err
+			return "", nil, err
 		}
 	}
 
@@ -341,10 +343,10 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, error) {
 	if commandExists("zenity") {
 		password, err := sm.promptZenity(errMsg)
 		if err == nil {
-			return password, nil
+			return password, nil, nil
 		}
 		if errors.Is(err, ErrUserCancelled) {
-			return "", err
+			return "", nil, err
 		}
 	}
 
@@ -352,10 +354,10 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, error) {
 	if commandExists("kdialog") {
 		password, err := sm.promptKDialog(errMsg)
 		if err == nil {
-			return password, nil
+			return password, nil, nil
 		}
 		if errors.Is(err, ErrUserCancelled) {
-			return "", err
+			return "", nil, err
 		}
 	}
 
@@ -363,10 +365,10 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, error) {
 	if commandExists("rofi") {
 		password, err := sm.promptRofi(errMsg)
 		if err == nil {
-			return password, nil
+			return password, nil, nil
 		}
 		if errors.Is(err, ErrUserCancelled) {
-			return "", err
+			return "", nil, err
 		}
 	}
 
@@ -374,31 +376,58 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, error) {
 	if sm.allowInsecurePrompts && commandExists("dmenu") {
 		password, err := sm.promptDmenu(errMsg)
 		if err == nil {
-			return password, nil
+			return password, nil, nil
 		}
 		if errors.Is(err, ErrUserCancelled) {
-			return "", err
+			return "", nil, err
 		}
 	}
 
 	// Check if only dmenu is available but not allowed
 	if !sm.allowInsecurePrompts && commandExists("dmenu") {
-		return "", ErrNoSecurePromptAvailable
+		return "", nil, ErrNoSecurePromptAvailable
 	}
 
-	return "", fmt.Errorf("no password prompt method available (install zenity, kdialog, rofi, or systemd-ask-password)")
+	return "", nil, fmt.Errorf("no password prompt method available (install zenity, kdialog, rofi, or systemd-ask-password)")
 }
 
-// promptNoctalia uses the Noctalia agent for a password dialog
-func (sm *SessionManager) promptNoctalia(errMsg string) (string, error) {
+// promptNoctalia uses the Noctalia agent for a password dialog with two-phase retry support.
+// Returns the password, a notifier function for sending results, and an error.
+func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier, error) {
 	if sm.noctaliaClient == nil {
-		return "", noctalia.ErrSocketNotFound
+		return "", nil, noctalia.ErrSocketNotFound
 	}
 
 	if !sm.noctaliaClient.IsAvailable() {
-		return "", noctalia.ErrSocketNotFound
+		return "", nil, noctalia.ErrSocketNotFound
 	}
 
+	// Check if we have an existing session waiting for retry
+	if sm.noctaliaSession != nil && errMsg != "" {
+		// Wait for the user to enter a new password on the existing session
+		password, err := sm.noctaliaSession.WaitForRetry(context.Background(), noctalia.DefaultTimeout)
+		if err != nil {
+			sm.noctaliaSession = nil
+			if errors.Is(err, noctalia.ErrCancelled) {
+				return "", nil, err
+			}
+			// Session failed, will need to create a new one on next attempt
+			return "", nil, err
+		}
+
+		// Return notifier that uses the existing session
+		notifier := func(success bool, errMsg string, allowRetry bool) {
+			if sm.noctaliaSession != nil {
+				_ = sm.noctaliaSession.SendResult(success, errMsg, allowRetry)
+				if success || !allowRetry {
+					sm.noctaliaSession = nil
+				}
+			}
+		}
+		return password, notifier, nil
+	}
+
+	// Create a new session
 	ctx, cancel := context.WithTimeout(context.Background(), noctalia.DefaultTimeout)
 	defer cancel()
 
@@ -406,7 +435,26 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, error) {
 	if errMsg != "" {
 		message = errMsg + "\n" + message
 	}
-	return sm.noctaliaClient.RequestPassword(ctx, "Bitwarden Keyring", message)
+
+	password, session, err := sm.noctaliaClient.RequestPasswordWithSession(ctx, "Bitwarden Keyring", message)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Store the session for potential retry
+	sm.noctaliaSession = session
+
+	// Create notifier that uses the session
+	notifier := func(success bool, errMsg string, allowRetry bool) {
+		if sm.noctaliaSession != nil {
+			_ = sm.noctaliaSession.SendResult(success, errMsg, allowRetry)
+			if success || !allowRetry {
+				sm.noctaliaSession = nil
+			}
+		}
+	}
+
+	return password, notifier, nil
 }
 
 // promptZenity uses zenity for a GTK password dialog

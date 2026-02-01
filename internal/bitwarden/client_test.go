@@ -28,17 +28,17 @@ type mockPrompter struct {
 	lastErrMsg string // Records the last error message passed to prompt
 }
 
-func (m *mockPrompter) PromptForPassword(errMsg string) (string, error) {
+func (m *mockPrompter) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
 	m.callCount.Add(1)
 	m.lastErrMsg = errMsg
 	if m.onlyOnce {
 		if m.onceCalled.Load() {
-			return "", errors.New("prompt called more than once")
+			return "", nil, errors.New("prompt called more than once")
 		}
 		m.onceCalled.Store(true)
 	}
 
-	return m.password, m.err
+	return m.password, nil, m.err
 }
 
 type blockingPrompter struct {
@@ -49,15 +49,15 @@ type blockingPrompter struct {
 	once      atomic.Bool
 }
 
-func (p *blockingPrompter) PromptForPassword(errMsg string) (string, error) {
+func (p *blockingPrompter) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
 	p.callCount.Add(1)
 	if p.once.Load() {
-		return "", errors.New("prompt called more than once")
+		return "", nil, errors.New("prompt called more than once")
 	}
 	p.once.Store(true)
 	close(p.entered)
 	password := <-p.passwordC
-	return password, p.err
+	return password, nil, p.err
 }
 
 // retryPrompter allows simulating password retries - returns different passwords on successive calls
@@ -69,7 +69,7 @@ type retryPrompter struct {
 	mu        sync.Mutex
 }
 
-func (p *retryPrompter) PromptForPassword(errMsg string) (string, error) {
+func (p *retryPrompter) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -77,7 +77,7 @@ func (p *retryPrompter) PromptForPassword(errMsg string) (string, error) {
 	p.errMsgs = append(p.errMsgs, errMsg)
 
 	if idx >= len(p.passwords) {
-		return "", errors.New("no more passwords configured")
+		return "", nil, errors.New("no more passwords configured")
 	}
 
 	var err error
@@ -85,7 +85,7 @@ func (p *retryPrompter) PromptForPassword(errMsg string) (string, error) {
 		err = p.errs[idx]
 	}
 
-	return p.passwords[idx], err
+	return p.passwords[idx], nil, err
 }
 
 // gatingErrCtx blocks on the first Err() call until allowed.

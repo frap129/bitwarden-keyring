@@ -43,6 +43,14 @@ Item {
 
     property var currentRequest: null
     property var currentConnection: null
+    property bool awaitingResult: false  // True after password submitted, waiting for Go to respond
+    
+    // Alias for Panel.qml binding
+    readonly property bool responseInFlight: awaitingResult
+    
+    // Agent availability (always available when server is active)
+    readonly property bool agentAvailable: serverActive
+    readonly property string agentStatus: serverActive ? "" : "Keyring server not available"
 
     signal requestReceived()
     signal requestCompleted(bool success)
@@ -101,7 +109,10 @@ Item {
 
         currentConnection.write(JSON.stringify(response) + "\n")
         currentConnection.flush()
-        handleRequestComplete(true)
+        
+        // Don't close the panel - wait for keyring_result from Go
+        awaitingResult = true
+        lastError = ""
     }
 
     function cancelRequest() {
@@ -131,10 +142,40 @@ Item {
         }
         currentRequest = null
         currentConnection = null
+        awaitingResult = false
         closeAuthUI()
     }
 
-    // Socket server for receiving password requests
+    // Handle keyring_result message from Go indicating unlock success/failure
+    function handleKeyringResult(result) {
+        awaitingResult = false
+        
+        if (result.success) {
+            // Unlock succeeded - close panel
+            handleRequestComplete(true)
+        } else if (result.retry) {
+            // Unlock failed but retry is allowed - show error, keep panel open
+            lastError = result.error || "Incorrect password"
+            requestCompleted(false)  // Signals AuthDialog to show error/shake
+            // Don't close panel or clear request - allow retry
+        } else {
+            // Unlock failed and no retry allowed - show error briefly then close
+            lastError = result.error || "Unlock failed"
+            requestCompleted(false)
+            // Close after a short delay so user can see the error
+            closeTimer.start()
+        }
+    }
+    
+    Timer {
+        id: closeTimer
+        interval: 2000
+        onTriggered: {
+            handleRequestComplete(false)
+        }
+    }
+
+    // Socket server for receiving password requests and results
     SocketServer {
         id: keyringServer
         active: root.serverActive
@@ -148,12 +189,14 @@ Item {
                     if (!trimmed) return
 
                     try {
-                        const request = JSON.parse(trimmed)
-                        if (request.type === "keyring_request") {
-                            root.handleKeyringRequest(request, clientSocket)
+                        const message = JSON.parse(trimmed)
+                        if (message.type === "keyring_request") {
+                            root.handleKeyringRequest(message, clientSocket)
+                        } else if (message.type === "keyring_result") {
+                            root.handleKeyringResult(message)
                         }
                     } catch (e) {
-                        console.log("Bitwarden Keyring: Failed to parse request:", e)
+                        console.log("Bitwarden Keyring: Failed to parse message:", e)
                     }
                 }
             }

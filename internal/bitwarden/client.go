@@ -61,12 +61,20 @@ var ErrInvalidPassword = errors.New("invalid master password")
 // ErrMaxRetriesExceeded indicates the maximum password retry attempts were exceeded
 var ErrMaxRetriesExceeded = errors.New("maximum password attempts exceeded")
 
+// ResultNotifier is a callback to notify the prompter of the unlock result.
+// For prompters that support two-phase communication (like Noctalia), this allows
+// showing inline retry feedback without re-opening the prompt.
+type ResultNotifier func(success bool, errMsg string, allowRetry bool)
+
 // passwordPrompter provides a way to prompt for passwords.
 // It is implemented by SessionManager and can be overridden in tests.
 type passwordPrompter interface {
 	// PromptForPassword prompts the user for their master password.
 	// If errMsg is non-empty, it should be displayed as part of the prompt (for retry feedback).
-	PromptForPassword(errMsg string) (string, error)
+	// Returns the password and an optional ResultNotifier.
+	// The ResultNotifier should be called after the unlock attempt to inform the prompter of the result.
+	// If the notifier is nil, the prompter doesn't support result notifications.
+	PromptForPassword(errMsg string) (password string, notifier ResultNotifier, err error)
 }
 
 // logHTTPBodySnippet returns a truncated and redacted snippet of an HTTP body for debug logging.
@@ -445,27 +453,50 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 	}
 
 	var errMsg string
+	var notifier ResultNotifier
+
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Check context before prompting
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		// Prompt for password with optional error message for retries
-		password, err := c.prompter.PromptForPassword(errMsg)
-		if err != nil {
-			return err // Preserves ErrUserCancelled
+		var password string
+		var err error
+
+		// For first attempt or prompters without retry support, prompt for password
+		// For subsequent attempts with a notifier, wait for retry via the session
+		if attempt == 1 || notifier == nil {
+			// Prompt for password with optional error message for retries
+			password, notifier, err = c.prompter.PromptForPassword(errMsg)
+			if err != nil {
+				return err // Preserves ErrUserCancelled
+			}
+		} else {
+			// Notifier was already set and supports retry - password comes from WaitForRetry
+			// The session manager handles this internally
+			password, notifier, err = c.prompter.PromptForPassword(errMsg)
+			if err != nil {
+				return err
+			}
 		}
 
 		// Unlock the vault
 		_, err = c.Unlock(ctx, password)
 		if err == nil {
-			return nil // Success!
+			// Success! Notify the prompter
+			if notifier != nil {
+				notifier(true, "", false)
+			}
+			return nil
 		}
 
 		// Check if this is a password error (retryable)
 		if !errors.Is(err, ErrInvalidPassword) {
 			// Non-password error (network, API, etc.) - don't retry
+			if notifier != nil {
+				notifier(false, "Failed to unlock vault", false)
+			}
 			return fmt.Errorf("failed to unlock vault: %w", err)
 		}
 
@@ -473,6 +504,15 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 		remaining := maxRetries - attempt
 		if remaining > 0 {
 			errMsg = fmt.Sprintf("Incorrect password. %d attempt(s) remaining.", remaining)
+			// Notify the prompter about the failure with retry allowed
+			if notifier != nil {
+				notifier(false, errMsg, true)
+			}
+		} else {
+			// No more retries
+			if notifier != nil {
+				notifier(false, "Maximum password attempts exceeded", false)
+			}
 		}
 	}
 
