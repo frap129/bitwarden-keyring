@@ -68,6 +68,8 @@ type SessionConfig struct {
 	SessionStore string
 	// SessionFile is the path to the session file (used when SessionStore is "file")
 	SessionFile string
+	// MaxPasswordRetries is the maximum number of password attempts before giving up (default: 3)
+	MaxPasswordRetries int
 }
 
 // DefaultSessionConfig returns a SessionConfig with default values
@@ -80,6 +82,7 @@ func DefaultSessionConfig() SessionConfig {
 		SystemdAskPasswordPath: "",
 		SessionStore:           "memory",
 		SessionFile:            "",
+		MaxPasswordRetries:     3,
 	}
 }
 
@@ -94,6 +97,7 @@ type SessionManager struct {
 	pathDiscoveryWarned    bool
 	sessionStore           string
 	sessionFile            string
+	maxPasswordRetries     int
 }
 
 // NewSessionManager creates a new session manager with default config
@@ -103,12 +107,18 @@ func NewSessionManager() *SessionManager {
 
 // NewSessionManagerWithConfig creates a new session manager with the given config
 func NewSessionManagerWithConfig(cfg SessionConfig) *SessionManager {
+	maxRetries := cfg.MaxPasswordRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+
 	sm := &SessionManager{
 		noctaliaEnabled:        cfg.NoctaliaEnabled,
 		allowInsecurePrompts:   cfg.AllowInsecurePrompts,
 		systemdAskPasswordPath: cfg.SystemdAskPasswordPath,
 		sessionStore:           cfg.SessionStore,
 		sessionFile:            cfg.SessionFile,
+		maxPasswordRetries:     maxRetries,
 	}
 
 	// Default to "memory" if not specified
@@ -172,6 +182,11 @@ func (sm *SessionManager) HasSession() bool {
 // SystemdAskPasswordPath returns the configured path for systemd-ask-password.
 func (sm *SessionManager) SystemdAskPasswordPath() string {
 	return sm.systemdAskPasswordPath
+}
+
+// MaxPasswordRetries returns the maximum number of password retry attempts.
+func (sm *SessionManager) MaxPasswordRetries() int {
+	return sm.maxPasswordRetries
 }
 
 // loadSession attempts to load session from environment or file
@@ -285,12 +300,13 @@ func getPromptOrder(cfg SessionConfig) []promptMethod {
 	return prompts
 }
 
-// PromptForPassword prompts the user for their master password using a GUI dialog
-// It tries various GUI methods, falling back through the chain in order of security
-func (sm *SessionManager) PromptForPassword() (string, error) {
+// PromptForPassword prompts the user for their master password using a GUI dialog.
+// If errMsg is non-empty, it's displayed as part of the prompt (for retry feedback).
+// It tries various GUI methods, falling back through the chain in order of security.
+func (sm *SessionManager) PromptForPassword(errMsg string) (string, error) {
 	// Try Noctalia first if enabled
 	if sm.noctaliaEnabled && sm.noctaliaClient != nil {
-		password, err := sm.promptNoctalia()
+		password, err := sm.promptNoctalia(errMsg)
 		if err == nil {
 			return password, nil
 		}
@@ -312,7 +328,7 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 
 	// Try systemd-ask-password (secure, works with Plymouth/console)
 	if commandExists("systemd-ask-password") {
-		password, err := sm.promptSystemd()
+		password, err := sm.promptSystemd(errMsg)
 		if err == nil {
 			return password, nil
 		}
@@ -323,7 +339,7 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 
 	// Try zenity (GNOME/GTK)
 	if commandExists("zenity") {
-		password, err := sm.promptZenity()
+		password, err := sm.promptZenity(errMsg)
 		if err == nil {
 			return password, nil
 		}
@@ -334,7 +350,7 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 
 	// Try kdialog (KDE)
 	if commandExists("kdialog") {
-		password, err := sm.promptKDialog()
+		password, err := sm.promptKDialog(errMsg)
 		if err == nil {
 			return password, nil
 		}
@@ -345,7 +361,7 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 
 	// Try rofi (common on tiling WMs)
 	if commandExists("rofi") {
-		password, err := sm.promptRofi()
+		password, err := sm.promptRofi(errMsg)
 		if err == nil {
 			return password, nil
 		}
@@ -356,7 +372,7 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 
 	// Try dmenu (insecure - only if explicitly allowed)
 	if sm.allowInsecurePrompts && commandExists("dmenu") {
-		password, err := sm.promptDmenu()
+		password, err := sm.promptDmenu(errMsg)
 		if err == nil {
 			return password, nil
 		}
@@ -374,7 +390,7 @@ func (sm *SessionManager) PromptForPassword() (string, error) {
 }
 
 // promptNoctalia uses the Noctalia agent for a password dialog
-func (sm *SessionManager) promptNoctalia() (string, error) {
+func (sm *SessionManager) promptNoctalia(errMsg string) (string, error) {
 	if sm.noctaliaClient == nil {
 		return "", noctalia.ErrSocketNotFound
 	}
@@ -386,42 +402,62 @@ func (sm *SessionManager) promptNoctalia() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), noctalia.DefaultTimeout)
 	defer cancel()
 
-	return sm.noctaliaClient.RequestPassword(ctx, "Bitwarden Keyring", "Enter your Bitwarden Master Password:")
+	message := "Enter your Bitwarden Master Password:"
+	if errMsg != "" {
+		message = errMsg + "\n" + message
+	}
+	return sm.noctaliaClient.RequestPassword(ctx, "Bitwarden Keyring", message)
 }
 
 // promptZenity uses zenity for a GTK password dialog
-func (sm *SessionManager) promptZenity() (string, error) {
+func (sm *SessionManager) promptZenity(errMsg string) (string, error) {
+	text := "Enter your Bitwarden Master Password:"
+	if errMsg != "" {
+		text = errMsg + "\n" + text
+	}
 	return runPromptCommand(exec.Command("zenity",
 		"--password",
 		"--title=Bitwarden Keyring",
-		"--text=Enter your Bitwarden Master Password:",
+		"--text="+text,
 		"--timeout=120",
 	))
 }
 
 // promptKDialog uses kdialog for a KDE password dialog
-func (sm *SessionManager) promptKDialog() (string, error) {
+func (sm *SessionManager) promptKDialog(errMsg string) (string, error) {
+	message := "Enter your Bitwarden Master Password:"
+	if errMsg != "" {
+		message = errMsg + "\n" + message
+	}
 	return runPromptCommand(exec.Command("kdialog",
 		"--password",
-		"Enter your Bitwarden Master Password:",
+		message,
 		"--title", "Bitwarden Keyring",
 	))
 }
 
 // promptRofi uses rofi in dmenu mode for password input
-func (sm *SessionManager) promptRofi() (string, error) {
-	return runPromptCommand(exec.Command("rofi",
+func (sm *SessionManager) promptRofi(errMsg string) (string, error) {
+	args := []string{
 		"-dmenu",
 		"-password",
 		"-p", "Bitwarden Master Password",
 		"-theme-str", "entry { placeholder: \"\"; }",
-	))
+	}
+	if errMsg != "" {
+		args = append(args, "-mesg", errMsg)
+	}
+	return runPromptCommand(exec.Command("rofi", args...))
 }
 
 // promptDmenu uses dmenu for password input (no masking, less secure)
-func (sm *SessionManager) promptDmenu() (string, error) {
+func (sm *SessionManager) promptDmenu(errMsg string) (string, error) {
+	prompt := "Bitwarden Master Password:"
+	if errMsg != "" {
+		prompt = errMsg + " - " + prompt
+	}
 	cmd := exec.Command("dmenu",
-		"-p", "Bitwarden Master Password:",
+		"-p", prompt,
 		"-nf", "#000000",
 		"-nb", "#000000", // Black on black to "hide" input
 	)
@@ -437,14 +473,18 @@ func (sm *SessionManager) promptDmenu() (string, error) {
 }
 
 // promptSystemd uses systemd-ask-password for password input
-func (sm *SessionManager) promptSystemd() (string, error) {
+func (sm *SessionManager) promptSystemd(errMsg string) (string, error) {
 	cmdPath := "systemd-ask-password"
 	if sm.systemdAskPasswordPath != "" {
 		cmdPath = sm.systemdAskPasswordPath
 	}
+	prompt := "Bitwarden Master Password:"
+	if errMsg != "" {
+		prompt = errMsg + " - " + prompt
+	}
 	return runPromptCommand(exec.Command(cmdPath,
 		"--timeout=120",
 		"--icon=dialog-password",
-		"Bitwarden Master Password:",
+		prompt,
 	))
 }

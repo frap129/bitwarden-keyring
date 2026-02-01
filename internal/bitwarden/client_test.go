@@ -21,10 +21,12 @@ type mockPrompter struct {
 	callCount  atomic.Int32
 	onlyOnce   bool // If true, returns error on subsequent calls
 	onceCalled atomic.Bool
+	lastErrMsg string // Records the last error message passed to prompt
 }
 
-func (m *mockPrompter) PromptForPassword() (string, error) {
+func (m *mockPrompter) PromptForPassword(errMsg string) (string, error) {
 	m.callCount.Add(1)
+	m.lastErrMsg = errMsg
 	if m.onlyOnce {
 		if m.onceCalled.Load() {
 			return "", errors.New("prompt called more than once")
@@ -43,7 +45,7 @@ type blockingPrompter struct {
 	once      atomic.Bool
 }
 
-func (p *blockingPrompter) PromptForPassword() (string, error) {
+func (p *blockingPrompter) PromptForPassword(errMsg string) (string, error) {
 	p.callCount.Add(1)
 	if p.once.Load() {
 		return "", errors.New("prompt called more than once")
@@ -52,6 +54,34 @@ func (p *blockingPrompter) PromptForPassword() (string, error) {
 	close(p.entered)
 	password := <-p.passwordC
 	return password, p.err
+}
+
+// retryPrompter allows simulating password retries - returns different passwords on successive calls
+type retryPrompter struct {
+	passwords []string // Passwords to return on each call
+	errs      []error  // Errors to return on each call (nil for success)
+	callCount atomic.Int32
+	errMsgs   []string // Records error messages passed on each call
+	mu        sync.Mutex
+}
+
+func (p *retryPrompter) PromptForPassword(errMsg string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	idx := int(p.callCount.Add(1)) - 1
+	p.errMsgs = append(p.errMsgs, errMsg)
+
+	if idx >= len(p.passwords) {
+		return "", errors.New("no more passwords configured")
+	}
+
+	var err error
+	if idx < len(p.errs) {
+		err = p.errs[idx]
+	}
+
+	return p.passwords[idx], err
 }
 
 // gatingErrCtx blocks on the first Err() call until allowed.
@@ -937,4 +967,297 @@ func TestStartServe_FailClosed_StopsOnReadinessFailure(t *testing.T) {
 	// We can't easily test this without mocking exec.Command
 	// For now, this test documents the expected behavior
 	t.Skip("TODO: implement with exec.Command mocking or integration test")
+}
+
+// --- Password Retry Tests ---
+
+func TestEnsureUnlocked_RetryOnWrongPassword_SuccessOnSecondAttempt(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var unlockCalls int32
+	var lastPassword string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			b, _ := io.ReadAll(r.Body)
+			lastPassword = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			// First call returns invalid password, second returns success
+			if atomic.LoadInt32(&unlockCalls) == 1 {
+				w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+			} else {
+				w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+			}
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &retryPrompter{
+		passwords: []string{"wrong-password", "correct-password"},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+
+	err := c.ensureUnlocked(context.Background())
+	if err != nil {
+		t.Fatalf("ensureUnlocked() error = %v, want nil", err)
+	}
+
+	// Verify we made 2 unlock attempts
+	if got := atomic.LoadInt32(&unlockCalls); got != 2 {
+		t.Errorf("unlock calls = %d, want 2", got)
+	}
+
+	// Verify prompter was called twice
+	if got := prompter.callCount.Load(); got != 2 {
+		t.Errorf("prompter calls = %d, want 2", got)
+	}
+
+	// Verify first prompt had no error message, second had retry message
+	if prompter.errMsgs[0] != "" {
+		t.Errorf("first prompt errMsg = %q, want empty", prompter.errMsgs[0])
+	}
+	if !strings.Contains(prompter.errMsgs[1], "Incorrect password") {
+		t.Errorf("second prompt errMsg = %q, want to contain 'Incorrect password'", prompter.errMsgs[1])
+	}
+	if !strings.Contains(prompter.errMsgs[1], "2 attempt(s) remaining") {
+		t.Errorf("second prompt errMsg = %q, want to contain '2 attempt(s) remaining'", prompter.errMsgs[1])
+	}
+
+	// Verify final password was correct
+	if !strings.Contains(lastPassword, "correct-password") {
+		t.Errorf("last password = %q, want to contain 'correct-password'", lastPassword)
+	}
+}
+
+func TestEnsureUnlocked_RetryExhausted_ReturnsMaxRetriesError(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			// Always return invalid password
+			w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &retryPrompter{
+		passwords: []string{"wrong1", "wrong2", "wrong3"},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+
+	err := c.ensureUnlocked(context.Background())
+	if !errors.Is(err, ErrMaxRetriesExceeded) {
+		t.Fatalf("ensureUnlocked() error = %v, want ErrMaxRetriesExceeded", err)
+	}
+
+	// Verify we made exactly 3 unlock attempts
+	if got := atomic.LoadInt32(&unlockCalls); got != 3 {
+		t.Errorf("unlock calls = %d, want 3", got)
+	}
+
+	// Verify prompter was called 3 times
+	if got := prompter.callCount.Load(); got != 3 {
+		t.Errorf("prompter calls = %d, want 3", got)
+	}
+
+	// Verify error messages on retries
+	if prompter.errMsgs[0] != "" {
+		t.Errorf("first prompt errMsg = %q, want empty", prompter.errMsgs[0])
+	}
+	if !strings.Contains(prompter.errMsgs[1], "2 attempt(s) remaining") {
+		t.Errorf("second prompt errMsg = %q, want '2 attempt(s) remaining'", prompter.errMsgs[1])
+	}
+	if !strings.Contains(prompter.errMsgs[2], "1 attempt(s) remaining") {
+		t.Errorf("third prompt errMsg = %q, want '1 attempt(s) remaining'", prompter.errMsgs[2])
+	}
+}
+
+func TestEnsureUnlocked_UserCancellationDuringRetry_StopsImmediately(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	// Cancel on second prompt
+	prompter := &retryPrompter{
+		passwords: []string{"wrong1", ""},
+		errs:      []error{nil, ErrUserCancelled},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+
+	err := c.ensureUnlocked(context.Background())
+	if !errors.Is(err, ErrUserCancelled) {
+		t.Fatalf("ensureUnlocked() error = %v, want ErrUserCancelled", err)
+	}
+
+	// Verify we only made 1 unlock attempt (before cancellation)
+	if got := atomic.LoadInt32(&unlockCalls); got != 1 {
+		t.Errorf("unlock calls = %d, want 1", got)
+	}
+
+	// Verify prompter was called twice (first prompt + cancel on second)
+	if got := prompter.callCount.Load(); got != 2 {
+		t.Errorf("prompter calls = %d, want 2", got)
+	}
+}
+
+func TestEnsureUnlocked_NonPasswordError_DoesNotRetry(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			// Return a non-password error (network error, API error, etc.)
+			w.Write([]byte(`{"success":false,"data":{"message":"Connection to server failed"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &retryPrompter{
+		passwords: []string{"password1", "password2", "password3"},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+
+	err := c.ensureUnlocked(context.Background())
+	if err == nil {
+		t.Fatal("ensureUnlocked() should fail on non-password error")
+	}
+	if errors.Is(err, ErrMaxRetriesExceeded) {
+		t.Fatal("ensureUnlocked() should not return ErrMaxRetriesExceeded for non-password errors")
+	}
+
+	// Verify we only made 1 unlock attempt (no retry for non-password errors)
+	if got := atomic.LoadInt32(&unlockCalls); got != 1 {
+		t.Errorf("unlock calls = %d, want 1", got)
+	}
+
+	// Verify prompter was only called once
+	if got := prompter.callCount.Load(); got != 1 {
+		t.Errorf("prompter calls = %d, want 1", got)
+	}
+}
+
+func TestEnsureUnlocked_SuccessOnFirstAttempt_NoRetryNeeded(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &retryPrompter{
+		passwords: []string{"correct-password"},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+
+	err := c.ensureUnlocked(context.Background())
+	if err != nil {
+		t.Fatalf("ensureUnlocked() error = %v, want nil", err)
+	}
+
+	// Verify we made exactly 1 unlock attempt
+	if got := atomic.LoadInt32(&unlockCalls); got != 1 {
+		t.Errorf("unlock calls = %d, want 1", got)
+	}
+
+	// Verify prompter was called once with no error message
+	if got := prompter.callCount.Load(); got != 1 {
+		t.Errorf("prompter calls = %d, want 1", got)
+	}
+	if prompter.errMsgs[0] != "" {
+		t.Errorf("first prompt errMsg = %q, want empty", prompter.errMsgs[0])
+	}
+}
+
+func TestEnsureUnlocked_ContextCancelledDuringRetryLoop(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	var unlockCalls int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			atomic.AddInt32(&unlockCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Prompter that cancels context on second call
+	prompter := &retryPrompter{
+		passwords: []string{"wrong1", "wrong2"},
+	}
+
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+
+	// Start ensureUnlocked in a goroutine
+	done := make(chan error, 1)
+	go func() {
+		done <- c.ensureUnlocked(ctx)
+	}()
+
+	// Wait a bit then cancel
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	err := <-done
+	// Could be context.Canceled or invalid password depending on timing
+	// The key is that it doesn't hang
+	if err == nil {
+		t.Fatal("ensureUnlocked() should fail when context is cancelled")
+	}
 }

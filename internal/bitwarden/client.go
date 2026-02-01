@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -53,10 +55,18 @@ func (e *APIError) DebugDetails() string {
 	return e.debugBody
 }
 
+// ErrInvalidPassword indicates the master password was incorrect
+var ErrInvalidPassword = errors.New("invalid master password")
+
+// ErrMaxRetriesExceeded indicates the maximum password retry attempts were exceeded
+var ErrMaxRetriesExceeded = errors.New("maximum password attempts exceeded")
+
 // passwordPrompter provides a way to prompt for passwords.
 // It is implemented by SessionManager and can be overridden in tests.
 type passwordPrompter interface {
-	PromptForPassword() (string, error)
+	// PromptForPassword prompts the user for their master password.
+	// If errMsg is non-empty, it should be displayed as part of the prompt (for retry feedback).
+	PromptForPassword(errMsg string) (string, error)
 }
 
 // logHTTPBodySnippet returns a truncated and redacted snippet of an HTTP body for debug logging.
@@ -348,6 +358,10 @@ func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
 	}
 
 	if !result.Success {
+		// Bitwarden CLI returns specific message for wrong password
+		if strings.Contains(result.Data.Message, "Invalid master password") {
+			return "", ErrInvalidPassword
+		}
 		return "", fmt.Errorf("unlock failed: %s", result.Data.Message)
 	}
 
@@ -421,18 +435,45 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 		return fmt.Errorf("backend not healthy: %w", err)
 	}
 
-	// Prompt for password (note: not cancellable)
-	password, err := c.prompter.PromptForPassword()
-	if err != nil {
-		return err // Preserves ErrUserCancelled
+	// Retry loop for password prompts
+	maxRetries := c.session.MaxPasswordRetries()
+	if maxRetries <= 0 {
+		maxRetries = 3
 	}
 
-	// Unlock the vault
-	if _, err := c.Unlock(ctx, password); err != nil {
-		return fmt.Errorf("failed to unlock vault: %w", err)
+	var errMsg string
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Check context before prompting
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Prompt for password with optional error message for retries
+		password, err := c.prompter.PromptForPassword(errMsg)
+		if err != nil {
+			return err // Preserves ErrUserCancelled
+		}
+
+		// Unlock the vault
+		_, err = c.Unlock(ctx, password)
+		if err == nil {
+			return nil // Success!
+		}
+
+		// Check if this is a password error (retryable)
+		if !errors.Is(err, ErrInvalidPassword) {
+			// Non-password error (network, API, etc.) - don't retry
+			return fmt.Errorf("failed to unlock vault: %w", err)
+		}
+
+		// Wrong password - prepare retry message if we have attempts remaining
+		remaining := maxRetries - attempt
+		if remaining > 0 {
+			errMsg = fmt.Sprintf("Incorrect password. %d attempt(s) remaining.", remaining)
+		}
 	}
 
-	return nil
+	return fmt.Errorf("%w: tried %d times", ErrMaxRetriesExceeded, maxRetries)
 }
 
 // withAutoUnlock wraps an operation with auto-unlock logic

@@ -28,6 +28,7 @@ var (
 	systemdAskPasswordPath = flag.String("systemd-ask-password-path", "", "Absolute path to systemd-ask-password binary")
 	sessionStore           = flag.String("session-store", "memory", "Session storage mode: 'memory' or 'file' (default: memory)")
 	sessionFile            = flag.String("session-file", "", "Custom session file path (default: $XDG_CONFIG_HOME/bitwarden-keyring/session)")
+	maxPasswordRetries     = flag.Int("max-password-retries", 3, "Maximum password retry attempts (default: 3)")
 	version                = "0.4.0"
 )
 
@@ -50,6 +51,7 @@ type Config struct {
 	SystemdAskPasswordPath string
 	SessionStore           string
 	SessionFile            string
+	MaxPasswordRetries     int
 	EnabledComponents      map[string]bool
 	SSHSocketPath          string
 	Version                string
@@ -65,6 +67,7 @@ func (c *Config) SessionConfig() bitwarden.SessionConfig {
 		SystemdAskPasswordPath: c.SystemdAskPasswordPath,
 		SessionStore:           c.SessionStore,
 		SessionFile:            c.SessionFile,
+		MaxPasswordRetries:     c.MaxPasswordRetries,
 	}
 }
 
@@ -186,6 +189,7 @@ func ConfigFromFlags() (Config, error) {
 		SystemdAskPasswordPath: *systemdAskPasswordPath,
 		SessionStore:           *sessionStore,
 		SessionFile:            *sessionFile,
+		MaxPasswordRetries:     *maxPasswordRetries,
 		EnabledComponents:      enabledComponents,
 		SSHSocketPath:          *sshSocket,
 		Version:                version,
