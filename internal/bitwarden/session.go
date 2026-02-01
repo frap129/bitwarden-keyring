@@ -281,17 +281,17 @@ func getPromptOrder(cfg SessionConfig) []promptMethod {
 		prompts = append(prompts, promptMethod{name: "noctalia"})
 	}
 
-	// 2. systemd-ask-password
-	prompts = append(prompts, promptMethod{name: "systemd-ask-password"})
-
-	// 3. zenity
+	// 2. zenity (GNOME/GTK GUI)
 	prompts = append(prompts, promptMethod{name: "zenity"})
 
-	// 4. kdialog
+	// 3. kdialog (KDE GUI)
 	prompts = append(prompts, promptMethod{name: "kdialog"})
 
-	// 5. rofi
+	// 4. rofi (tiling WM GUI)
 	prompts = append(prompts, promptMethod{name: "rofi"})
+
+	// 5. systemd-ask-password (TTY/console fallback)
+	prompts = append(prompts, promptMethod{name: "systemd-ask-password"})
 
 	// 6. dmenu (only if AllowInsecurePrompts)
 	if cfg.AllowInsecurePrompts {
@@ -328,17 +328,6 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 		sm.pathDiscoveryWarned = true
 	}
 
-	// Try systemd-ask-password (secure, works with Plymouth/console)
-	if commandExists("systemd-ask-password") {
-		password, err := sm.promptSystemd(errMsg)
-		if err == nil {
-			return password, nil, nil
-		}
-		if errors.Is(err, ErrUserCancelled) {
-			return "", nil, err
-		}
-	}
-
 	// Try zenity (GNOME/GTK)
 	if commandExists("zenity") {
 		password, err := sm.promptZenity(errMsg)
@@ -364,6 +353,17 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 	// Try rofi (common on tiling WMs)
 	if commandExists("rofi") {
 		password, err := sm.promptRofi(errMsg)
+		if err == nil {
+			return password, nil, nil
+		}
+		if errors.Is(err, ErrUserCancelled) {
+			return "", nil, err
+		}
+	}
+
+	// Try systemd-ask-password (TTY/console fallback)
+	if commandExists("systemd-ask-password") {
+		password, err := sm.promptSystemd(errMsg)
 		if err == nil {
 			return password, nil, nil
 		}

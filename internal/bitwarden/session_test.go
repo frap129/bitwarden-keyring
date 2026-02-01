@@ -104,7 +104,7 @@ func TestPromptOrder_ReturnsCorrectSequence(t *testing.T) {
 			wantRofi:             true,
 			wantDmenu:            true,
 			noctaliaPosition:     0, // First
-			systemdPosition:      1, // Second
+			systemdPosition:      4, // After GUI tools (zenity, kdialog, rofi)
 			dmenuPosition:        5, // Last
 		},
 		{
@@ -117,7 +117,7 @@ func TestPromptOrder_ReturnsCorrectSequence(t *testing.T) {
 			wantKDialog:          true,
 			wantRofi:             true,
 			wantDmenu:            false,
-			systemdPosition:      0, // First (since Noctalia disabled)
+			systemdPosition:      3, // After GUI tools (zenity=0, kdialog=1, rofi=2)
 		},
 		{
 			name:                 "dmenu allowed when insecure prompts enabled",
@@ -129,6 +129,8 @@ func TestPromptOrder_ReturnsCorrectSequence(t *testing.T) {
 			wantKDialog:          true,
 			wantRofi:             true,
 			wantDmenu:            true,
+			systemdPosition:      3, // After GUI tools (zenity=0, kdialog=1, rofi=2)
+			dmenuPosition:        4, // Last
 		},
 	}
 
@@ -208,7 +210,7 @@ func TestPromptOrder_ReturnsCorrectSequence(t *testing.T) {
 				t.Errorf("dmenu should be last, but is at position %d of %d", dmenuIdx, len(prompts))
 			}
 
-			// Verify systemd is after Noctalia (if both present)
+			// Verify systemd is after GUI tools (zenity, kdialog, rofi)
 			if foundNoctalia && foundSystemd && noctaliaIdx >= systemdIdx {
 				t.Errorf("Noctalia (pos %d) should be before systemd-ask-password (pos %d)", noctaliaIdx, systemdIdx)
 			}
