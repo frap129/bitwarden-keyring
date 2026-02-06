@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/joe/bitwarden-keyring/internal/noctalia"
@@ -242,6 +243,14 @@ func (sm *SessionManager) saveSessionToFile(key string) {
 	sessionFile := sm.getSessionFilePath()
 	dir := filepath.Dir(sessionFile)
 
+	// Check if the parent directory is a symlink (security check)
+	if dirInfo, err := os.Lstat(dir); err == nil {
+		if dirInfo.Mode()&os.ModeSymlink != 0 {
+			log.Printf("Warning: Session directory is a symlink, refusing to save: %s", dir)
+			return
+		}
+	}
+
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return
@@ -257,8 +266,48 @@ func (sm *SessionManager) saveSessionToFile(key string) {
 		}
 	}
 
-	// Write session file with restricted permissions
-	_ = os.WriteFile(sessionFile, []byte(key), 0600)
+	// Check if session file is already a symlink (best-effort pre-check)
+	if fileInfo, err := os.Lstat(sessionFile); err == nil {
+		if fileInfo.Mode()&os.ModeSymlink != 0 {
+			log.Printf("Warning: Session file is a symlink, refusing to save: %s", sessionFile)
+			return
+		}
+	}
+
+	// Open file with O_NOFOLLOW to prevent following symlinks (TOCTOU protection)
+	// This will fail with ELOOP if the file is a symlink
+	fd, err := os.OpenFile(sessionFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			log.Printf("Warning: Session file is a symlink, refusing to save: %s", sessionFile)
+		} else {
+			log.Printf("Warning: Failed to open session file for writing: %v", err)
+		}
+		return
+	}
+	defer func() {
+		if err := fd.Close(); err != nil {
+			log.Printf("Warning: failed to close session file: %v", err)
+		}
+	}()
+
+	// Verify the opened file is a regular file (not FIFO, device, directory)
+	fi, err := fd.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		log.Printf("Warning: session file is not a regular file, refusing to write")
+		return
+	}
+
+	// Ensure permissions are 0600 (in case file already existed with different perms)
+	if err := fd.Chmod(0600); err != nil {
+		log.Printf("Warning: Failed to set session file permissions: %v", err)
+	}
+
+	// Write session key
+	if _, err := fd.WriteString(key); err != nil {
+		log.Printf("Warning: Failed to write session file: %v", err)
+		return
+	}
 }
 
 // deleteSessionFile removes the session file

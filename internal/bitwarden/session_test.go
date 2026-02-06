@@ -3,6 +3,7 @@ package bitwarden
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -503,5 +504,32 @@ func TestSessionManager_EmptyStoreDefaultsToMemory(t *testing.T) {
 	// Verify the session was stored in memory
 	if sm.GetSession() != "test-session-key" {
 		t.Error("Session should still be stored in memory")
+	}
+}
+
+func TestSessionManager_SaveSession_RejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(dir, "session")
+	if err := os.Symlink(target, sessionFile); err != nil {
+		t.Fatal(err)
+	}
+
+	sm := NewSessionManagerWithConfig(SessionConfig{
+		SessionStore: "file",
+		SessionFile:  sessionFile,
+	})
+	sm.SetSession("secret-key")
+
+	// Target must remain unchanged; writing through the symlink would overwrite it.
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("target was overwritten via symlink: got %q", string(got))
 	}
 }
