@@ -61,6 +61,10 @@ var ErrInvalidPassword = errors.New("invalid master password")
 // ErrMaxRetriesExceeded indicates the maximum password retry attempts were exceeded
 var ErrMaxRetriesExceeded = errors.New("maximum password attempts exceeded")
 
+// maxErrorBody is the maximum number of bytes to read from error response bodies
+// for debug logging. When exceeded, the body is truncated with an indicator.
+const maxErrorBody = 4096
+
 // ResultNotifier is a callback to notify the prompter of the unlock result.
 // For prompters that support two-phase communication (like Noctalia), this allows
 // showing inline retry feedback without re-opening the prompt.
@@ -149,8 +153,9 @@ func (c *Client) SetAutoUnlock(enabled bool) {
 }
 
 // SetDebug enables or disables HTTP body logging for errors.
-// When enabled, APIError.DebugDetails() will contain response bodies (up to 4096 bytes),
-// which are redacted but should only be logged with --debug flag.
+// When enabled, APIError.DebugDetails() will contain response bodies (up to 4096 bytes
+// plus truncation indicator when exceeded), which are redacted but should only be
+// logged with --debug flag.
 func (c *Client) SetDebug(enabled bool) {
 	c.debug.Store(enabled)
 }
@@ -756,9 +761,16 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body io.Rea
 
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
-		// Read at most 4096 bytes of the response body
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		bodyStr := string(bodyBytes)
+		// Read at most maxErrorBody+1 bytes to detect if truncation occurred
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+
+		// Check if truncation occurred and append indicator
+		var bodyStr string
+		if len(bodyBytes) > maxErrorBody {
+			bodyStr = string(bodyBytes[:maxErrorBody]) + "... (truncated)"
+		} else {
+			bodyStr = string(bodyBytes)
+		}
 
 		apiErr := &APIError{
 			StatusCode: resp.StatusCode,

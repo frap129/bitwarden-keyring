@@ -1385,3 +1385,41 @@ func TestEnsureUnlocked_ContextCancelledDuringRetryLoop(t *testing.T) {
 		t.Fatal("ensureUnlocked() should fail when context is cancelled")
 	}
 }
+
+func TestDoRequest_TruncatesLargeErrorBody(t *testing.T) {
+	// Create a large error body (5000 bytes, exceeding maxErrorBody of 4096)
+	largeBody := strings.Repeat("x", 5000)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(largeBody))
+	}))
+	defer ts.Close()
+
+	c := NewClient(0)
+	c.baseURL = ts.URL
+	c.httpClient = &http.Client{Timeout: 5 * time.Second}
+
+	// Call a public method that uses doRequest
+	_, err := c.Status(context.Background())
+	if err == nil {
+		t.Fatal("expected error from bad request")
+	}
+
+	// Assert error is an APIError
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T: %v", err, err)
+	}
+
+	// Assert DebugDetails contains truncation indicator
+	details := apiErr.DebugDetails()
+	if !strings.Contains(details, "truncated") {
+		t.Errorf("DebugDetails() should contain 'truncated' indicator, got: %q", details)
+	}
+
+	// Assert the body was actually truncated (should be around 4096 bytes plus marker)
+	if len(details) > 4200 {
+		t.Errorf("DebugDetails() length = %d, expected truncated to ~4096 bytes", len(details))
+	}
+}
