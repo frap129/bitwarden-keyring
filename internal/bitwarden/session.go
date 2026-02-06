@@ -306,85 +306,108 @@ func getPromptOrder(cfg SessionConfig) []promptMethod {
 // It tries various GUI methods, falling back through the chain in order of security.
 // Returns the password, an optional ResultNotifier for two-phase communication, and an error.
 func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
-	// Try Noctalia first if enabled
-	if sm.noctaliaEnabled && sm.noctaliaClient != nil {
-		password, notifier, err := sm.promptNoctalia(errMsg)
-		if err == nil {
-			return password, notifier, nil
-		}
-		if errors.Is(err, noctalia.ErrCancelled) {
-			// User explicitly cancelled - don't try fallback methods
-			return "", nil, ErrUserCancelled
-		}
-		if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
-			// Only log non-connection errors (connection errors just mean agent isn't running)
-			log.Printf("Noctalia prompt failed: %v, trying fallback methods", err)
-		}
+	// Build minimal config from session manager fields
+	cfg := SessionConfig{
+		NoctaliaEnabled:      sm.noctaliaEnabled,
+		AllowInsecurePrompts: sm.allowInsecurePrompts,
 	}
 
-	// Log one-time warning about PATH discovery
+	// Get the ordered list of prompts to try
+	prompts := getPromptOrder(cfg)
+
+	// Log one-time warning about PATH discovery (before trying any prompt)
 	if !sm.pathDiscoveryWarned {
 		log.Printf("DEBUG: Using PATH discovery for prompt tools - consider specifying absolute paths")
 		sm.pathDiscoveryWarned = true
 	}
 
-	// Try zenity (GNOME/GTK)
-	if commandExists("zenity") {
-		password, err := sm.promptZenity(errMsg)
-		if err == nil {
-			return password, nil, nil
-		}
-		if errors.Is(err, ErrUserCancelled) {
-			return "", nil, err
+	// Try each prompt method in order
+	for _, method := range prompts {
+		switch method.name {
+		case "noctalia":
+			if sm.noctaliaClient == nil {
+				continue
+			}
+			password, notifier, err := sm.promptNoctalia(errMsg)
+			if err == nil {
+				return password, notifier, nil
+			}
+			if errors.Is(err, noctalia.ErrCancelled) {
+				// User explicitly cancelled - don't try fallback methods
+				return "", nil, ErrUserCancelled
+			}
+			if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
+				// Only log non-connection errors (connection errors just mean agent isn't running)
+				log.Printf("Noctalia prompt failed: %v, trying fallback methods", err)
+			}
+
+		case "zenity":
+			if !commandExists("zenity") {
+				continue
+			}
+			password, err := sm.promptZenity(errMsg)
+			if err == nil {
+				return password, nil, nil
+			}
+			if errors.Is(err, ErrUserCancelled) {
+				return "", nil, err
+			}
+
+		case "kdialog":
+			if !commandExists("kdialog") {
+				continue
+			}
+			password, err := sm.promptKDialog(errMsg)
+			if err == nil {
+				return password, nil, nil
+			}
+			if errors.Is(err, ErrUserCancelled) {
+				return "", nil, err
+			}
+
+		case "rofi":
+			if !commandExists("rofi") {
+				continue
+			}
+			password, err := sm.promptRofi(errMsg)
+			if err == nil {
+				return password, nil, nil
+			}
+			if errors.Is(err, ErrUserCancelled) {
+				return "", nil, err
+			}
+
+		case "systemd-ask-password":
+			if !commandExists("systemd-ask-password") {
+				continue
+			}
+			password, err := sm.promptSystemd(errMsg)
+			if err == nil {
+				return password, nil, nil
+			}
+			if errors.Is(err, ErrUserCancelled) {
+				return "", nil, err
+			}
+
+		case "dmenu":
+			if !commandExists("dmenu") {
+				continue
+			}
+			password, err := sm.promptDmenu(errMsg)
+			if err == nil {
+				return password, nil, nil
+			}
+			if errors.Is(err, ErrUserCancelled) {
+				return "", nil, err
+			}
+
+		default:
+			log.Printf("DEBUG: Unknown prompt method %q; skipping", method.name)
 		}
 	}
 
-	// Try kdialog (KDE)
-	if commandExists("kdialog") {
-		password, err := sm.promptKDialog(errMsg)
-		if err == nil {
-			return password, nil, nil
-		}
-		if errors.Is(err, ErrUserCancelled) {
-			return "", nil, err
-		}
-	}
-
-	// Try rofi (common on tiling WMs)
-	if commandExists("rofi") {
-		password, err := sm.promptRofi(errMsg)
-		if err == nil {
-			return password, nil, nil
-		}
-		if errors.Is(err, ErrUserCancelled) {
-			return "", nil, err
-		}
-	}
-
-	// Try systemd-ask-password (TTY/console fallback)
-	if commandExists("systemd-ask-password") {
-		password, err := sm.promptSystemd(errMsg)
-		if err == nil {
-			return password, nil, nil
-		}
-		if errors.Is(err, ErrUserCancelled) {
-			return "", nil, err
-		}
-	}
-
-	// Try dmenu (insecure - only if explicitly allowed)
-	if sm.allowInsecurePrompts && commandExists("dmenu") {
-		password, err := sm.promptDmenu(errMsg)
-		if err == nil {
-			return password, nil, nil
-		}
-		if errors.Is(err, ErrUserCancelled) {
-			return "", nil, err
-		}
-	}
-
-	// Check if only dmenu is available but not allowed
-	if !sm.allowInsecurePrompts && commandExists("dmenu") {
+	// Check if only dmenu is available but not allowed (special error case)
+	if !cfg.AllowInsecurePrompts && commandExists("dmenu") {
 		return "", nil, ErrNoSecurePromptAvailable
 	}
 
