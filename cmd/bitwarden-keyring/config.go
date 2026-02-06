@@ -24,6 +24,7 @@ var (
 	noctaliaTimeout        = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
 	components             = flag.String("components", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
 	sshSocket              = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
+	noSSHEnvExport         = flag.Bool("no-ssh-env-export", false, "Disable automatic SSH_AUTH_SOCK export to D-Bus/systemd environment")
 	allowInsecurePrompts   = flag.Bool("allow-insecure-prompts", false, "Allow insecure password prompt methods like dmenu")
 	systemdAskPasswordPath = flag.String("systemd-ask-password-path", "", "Absolute path to systemd-ask-password binary")
 	sessionStore           = flag.String("session-store", "memory", "Session storage mode: 'memory' or 'file' (default: memory)")
@@ -54,6 +55,7 @@ type Config struct {
 	MaxPasswordRetries     int
 	EnabledComponents      map[string]bool
 	SSHSocketPath          string
+	NoSSHEnvExport         bool
 	Version                string
 }
 
@@ -192,6 +194,7 @@ func ConfigFromFlags() (Config, error) {
 		MaxPasswordRetries:     *maxPasswordRetries,
 		EnabledComponents:      enabledComponents,
 		SSHSocketPath:          *sshSocket,
+		NoSSHEnvExport:         *noSSHEnvExport,
 		Version:                version,
 	}
 

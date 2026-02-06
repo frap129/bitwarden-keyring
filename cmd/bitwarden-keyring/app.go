@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/godbus/dbus/v5"
@@ -136,8 +138,49 @@ func (a *App) startSSHAgent(ctx context.Context) error {
 	}
 
 	log.Printf("SSH agent listening on %s", socketPath)
-	log.Printf("Set SSH_AUTH_SOCK=%s to use", socketPath)
+
+	if !a.config.NoSSHEnvExport {
+		if err := exportSSHAuthSock(socketPath); err != nil {
+			return fmt.Errorf("failed to export SSH_AUTH_SOCK: %w", err)
+		}
+		log.Printf("Exported SSH_AUTH_SOCK to D-Bus activation environment")
+	} else {
+		log.Printf("Set SSH_AUTH_SOCK=%s to use", socketPath)
+	}
 	return nil
+}
+
+// exportSSHAuthSock uses dbus-update-activation-environment to propagate
+// SSH_AUTH_SOCK to the systemd and D-Bus user session so that applications
+// launched from desktop environments or systemd user services can discover
+// the agent socket. It is a no-op when systemd is not running or the
+// command is not installed.
+func exportSSHAuthSock(socketPath string) error {
+	if !isSystemdUserRunning() {
+		return nil
+	}
+
+	cmd := "dbus-update-activation-environment"
+	if _, err := exec.LookPath(cmd); err != nil {
+		return nil
+	}
+
+	arg := "SSH_AUTH_SOCK=" + socketPath
+	if out, err := exec.Command(cmd, arg).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s failed: %w: %s", cmd, err, out)
+	}
+	return nil
+}
+
+// isSystemdUserRunning checks whether a systemd user session is active
+// by testing for the existence of the systemd user manager's private socket.
+func isSystemdUserRunning() bool {
+	xdgRuntime := os.Getenv("XDG_RUNTIME_DIR")
+	if xdgRuntime == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(xdgRuntime, "systemd", "private"))
+	return err == nil
 }
 
 // Stop gracefully shuts down all components in reverse order

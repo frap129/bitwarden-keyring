@@ -123,6 +123,13 @@ func TestParseComponents(t *testing.T) {
 	}
 }
 
+func TestConfigNoSSHEnvExport_DefaultsFalse(t *testing.T) {
+	cfg := Config{}
+	if cfg.NoSSHEnvExport {
+		t.Error("NoSSHEnvExport should default to false")
+	}
+}
+
 func TestValidComponentsList(t *testing.T) {
 	list := validComponentsList()
 
