@@ -1,3 +1,8 @@
+## 0.5.1 (2026-02-06)
+
+- feat(ssh): export SSH_AUTH_SOCK via dbus-update-activation-environment ([13bdf19](https://github.com/frap129/bitwarden-keyring/commit/13bdf19))
+- docs: Update Changelog ([038e560](https://github.com/frap129/bitwarden-keyring/commit/038e560))
+
 ## 0.5.0 (2026-02-01)
 
 - chore: Bump package and plugin versions ([027a562](https://github.com/frap129/bitwarden-keyring/commit/027a562))

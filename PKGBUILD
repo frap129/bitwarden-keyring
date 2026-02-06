@@ -1,6 +1,6 @@
 # Maintainer: Joe Maples <joe@maples.dev>
 pkgname=bitwarden-keyring
-pkgver=0.5.0
+pkgver=0.5.1
 pkgrel=1
 pkgdesc="A D-Bus service implementing the Secret Service API using Bitwarden as the backend"
 arch=('x86_64' 'aarch64')

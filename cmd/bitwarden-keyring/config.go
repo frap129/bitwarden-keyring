@@ -30,7 +30,7 @@ var (
 	sessionStore           = flag.String("session-store", "memory", "Session storage mode: 'memory' or 'file' (default: memory)")
 	sessionFile            = flag.String("session-file", "", "Custom session file path (default: $XDG_CONFIG_HOME/bitwarden-keyring/session)")
 	maxPasswordRetries     = flag.Int("max-password-retries", 3, "Maximum password retry attempts (default: 3)")
-	version                = "0.4.0"
+	version                = "0.5.1"
 )
 
 // validComponents defines the supported component names
