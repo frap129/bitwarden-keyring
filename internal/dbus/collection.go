@@ -183,9 +183,15 @@ func (c *Collection) CreateItem(properties map[string]dbus.Variant, secret Secre
 	// If replace is true, try to find and update existing item
 	// Only replace if attrs contains meaningful identity attributes
 	if replace && attrs != nil && hasMeaningfulAttrs(attrs) {
-		items, err := c.bwClient.ListItems(ctx)
+		var items []bitwarden.Item
+		var err error
+		if uri != "" {
+			items, err = c.bwClient.SearchItems(ctx, uri)
+		} else {
+			items, err = c.bwClient.ListItems(ctx)
+		}
 		if err != nil {
-			// If we can't list items, we can't safely replace - fail the operation
+			// If we can't fetch candidate items, we can't safely replace - fail the operation
 			return NoPrompt, NoPrompt, toDBusError(
 				fmt.Errorf("cannot check for existing items: %w", err))
 		}
