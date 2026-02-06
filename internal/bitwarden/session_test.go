@@ -439,11 +439,7 @@ func TestSessionManager_ClearSessionMemoryModeNoFile(t *testing.T) {
 }
 
 func TestSessionManager_BW_SESSION_EnvHonored(t *testing.T) {
-	// Save and restore env
-	oldVal := os.Getenv("BW_SESSION")
-	defer os.Setenv("BW_SESSION", oldVal)
-
-	os.Setenv("BW_SESSION", "env-session-key")
+	t.Setenv("BW_SESSION", "env-session-key")
 
 	cfg := DefaultSessionConfig()
 	sm := NewSessionManagerWithConfig(cfg)
@@ -463,11 +459,7 @@ func TestSessionManager_BW_SESSION_TakesPriorityOverFile(t *testing.T) {
 		t.Fatalf("Failed to create session file: %v", err)
 	}
 
-	// Save and restore env
-	oldVal := os.Getenv("BW_SESSION")
-	defer os.Setenv("BW_SESSION", oldVal)
-
-	os.Setenv("BW_SESSION", "env-session-key")
+	t.Setenv("BW_SESSION", "env-session-key")
 
 	cfg := SessionConfig{
 		SessionStore: "file",
