@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 
 	"github.com/godbus/dbus/v5"
+
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 // Prompt represents an unlock prompt
@@ -147,14 +148,14 @@ func (p *Prompt) doUnlock(ctx context.Context) {
 	if err != nil {
 		// Check if context was cancelled (dismiss was called)
 		if errors.Is(err, context.Canceled) {
-			log.Printf("Prompt unlock cancelled")
+			logging.L.With("component", "dbus").Debug("prompt unlock cancelled")
 			return // Dismiss already handled completion
 		}
 		// Log the error for debugging (D-Bus signal can't carry error details)
 		if errors.Is(err, bitwarden.ErrUserCancelled) {
-			log.Printf("Prompt unlock dismissed by user")
+			logging.L.With("component", "dbus").Info("prompt unlock dismissed by user")
 		} else {
-			log.Printf("Prompt unlock failed: %v", err)
+			logging.L.With("component", "dbus").Warn("prompt unlock failed", "error", err)
 		}
 
 		p.completeOnce(true, nil) // Dismissed/failed

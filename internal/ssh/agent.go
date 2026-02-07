@@ -3,7 +3,6 @@ package ssh
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 // Server manages the SSH agent Unix socket and handles incoming connections.
@@ -108,7 +108,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	if s.debug {
-		log.Printf("SSH agent listening on %s", s.socketPath)
+		logging.L.With("component", "ssh-agent").Info("listening on socket", "path", s.socketPath)
 	}
 
 	// Start accepting connections
@@ -181,7 +181,7 @@ func (s *Server) acceptLoop(ctx context.Context) {
 				return
 			default:
 				if s.debug {
-					log.Printf("SSH agent accept error: %v", err)
+					logging.L.With("component", "ssh-agent").Warn("accept error", "error", err)
 				}
 				continue
 			}
@@ -208,13 +208,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}()
 
 	if s.debug {
-		log.Printf("SSH agent: new connection from %s", conn.RemoteAddr())
+		logging.L.With("component", "ssh-agent").Info("new connection", "remote", conn.RemoteAddr())
 	}
 
 	// ServeAgent serves the agent protocol on the connection
 	if err := agent.ServeAgent(s.keyring, conn); err != nil {
 		if s.debug {
-			log.Printf("SSH agent: connection error: %v", err)
+			logging.L.With("component", "ssh-agent").Warn("connection error", "error", err)
 		}
 	}
 }
@@ -260,7 +260,7 @@ func (s *Server) Stop() error {
 	s.started = false
 
 	if s.debug {
-		log.Printf("SSH agent stopped")
+		logging.L.With("component", "ssh-agent").Info("stopped")
 	}
 
 	return nil

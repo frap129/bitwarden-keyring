@@ -5,13 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"log"
 	"sync"
 
 	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 // Keyring implements the agent.Agent interface using Bitwarden as the key store.
@@ -44,7 +44,7 @@ func (k *Keyring) refreshKeys(ctx context.Context) error {
 	// Log parse errors in debug mode
 	if k.debug && len(result.Errors) > 0 {
 		for _, parseErr := range result.Errors {
-			log.Printf("SSH agent: failed to parse key %q: %v", parseErr.ItemName, parseErr.Err)
+			logging.L.With("component", "ssh-agent").Warn("failed to parse key", "item", parseErr.ItemName, "error", parseErr.Err)
 		}
 	}
 
@@ -173,7 +173,7 @@ func (k *Keyring) Add(key agent.AddedKey) error {
 	if found {
 		// Key already exists, return success (idempotent)
 		if k.debug {
-			log.Printf("SSH agent: key %s already exists, skipping", fingerprint)
+			logging.L.With("component", "ssh-agent").Info("key already exists, skipping", "fingerprint", fingerprint)
 		}
 		return nil
 	}
@@ -218,7 +218,7 @@ func (k *Keyring) Add(key agent.AddedKey) error {
 	k.mu.Unlock()
 
 	if k.debug {
-		log.Printf("SSH agent: added key %s as item %s", fingerprint, createdItem.ID)
+		logging.L.With("component", "ssh-agent").Info("added key", "fingerprint", fingerprint, "item_id", createdItem.ID)
 	}
 
 	return nil
@@ -267,7 +267,7 @@ func (k *Keyring) Remove(key cryptossh.PublicKey) error {
 	k.mu.Unlock()
 
 	if k.debug {
-		log.Printf("SSH agent: removed key %s (item %s)", cryptossh.FingerprintSHA256(key), sshKey.Item.ID)
+		logging.L.With("component", "ssh-agent").Info("removed key", "fingerprint", cryptossh.FingerprintSHA256(key), "item_id", sshKey.Item.ID)
 	}
 
 	return nil

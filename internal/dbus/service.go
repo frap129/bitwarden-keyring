@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 
 	"github.com/godbus/dbus/v5"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 // toDBusError converts backend errors to D-Bus errors with safe messages.
@@ -272,7 +272,7 @@ func (s *Service) ReadAlias(name string) (dbus.ObjectPath, *dbus.Error) {
 
 // SetAlias sets the collection for the given alias (D-Bus method)
 func (s *Service) SetAlias(name string, collection dbus.ObjectPath) *dbus.Error {
-	log.Printf("[dbus] SetAlias(%q, %q): not implemented, ignoring", name, collection)
+	logging.L.With("component", "dbus").Info("SetAlias not implemented, ignoring", "alias", name, "collection", collection)
 	return nil
 }
 

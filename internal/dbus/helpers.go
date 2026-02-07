@@ -1,9 +1,9 @@
 package dbus
 
 import (
-	"log"
-
 	"github.com/godbus/dbus/v5"
+
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 // exportDBusObject exports an object to D-Bus with the standard interface pattern.
@@ -46,16 +46,16 @@ func exportDBusObject(conn *dbus.Conn, obj interface{}, path dbus.ObjectPath, if
 //   - hasProperties: whether the Properties interface was also exported
 func unexportDBusObject(conn *dbus.Conn, path dbus.ObjectPath, iface string, hasProperties bool) {
 	if err := conn.Export(nil, path, iface); err != nil {
-		log.Printf("Failed to unexport %s interface from %s: %v", iface, path, err)
+		logging.L.With("component", "dbus").Warn("failed to unexport interface", "interface", iface, "path", path, "error", err)
 	}
 
 	if hasProperties {
 		if err := conn.Export(nil, path, PropertiesInterface); err != nil {
-			log.Printf("Failed to unexport %s interface from %s: %v", PropertiesInterface, path, err)
+			logging.L.With("component", "dbus").Warn("failed to unexport interface", "interface", PropertiesInterface, "path", path, "error", err)
 		}
 	}
 
 	if err := conn.Export(nil, path, "org.freedesktop.DBus.Introspectable"); err != nil {
-		log.Printf("Failed to unexport Introspectable interface from %s: %v", path, err)
+		logging.L.With("component", "dbus").Warn("failed to unexport introspectable interface", "path", path, "error", err)
 	}
 }

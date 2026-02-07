@@ -2,15 +2,15 @@
 package dbus
 
 import (
-	"log"
-
 	"github.com/godbus/dbus/v5"
+
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 // emit emits a D-Bus signal with error logging.
 func emit(conn *dbus.Conn, path dbus.ObjectPath, signalName string, args ...interface{}) {
 	if err := conn.Emit(path, signalName, args...); err != nil {
-		log.Printf("Failed to emit %s signal: %v", signalName, err)
+		logging.L.With("component", "dbus").Warn("failed to emit signal", "signal", signalName, "error", err)
 	}
 }
 

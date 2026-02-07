@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joe/bitwarden-keyring/internal/logging"
 	"github.com/joe/bitwarden-keyring/internal/noctalia"
 )
 
@@ -214,7 +214,7 @@ func (sm *SessionManager) loadSession() {
 	}
 
 	if fileInfo.Mode()&os.ModeSymlink != 0 {
-		log.Printf("Warning: Session file is a symlink, rejecting: %s", sessionFile)
+		logging.L.Warn("session file is a symlink, rejecting", "path", sessionFile)
 		return
 	}
 
@@ -246,7 +246,7 @@ func (sm *SessionManager) saveSessionToFile(key string) {
 	// Check if the parent directory is a symlink (security check)
 	if dirInfo, err := os.Lstat(dir); err == nil {
 		if dirInfo.Mode()&os.ModeSymlink != 0 {
-			log.Printf("Warning: Session directory is a symlink, refusing to save: %s", dir)
+			logging.L.Warn("session directory is a symlink, refusing to save", "path", dir)
 			return
 		}
 	}
@@ -262,14 +262,14 @@ func (sm *SessionManager) saveSessionToFile(key string) {
 		mode := dirInfo.Mode().Perm()
 		// Warn if directory has group or world write permissions
 		if mode&0022 != 0 {
-			log.Printf("Warning: Session directory has insecure permissions (group/world-writable): %s (mode: %04o)", dir, mode)
+			logging.L.Warn("session directory has insecure permissions (group/world-writable)", "path", dir, "mode", fmt.Sprintf("%04o", mode))
 		}
 	}
 
 	// Check if session file is already a symlink (best-effort pre-check)
 	if fileInfo, err := os.Lstat(sessionFile); err == nil {
 		if fileInfo.Mode()&os.ModeSymlink != 0 {
-			log.Printf("Warning: Session file is a symlink, refusing to save: %s", sessionFile)
+			logging.L.Warn("session file is a symlink, refusing to save", "path", sessionFile)
 			return
 		}
 	}
@@ -279,33 +279,33 @@ func (sm *SessionManager) saveSessionToFile(key string) {
 	fd, err := os.OpenFile(sessionFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
-			log.Printf("Warning: Session file is a symlink, refusing to save: %s", sessionFile)
+			logging.L.Warn("session file is a symlink, refusing to save", "path", sessionFile)
 		} else {
-			log.Printf("Warning: Failed to open session file for writing: %v", err)
+			logging.L.Warn("failed to open session file for writing", "error", err)
 		}
 		return
 	}
 	defer func() {
 		if err := fd.Close(); err != nil {
-			log.Printf("Warning: failed to close session file: %v", err)
+			logging.L.Warn("failed to close session file", "error", err)
 		}
 	}()
 
 	// Verify the opened file is a regular file (not FIFO, device, directory)
 	fi, err := fd.Stat()
 	if err != nil || !fi.Mode().IsRegular() {
-		log.Printf("Warning: session file is not a regular file, refusing to write")
+		logging.L.Warn("session file is not a regular file, refusing to write")
 		return
 	}
 
 	// Ensure permissions are 0600 (in case file already existed with different perms)
 	if err := fd.Chmod(0600); err != nil {
-		log.Printf("Warning: Failed to set session file permissions: %v", err)
+		logging.L.Warn("failed to set session file permissions", "error", err)
 	}
 
 	// Write session key
 	if _, err := fd.WriteString(key); err != nil {
-		log.Printf("Warning: Failed to write session file: %v", err)
+		logging.L.Warn("failed to write session file", "error", err)
 		return
 	}
 }
@@ -366,7 +366,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 
 	// Log one-time warning about PATH discovery (before trying any prompt)
 	if !sm.pathDiscoveryWarned {
-		log.Printf("DEBUG: Using PATH discovery for prompt tools - consider specifying absolute paths")
+		logging.L.Debug("using PATH discovery for prompt tools - consider specifying absolute paths")
 		sm.pathDiscoveryWarned = true
 	}
 
@@ -387,7 +387,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 			}
 			if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
 				// Only log non-connection errors (connection errors just mean agent isn't running)
-				log.Printf("Noctalia prompt failed: %v, trying fallback methods", err)
+				logging.L.Info("noctalia prompt failed, trying fallback methods", "error", err)
 			}
 
 		case "zenity":
@@ -451,7 +451,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 			}
 
 		default:
-			log.Printf("DEBUG: Unknown prompt method %q; skipping", method.name)
+			logging.L.Debug("unknown prompt method, skipping", "method", method.name)
 		}
 	}
 
