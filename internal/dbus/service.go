@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/godbus/dbus/v5"
@@ -271,7 +272,7 @@ func (s *Service) ReadAlias(name string) (dbus.ObjectPath, *dbus.Error) {
 
 // SetAlias sets the collection for the given alias (D-Bus method)
 func (s *Service) SetAlias(name string, collection dbus.ObjectPath) *dbus.Error {
-	// We don't support setting aliases
+	log.Printf("[dbus] SetAlias(%q, %q): not implemented, ignoring", name, collection)
 	return nil
 }
 
