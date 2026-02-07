@@ -1,7 +1,7 @@
 {
   "id": "noctalia-bitwarden-keyring",
   "name": "Bitwarden Keyring",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minNoctaliaVersion": "4.0.0",
   "author": "bitwarden-keyring",
   "license": "MIT",
