@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -9,10 +11,15 @@ import (
 	"syscall"
 )
 
-func main() {
-	cfg, err := ConfigFromFlags()
+// run contains the main application logic and is testable.
+// It takes command-line arguments and returns an error if execution fails.
+func run(args []string) error {
+	cfg, err := ConfigFromArgs(args)
 	if err != nil {
-		log.Fatalf("Configuration error: %v", err)
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // help already printed by FlagSet
+		}
+		return fmt.Errorf("configuration error: %w", err)
 	}
 
 	if cfg.Debug {
@@ -25,12 +32,13 @@ func main() {
 	defer cancel()
 
 	if err := app.Start(ctx); err != nil {
-		log.Fatalf("Failed to start: %v", err)
+		return fmt.Errorf("failed to start: %w", err)
 	}
 
 	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
 	<-sigChan
 	fmt.Println()
@@ -41,4 +49,11 @@ func main() {
 	}
 
 	log.Printf("Goodbye!")
+	return nil
+}
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		log.Fatalf("%v", err)
+	}
 }

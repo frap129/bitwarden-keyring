@@ -13,24 +13,8 @@ import (
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
 
-var (
-	port                   = flag.Int("port", 0, "DEPRECATED: use --bw-port instead")
-	bwPort                 = flag.Int("bw-port", 0, "Port for Bitwarden serve API (0 = auto-select)")
-	bwStartTimeout         = flag.Duration("bw-start-timeout", 10*time.Second, "Timeout for bw serve to start and become ready")
-	debug                  = flag.Bool("debug", false, "Enable debug logging")
-	debugHTTP              = flag.Bool("debug-http", false, "Enable HTTP body logging for errors (requires --debug to be effective)")
-	noctaliaFlag           = flag.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
-	noctaliaSocket         = flag.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-keyring.sock)")
-	noctaliaTimeout        = flag.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
-	components             = flag.String("components", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
-	sshSocket              = flag.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
-	noSSHEnvExport         = flag.Bool("no-ssh-env-export", false, "Disable automatic SSH_AUTH_SOCK export to D-Bus/systemd environment")
-	allowInsecurePrompts   = flag.Bool("allow-insecure-prompts", false, "Allow insecure password prompt methods like dmenu")
-	systemdAskPasswordPath = flag.String("systemd-ask-password-path", "", "Absolute path to systemd-ask-password binary")
-	sessionStore           = flag.String("session-store", "memory", "Session storage mode: 'memory' or 'file' (default: memory)")
-	sessionFile            = flag.String("session-file", "", "Custom session file path (default: $XDG_CONFIG_HOME/bitwarden-keyring/session)")
-	maxPasswordRetries     = flag.Int("max-password-retries", 3, "Maximum password retry attempts (default: 3)")
-	version                = "0.5.1"
+const (
+	version = "0.5.1"
 )
 
 // validComponents defines the supported component names
@@ -156,45 +140,72 @@ func validateConfig(cfg *Config) error {
 	return nil
 }
 
-// ConfigFromFlags parses command-line flags and returns a Config.
-// It also handles flag validation and returns errors for invalid values.
-func ConfigFromFlags() (Config, error) {
-	flag.Parse()
+// ConfigFromArgs parses command-line arguments and returns a Config.
+// It uses a flag.FlagSet instead of the global flag package for isolated parsing.
+func ConfigFromArgs(args []string) (Config, error) {
+	fs := flag.NewFlagSet("bitwarden-keyring", flag.ContinueOnError)
+
+	// Define all flags on the FlagSet
+	var (
+		fPort                   = fs.Int("port", 0, "DEPRECATED: use --bw-port instead")
+		fBwPort                 = fs.Int("bw-port", 0, "Port for Bitwarden serve API (0 = auto-select)")
+		fBwStartTimeout         = fs.Duration("bw-start-timeout", 10*time.Second, "Timeout for bw serve to start and become ready")
+		fDebug                  = fs.Bool("debug", false, "Enable debug logging")
+		fDebugHTTP              = fs.Bool("debug-http", false, "Enable HTTP body logging for errors (requires --debug to be effective)")
+		fNoctaliaFlag           = fs.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
+		fNoctaliaSocket         = fs.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-keyring.sock)")
+		fNoctaliaTimeout        = fs.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
+		fComponents             = fs.String("components", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
+		fSshSocket              = fs.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
+		fNoSSHEnvExport         = fs.Bool("no-ssh-env-export", false, "Disable automatic SSH_AUTH_SOCK export to D-Bus/systemd environment")
+		fAllowInsecurePrompts   = fs.Bool("allow-insecure-prompts", false, "Allow insecure password prompt methods like dmenu")
+		fSystemdAskPasswordPath = fs.String("systemd-ask-password-path", "", "Absolute path to systemd-ask-password binary")
+		fSessionStore           = fs.String("session-store", "memory", "Session storage mode: 'memory' or 'file' (default: memory)")
+		fSessionFile            = fs.String("session-file", "", "Custom session file path (default: $XDG_CONFIG_HOME/bitwarden-keyring/session)")
+		fMaxPasswordRetries     = fs.Int("max-password-retries", 3, "Maximum password retry attempts (default: 3)")
+	)
+
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return Config{}, err
+		}
+		return Config{}, fmt.Errorf("failed to parse flags: %w", err)
+	}
 
 	// Select port (handles deprecated flag and auto-selection)
-	selectedPort, err := selectPort(*bwPort, *port)
+	selectedPort, err := selectPort(*fBwPort, *fPort)
 	if err != nil {
 		return Config{}, err
 	}
 
 	// Parse and validate components
-	enabledComponents, err := parseComponents(*components)
+	enabledComponents, err := parseComponents(*fComponents)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid --components flag: %w", err)
 	}
 
 	// Check for environment variable override for Noctalia
-	noctaliaEnabled := *noctaliaFlag
+	noctaliaEnabled := *fNoctaliaFlag
 	if os.Getenv("BITWARDEN_KEYRING_NOCTALIA") == "1" {
 		noctaliaEnabled = true
 	}
 
 	cfg := Config{
 		BWPort:                 selectedPort,
-		BWStartTimeout:         *bwStartTimeout,
-		Debug:                  *debug,
-		DebugHTTP:              *debugHTTP,
+		BWStartTimeout:         *fBwStartTimeout,
+		Debug:                  *fDebug,
+		DebugHTTP:              *fDebugHTTP,
 		NoctaliaEnabled:        noctaliaEnabled,
-		NoctaliaSocket:         *noctaliaSocket,
-		NoctaliaTimeout:        *noctaliaTimeout,
-		AllowInsecurePrompts:   *allowInsecurePrompts,
-		SystemdAskPasswordPath: *systemdAskPasswordPath,
-		SessionStore:           *sessionStore,
-		SessionFile:            *sessionFile,
-		MaxPasswordRetries:     *maxPasswordRetries,
+		NoctaliaSocket:         *fNoctaliaSocket,
+		NoctaliaTimeout:        *fNoctaliaTimeout,
+		AllowInsecurePrompts:   *fAllowInsecurePrompts,
+		SystemdAskPasswordPath: *fSystemdAskPasswordPath,
+		SessionStore:           *fSessionStore,
+		SessionFile:            *fSessionFile,
+		MaxPasswordRetries:     *fMaxPasswordRetries,
 		EnabledComponents:      enabledComponents,
-		SSHSocketPath:          *sshSocket,
-		NoSSHEnvExport:         *noSSHEnvExport,
+		SSHSocketPath:          *fSshSocket,
+		NoSSHEnvExport:         *fNoSSHEnvExport,
 		Version:                version,
 	}
 
@@ -204,6 +215,12 @@ func ConfigFromFlags() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ConfigFromFlags parses command-line flags and returns a Config.
+// It is a wrapper around ConfigFromArgs using os.Args[1:].
+func ConfigFromFlags() (Config, error) {
+	return ConfigFromArgs(os.Args[1:])
 }
 
 // EnabledComponentsList returns a sorted list of enabled component names
