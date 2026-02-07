@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -42,18 +41,19 @@ func run(args []string) error {
 
 	<-sigChan
 	fmt.Println()
-	log.Printf("Shutting down...")
+	logging.L.Info("shutting down")
 
 	if err := app.Stop(); err != nil {
-		log.Printf("Warning during shutdown: %v", err)
+		logging.L.Warn("warning during shutdown", "error", err)
 	}
 
-	log.Printf("Goodbye!")
+	logging.L.Info("goodbye")
 	return nil
 }
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		log.Fatalf("%v", err)
+		logging.L.Error("fatal error", "error", err)
+		os.Exit(1)
 	}
 }

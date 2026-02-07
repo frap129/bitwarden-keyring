@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 	secretdbus "github.com/joe/bitwarden-keyring/internal/dbus"
+	"github.com/joe/bitwarden-keyring/internal/logging"
 	"github.com/joe/bitwarden-keyring/internal/ssh"
 )
 
@@ -41,11 +41,11 @@ func (a *App) Start(ctx context.Context) error {
 	}
 
 	// Log startup info
-	log.Printf("bitwarden-keyring %s starting...", a.config.Version)
-	log.Printf("Enabled components: %s", strings.Join(a.config.EnabledComponentsList(), ", "))
+	logging.L.Info("bitwarden-keyring starting", "version", a.config.Version)
+	logging.L.Info("enabled components", "components", strings.Join(a.config.EnabledComponentsList(), ", "))
 
 	if a.config.NoctaliaEnabled {
-		log.Printf("Noctalia UI integration enabled")
+		logging.L.Info("noctalia UI integration enabled")
 	}
 
 	// Start Bitwarden backend
@@ -81,7 +81,7 @@ func (a *App) startBitwardenBackend(ctx context.Context) error {
 	}
 
 	// Start bw serve with timeout - FAIL-CLOSED
-	log.Printf("Starting bw serve on port %d...", a.config.BWPort)
+	logging.L.Info("starting bw serve", "port", a.config.BWPort)
 	startCtx, startCancel := context.WithTimeout(ctx, a.config.BWStartTimeout)
 	defer startCancel()
 
@@ -94,7 +94,7 @@ func (a *App) startBitwardenBackend(ctx context.Context) error {
 		return fmt.Errorf("backend not healthy after start: %w", err)
 	}
 
-	log.Printf("Bitwarden backend ready")
+	logging.L.Info("bitwarden backend ready")
 	return nil
 }
 
@@ -106,7 +106,7 @@ func (a *App) startSecretService() error {
 		return fmt.Errorf("failed to connect to session bus: %w", err)
 	}
 
-	log.Printf("Connected to session D-Bus")
+	logging.L.Info("connected to session D-Bus")
 
 	// Create and export the service
 	a.service, err = secretdbus.NewService(a.conn, a.bwClient)
@@ -118,8 +118,8 @@ func (a *App) startSecretService() error {
 		return fmt.Errorf("failed to export service: %w", err)
 	}
 
-	log.Printf("Secret Service exported at %s", secretdbus.BusName)
-	log.Printf("Ready to serve secrets from Bitwarden vault")
+	logging.L.Info("secret service exported", "busname", secretdbus.BusName)
+	logging.L.Info("ready to serve secrets from bitwarden vault")
 	return nil
 }
 
@@ -137,15 +137,15 @@ func (a *App) startSSHAgent(ctx context.Context) error {
 		return fmt.Errorf("failed to start SSH agent: %w", err)
 	}
 
-	log.Printf("SSH agent listening on %s", socketPath)
+	logging.L.Info("SSH agent listening", "socket", socketPath)
 
 	if !a.config.NoSSHEnvExport {
 		if err := exportSSHAuthSock(socketPath); err != nil {
 			return fmt.Errorf("failed to export SSH_AUTH_SOCK: %w", err)
 		}
-		log.Printf("Exported SSH_AUTH_SOCK to D-Bus activation environment")
+		logging.L.Info("exported SSH_AUTH_SOCK to D-Bus activation environment")
 	} else {
-		log.Printf("Set SSH_AUTH_SOCK=%s to use", socketPath)
+		logging.L.Info("SSH_AUTH_SOCK configured", "socket", socketPath)
 	}
 	return nil
 }

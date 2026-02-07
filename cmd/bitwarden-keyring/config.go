@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"sort"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 const (
@@ -105,7 +105,7 @@ func selectPort(bwPortFlag, deprecatedPortFlag int) (int, error) {
 
 	// Handle deprecated --port flag
 	if deprecatedPortFlag != 0 {
-		log.Printf("Warning: --port is deprecated, use --bw-port instead")
+		logging.L.Warn("--port is deprecated, use --bw-port instead")
 		if bwPortFlag == 0 {
 			selectedPort = deprecatedPortFlag
 		}
@@ -119,7 +119,7 @@ func selectPort(bwPortFlag, deprecatedPortFlag int) (int, error) {
 		}
 		selectedPort = listener.Addr().(*net.TCPAddr).Port
 		listener.Close()
-		log.Printf("Auto-selected port: %d", selectedPort)
+		logging.L.Info("auto-selected port", "port", selectedPort)
 	}
 
 	return selectedPort, nil
