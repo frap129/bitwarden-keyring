@@ -235,11 +235,17 @@ func (s *PasswordSession) WaitForRetry(ctx context.Context, timeout time.Duratio
 		return "", fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
-	// Wait for response
+	// Wait for response with context cancellation support
 	reader := bufio.NewReader(conn)
-	respLine, err := reader.ReadBytes('\n')
+	respLine, err := readWithContext(ctx, conn, reader)
 	if err != nil {
 		s.Close()
+		if errors.Is(err, context.Canceled) {
+			return "", ErrCancelled
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", ErrTimeout
+		}
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			return "", ErrTimeout
 		}
@@ -325,7 +331,13 @@ func (c *Client) RequestPasswordWithSession(ctx context.Context, title, message 
 	dialer := net.Dialer{Timeout: connectTimeout}
 	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
 	if err != nil {
-		return "", nil, fmt.Errorf("%w: %v", ErrConnectionFailed, err)
+		if errors.Is(err, context.Canceled) {
+			return "", nil, ErrCancelled
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", nil, ErrTimeout
+		}
+		return "", nil, fmt.Errorf("%w: %w", ErrConnectionFailed, err)
 	}
 
 	// Set read deadline based on timeout
@@ -351,11 +363,17 @@ func (c *Client) RequestPasswordWithSession(ctx context.Context, title, message 
 		return "", nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// Wait for response (blocking read, connection stays open)
+	// Wait for response with context cancellation support
 	reader := bufio.NewReader(conn)
-	respLine, err := reader.ReadBytes('\n')
+	respLine, err := readWithContext(ctx, conn, reader)
 	if err != nil {
 		conn.Close()
+		if errors.Is(err, context.Canceled) {
+			return "", nil, ErrCancelled
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", nil, ErrTimeout
+		}
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			return "", nil, ErrTimeout
 		}
@@ -404,6 +422,38 @@ func (c *Client) RequestPasswordWithSession(ctx context.Context, title, message 
 	default:
 		session.Close()
 		return "", nil, fmt.Errorf("%w: unknown result: %s", ErrProtocolError, resp.Result)
+	}
+}
+
+// readWithContext reads from the connection with context cancellation support.
+// It uses a goroutine to read and monitors the context's Done channel.
+func readWithContext(ctx context.Context, conn net.Conn, reader *bufio.Reader) ([]byte, error) {
+	type result struct {
+		data []byte
+		err  error
+	}
+
+	resultChan := make(chan result, 1)
+
+	// Start reading in a goroutine
+	go func() {
+		data, err := reader.ReadBytes('\n')
+		resultChan <- result{data: data, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Context was cancelled - close connection to unblock read
+		_ = conn.SetReadDeadline(time.Now()) // best-effort unblock
+		_ = conn.Close()
+		select {
+		case <-resultChan:
+		case <-time.After(1 * time.Second):
+			// give up joining; avoid deadlock
+		}
+		return nil, ctx.Err()
+	case res := <-resultChan:
+		return res.data, res.err
 	}
 }
 
