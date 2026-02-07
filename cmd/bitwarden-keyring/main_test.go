@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -137,5 +138,44 @@ func TestValidComponentsList(t *testing.T) {
 	want := "secrets, ssh"
 	if list != want {
 		t.Errorf("validComponentsList() = %q, want %q", list, want)
+	}
+}
+
+func TestRun_ConfigError(t *testing.T) {
+	tests := []struct {
+		name           string
+		args           []string
+		wantErrContain string
+	}{
+		{
+			name:           "invalid component",
+			args:           []string{"--components=invalid"},
+			wantErrContain: "configuration error",
+		},
+		{
+			name:           "invalid session store",
+			args:           []string{"--session-store=invalid"},
+			wantErrContain: "configuration error",
+		},
+		{
+			name:           "relative systemd path",
+			args:           []string{"--systemd-ask-password-path=relative/path"},
+			wantErrContain: "configuration error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := run(tt.args)
+
+			if err == nil {
+				t.Error("run() expected error for invalid config, got nil")
+				return
+			}
+
+			if !strings.Contains(err.Error(), tt.wantErrContain) {
+				t.Errorf("run() error = %v, want error containing %q", err, tt.wantErrContain)
+			}
+		})
 	}
 }

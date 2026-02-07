@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // setupSystemdSocket creates a fake XDG_RUNTIME_DIR with systemd/private
@@ -185,5 +188,31 @@ func TestIsSystemdUserRunning(t *testing.T) {
 				t.Errorf("isSystemdUserRunning() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStart_NoBW(t *testing.T) {
+	// Clear PATH so 'bw' command is not found
+	t.Setenv("PATH", "")
+
+	cfg := Config{
+		BWPort:            8087,
+		EnabledComponents: map[string]bool{"secrets": true},
+		Version:           "test",
+	}
+
+	app := NewApp(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := app.Start(ctx)
+
+	if err == nil {
+		t.Error("App.Start() expected error when bw not found, got nil")
+		return
+	}
+
+	if !strings.Contains(err.Error(), "Bitwarden CLI (bw) not found") {
+		t.Errorf("App.Start() error = %v, want error containing 'Bitwarden CLI (bw) not found'", err)
 	}
 }
