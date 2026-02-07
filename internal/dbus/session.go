@@ -26,10 +26,12 @@ type Session struct {
 
 // SessionManager manages active sessions
 type SessionManager struct {
-	conn     *dbus.Conn
-	sessions map[dbus.ObjectPath]*Session
-	counter  uint64
-	mu       sync.RWMutex
+	conn         *dbus.Conn
+	sessions     map[dbus.ObjectPath]*Session
+	counter      uint64
+	mu           sync.RWMutex
+	exportFunc   func(*Session) error                            // for testing; defaults to exportSession
+	unexportFunc func(*dbus.Conn, dbus.ObjectPath, string, bool) // for testing; defaults to unexportDBusObject
 }
 
 // NewSessionManager creates a new session manager
@@ -87,7 +89,11 @@ func (sm *SessionManager) CreateSession(algorithm string, input []byte) (*Sessio
 	sm.mu.Unlock()
 
 	// Export the session object
-	if err := sm.exportSession(session); err != nil {
+	exportFn := sm.exportFunc
+	if exportFn == nil {
+		exportFn = sm.exportSession
+	}
+	if err := exportFn(session); err != nil {
 		sm.mu.Lock()
 		delete(sm.sessions, path)
 		sm.mu.Unlock()
@@ -115,6 +121,14 @@ func (sm *SessionManager) GetSessionOrError(path dbus.ObjectPath) (*Session, *db
 	return session, nil
 }
 
+// SessionCount returns the number of active sessions.
+// This is safe for concurrent use.
+func (sm *SessionManager) SessionCount() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.sessions)
+}
+
 // CloseSession closes and removes a session, unexports all D-Bus interfaces
 func (sm *SessionManager) CloseSession(path dbus.ObjectPath) error {
 	sm.mu.Lock()
@@ -129,7 +143,11 @@ func (sm *SessionManager) CloseSession(path dbus.ObjectPath) error {
 	}
 
 	// Unexport all session D-Bus interfaces
-	unexportDBusObject(sm.conn, session.path, SessionInterface, false)
+	unexportFn := sm.unexportFunc
+	if unexportFn == nil {
+		unexportFn = unexportDBusObject
+	}
+	unexportFn(sm.conn, session.path, SessionInterface, false)
 
 	return nil
 }
