@@ -63,15 +63,21 @@ type ListSSHKeysResult struct {
 
 // Common errors for the SSH agent.
 var (
-	ErrKeyNotFound           = errors.New("ssh key not found")
-	ErrVaultLocked           = errors.New("bitwarden vault is locked")
-	ErrReadOnly              = errors.New("ssh agent is read-only")
+	ErrKeyNotFound = errors.New("ssh key not found")
+	ErrVaultLocked = errors.New("bitwarden vault is locked")
+	ErrReadOnly    = errors.New("ssh agent is read-only")
+
+	// ErrRemoveAllNotSupported is returned by RemoveAll to prevent bulk deletion
+	// of SSH keys. This is a deliberate safety measure because SSH keys stored
+	// in Bitwarden should not be mass-deleted through the agent interface.
+	// Callers should delete keys individually via Remove() instead.
 	ErrRemoveAllNotSupported = errors.New("ssh-add -D (remove all) is not supported")
-	ErrInvalidKey            = errors.New("invalid ssh key format")
-	ErrSocketExists          = errors.New("socket already exists")
-	ErrNotSocket             = errors.New("path exists but is not a socket")
-	ErrNotSSHKeyItem         = errors.New("item is not an SSH key")
-	ErrAlreadyStarted        = errors.New("server already started")
+
+	ErrInvalidKey     = errors.New("invalid ssh key format")
+	ErrSocketExists   = errors.New("socket already exists")
+	ErrNotSocket      = errors.New("path exists but is not a socket")
+	ErrNotSSHKeyItem  = errors.New("item is not an SSH key")
+	ErrAlreadyStarted = errors.New("server already started")
 )
 
 // ItemLister is a minimal interface for listing items from a Bitwarden-like source.

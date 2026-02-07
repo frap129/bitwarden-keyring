@@ -273,8 +273,14 @@ func (k *Keyring) Remove(key cryptossh.PublicKey) error {
 	return nil
 }
 
-// RemoveAll is not supported to prevent accidental deletion of all SSH keys.
-// Use Remove to delete individual keys instead.
+// RemoveAll is intentionally not supported as a safety guard against bulk key deletion.
+//
+// This method is required by the agent.ExtendedAgent interface, but returning an error
+// prevents accidental mass deletion of SSH keys from Bitwarden. SSH keys stored in
+// Bitwarden should be deleted individually through explicit user action, not through
+// the ssh-add -D command which could wipe all keys without confirmation.
+//
+// Callers should remove keys individually via Remove(key).
 func (k *Keyring) RemoveAll() error {
 	return ErrRemoveAllNotSupported
 }
