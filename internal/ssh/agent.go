@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 
 	"golang.org/x/crypto/ssh/agent"
 
@@ -67,6 +68,12 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 
+	// Security validation: ensure socket directory is not a symlink, is owned by current user,
+	// and has restrictive permissions
+	if err := validateSocketDir(socketDir); err != nil {
+		return err
+	}
+
 	// Remove stale socket if it exists
 	if info, err := os.Stat(s.socketPath); err == nil {
 		// Verify it's actually a socket before attempting removal
@@ -109,6 +116,53 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.acceptLoop(ctx)
 
 	s.started = true
+	return nil
+}
+
+// validateSocketDir validates that the socket directory is secure:
+// - Not a symlink (to prevent symlink attacks)
+// - Owned by the current user
+// - Has restrictive permissions (no world/group access)
+func validateSocketDir(dir string) error {
+	// Lstat to check if it's a symlink
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("failed to stat socket directory: %w", err)
+	}
+
+	// Check for symlink
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s is a symlink", ErrInsecureSocketDir, dir)
+	}
+
+	// Check ownership
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		// On systems where Stat_t is not available, skip ownership check
+		// but still check permissions
+	} else {
+		if int(stat.Uid) != os.Geteuid() {
+			return fmt.Errorf("%w: %s is not owned by current user", ErrInsecureSocketDir, dir)
+		}
+	}
+
+	// Check permissions - reject if world or group has any access
+	perm := fi.Mode().Perm()
+	if perm&0077 != 0 {
+		// Try to fix permissions first
+		if err := os.Chmod(dir, 0700); err != nil {
+			return fmt.Errorf("%w: %s has permissions %04o and chmod failed: %w", ErrInsecureSocketDir, dir, perm, err)
+		}
+		// Re-check permissions after chmod
+		fi, err = os.Lstat(dir)
+		if err != nil {
+			return fmt.Errorf("failed to re-stat socket directory after chmod: %w", err)
+		}
+		if fi.Mode().Perm()&0077 != 0 {
+			return fmt.Errorf("%w: %s has permissions %04o (chmod to 0700 failed)", ErrInsecureSocketDir, dir, fi.Mode().Perm())
+		}
+	}
+
 	return nil
 }
 

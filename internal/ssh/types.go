@@ -4,6 +4,7 @@ package ssh
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -25,12 +26,12 @@ type BitwardenClient interface {
 
 // DefaultSocketPath returns the default path for the SSH agent socket.
 // It uses $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock if XDG_RUNTIME_DIR is set,
-// otherwise falls back to /tmp/bitwarden-keyring-ssh.sock.
+// otherwise falls back to /tmp/bitwarden-keyring-<uid>/ssh.sock.
 func DefaultSocketPath() string {
 	if xdgRuntime := os.Getenv("XDG_RUNTIME_DIR"); xdgRuntime != "" {
 		return filepath.Join(xdgRuntime, "bitwarden-keyring", "ssh.sock")
 	}
-	return "/tmp/bitwarden-keyring-ssh.sock"
+	return filepath.Join(os.TempDir(), fmt.Sprintf("bitwarden-keyring-%d", os.Geteuid()), "ssh.sock")
 }
 
 // SSHKeyItem wraps a Bitwarden item with its parsed SSH key signer.
@@ -73,11 +74,12 @@ var (
 	// Callers should delete keys individually via Remove() instead.
 	ErrRemoveAllNotSupported = errors.New("ssh-add -D (remove all) is not supported")
 
-	ErrInvalidKey     = errors.New("invalid ssh key format")
-	ErrSocketExists   = errors.New("socket already exists")
-	ErrNotSocket      = errors.New("path exists but is not a socket")
-	ErrNotSSHKeyItem  = errors.New("item is not an SSH key")
-	ErrAlreadyStarted = errors.New("server already started")
+	ErrInvalidKey        = errors.New("invalid ssh key format")
+	ErrSocketExists      = errors.New("socket already exists")
+	ErrNotSocket         = errors.New("path exists but is not a socket")
+	ErrNotSSHKeyItem     = errors.New("item is not an SSH key")
+	ErrAlreadyStarted    = errors.New("server already started")
+	ErrInsecureSocketDir = errors.New("socket directory is insecure: must not be a symlink, must be owned by current user, and must not be world-accessible")
 )
 
 // ItemLister is a minimal interface for listing items from a Bitwarden-like source.

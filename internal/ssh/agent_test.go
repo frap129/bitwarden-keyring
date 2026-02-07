@@ -3,6 +3,7 @@ package ssh
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -177,10 +178,7 @@ func TestServer_SocketInUse(t *testing.T) {
 
 func TestDefaultSocketPath(t *testing.T) {
 	// Test with XDG_RUNTIME_DIR set
-	originalXDG := os.Getenv("XDG_RUNTIME_DIR")
-	defer os.Setenv("XDG_RUNTIME_DIR", originalXDG)
-
-	os.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
 	path := DefaultSocketPath()
 	expected := "/run/user/1000/bitwarden-keyring/ssh.sock"
 	if path != expected {
@@ -188,10 +186,104 @@ func TestDefaultSocketPath(t *testing.T) {
 	}
 
 	// Test without XDG_RUNTIME_DIR
-	os.Unsetenv("XDG_RUNTIME_DIR")
+	t.Setenv("XDG_RUNTIME_DIR", "")
 	path = DefaultSocketPath()
-	expected = "/tmp/bitwarden-keyring-ssh.sock"
+	uid := os.Geteuid()
+	expected = filepath.Join(os.TempDir(), fmt.Sprintf("bitwarden-keyring-%d", uid), "ssh.sock")
 	if path != expected {
 		t.Errorf("DefaultSocketPath() without XDG_RUNTIME_DIR = %v, want %v", path, expected)
+	}
+}
+
+func TestDefaultSocketPath_TmpFallback_UsesSubdirectory(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	path := DefaultSocketPath()
+	// Should be like /tmp/bitwarden-keyring-<uid>/ssh.sock
+	uid := os.Geteuid()
+	expected := filepath.Join(os.TempDir(), fmt.Sprintf("bitwarden-keyring-%d", uid), "ssh.sock")
+	if path != expected {
+		t.Errorf("got %q, want %q", path, expected)
+	}
+}
+
+func TestServer_Start_RejectsSymlinkedSocketDir(t *testing.T) {
+	// Create a temp directory for our test
+	tmpDir := t.TempDir()
+
+	// Create a "real" directory
+	realDir := filepath.Join(tmpDir, "real")
+	if err := os.MkdirAll(realDir, 0700); err != nil {
+		t.Fatalf("Failed to create real directory: %v", err)
+	}
+
+	// Create a symlink pointing to the real directory
+	symlinkDir := filepath.Join(tmpDir, "symlink")
+	if err := os.Symlink(realDir, symlinkDir); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	socketPath := filepath.Join(symlinkDir, "ssh.sock")
+	client := bitwarden.NewClient(8087)
+	server := NewServer(socketPath, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := server.Start(ctx)
+	if err == nil {
+		server.Stop()
+		t.Fatal("Start() should reject symlinked socket directory")
+	}
+
+	if !errors.Is(err, ErrInsecureSocketDir) {
+		t.Errorf("Expected ErrInsecureSocketDir, got: %v", err)
+	}
+}
+
+func TestServer_Start_RejectsWrongOwnerSocketDir(t *testing.T) {
+	// This test requires creating a directory owned by a different user.
+	// In most test environments, this is not possible without root privileges.
+	// We skip this test since we cannot reliably create a directory with
+	// a different owner in a standard unit test environment.
+	t.Skip("Skipping test - cannot reliably create directory with different owner in unit test")
+}
+
+func TestServer_Start_FixesWorldWritableSocketDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	socketDir := filepath.Join(tmpDir, "world-writable")
+	// Create directory with world-writable permissions
+	if err := os.MkdirAll(socketDir, 0777); err != nil {
+		t.Fatalf("Failed to create socket directory: %v", err)
+	}
+
+	// Verify it was created with world-writable permissions
+	fi, err := os.Stat(socketDir)
+	if err != nil {
+		t.Fatalf("Failed to stat socket directory: %v", err)
+	}
+	if fi.Mode().Perm()&0077 == 0 {
+		t.Skip("Directory permissions were already restricted by umask")
+	}
+
+	socketPath := filepath.Join(socketDir, "ssh.sock")
+	client := bitwarden.NewClient(8087)
+	server := NewServer(socketPath, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Server should start successfully by fixing permissions
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start() should fix world-writable permissions and succeed: %v", err)
+	}
+	server.Stop()
+
+	// Verify permissions were fixed
+	fi, err = os.Stat(socketDir)
+	if err != nil {
+		t.Fatalf("Failed to stat socket directory after Start: %v", err)
+	}
+	if fi.Mode().Perm()&0077 != 0 {
+		t.Errorf("Directory permissions should be restricted to 0700, got: %04o", fi.Mode().Perm())
 	}
 }
