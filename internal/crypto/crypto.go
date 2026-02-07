@@ -15,6 +15,13 @@ import (
 )
 
 // Second Oakley Group (RFC 2409) - used as "dh-ietf1024" in Secret Service API
+//
+// The 1024-bit DH prime is mandated by the D-Bus Secret Service specification for
+// the "dh-ietf1024-sha256-aes128-cbc-pkcs7" algorithm. This specification-defined
+// parameter is used exclusively for local IPC transport over the D-Bus session bus,
+// not for internet-facing connections. While 1024-bit DH is considered weak for
+// general cryptographic use today, it is adequate for protecting secrets in transit
+// over the local D-Bus session bus between processes on the same machine.
 var (
 	modp1024Prime = func() *big.Int {
 		p, _ := new(big.Int).SetString(
