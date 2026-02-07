@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/joe/bitwarden-keyring/internal/logging"
 )
 
 // run contains the main application logic and is testable.
@@ -22,9 +24,7 @@ func run(args []string) error {
 		return fmt.Errorf("configuration error: %w", err)
 	}
 
-	if cfg.Debug {
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
+	logging.Setup(cfg.Debug)
 
 	app := NewApp(cfg)
 
