@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/joe/bitwarden-keyring/internal/bitwarden"
@@ -109,6 +110,35 @@ func (cm *CollectionManager) exportCollection(coll *Collection) error {
 // Path returns the collection's object path
 func (c *Collection) Path() dbus.ObjectPath {
 	return c.path
+}
+
+// lastSyncUnix returns the last sync time from Bitwarden status as a Unix timestamp.
+// Returns 0 if the status call fails or lastSync is empty.
+// Note: Status() uses doRequest which already checks HTTP status codes >= 400, so
+// we don't need to check status.Success here - an API error would have been returned
+// as an HTTP error.
+func (c *Collection) lastSyncUnix(ctx context.Context) int64 {
+	status, err := c.bwClient.Status(ctx)
+	if err != nil {
+		return 0
+	}
+	lastSync := status.Data.Template.LastSync
+	if lastSync == nil || *lastSync == "" {
+		return 0
+	}
+	// Try RFC3339Nano first (Bitwarden format), then RFC3339
+	t, err := time.Parse(time.RFC3339Nano, *lastSync)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, *lastSync)
+		if err != nil {
+			return 0
+		}
+	}
+	u := t.Unix()
+	if u < 0 {
+		return 0
+	}
+	return u
 }
 
 // hasMeaningfulAttrs checks if attrs has at least one identity attribute.
@@ -268,6 +298,12 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
+	// Handle timestamp properties outside the lock — they only need bwClient (immutable).
+	switch property {
+	case "Created", "Modified":
+		return dbus.MakeVariant(uint64(c.lastSyncUnix(context.Background()))), nil
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -287,12 +323,6 @@ func (c *Collection) Get(iface, property string) (dbus.Variant, *dbus.Error) {
 	case "Locked":
 		ctx := context.Background()
 		return dbus.MakeVariant(c.bwClient.IsLockedSafe(ctx)), nil
-
-	case "Created":
-		return dbus.MakeVariant(uint64(0)), nil
-
-	case "Modified":
-		return dbus.MakeVariant(uint64(0)), nil
 
 	default:
 		return dbus.Variant{}, toDBusError(fmt.Errorf("unknown property: %s", property))
@@ -328,6 +358,9 @@ func (c *Collection) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error)
 		return nil, toDBusError(fmt.Errorf("unknown interface: %s", iface))
 	}
 
+	// Fetch timestamp outside the lock — it only needs bwClient (immutable).
+	ts := uint64(c.lastSyncUnix(context.Background()))
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -345,8 +378,8 @@ func (c *Collection) GetAll(iface string) (map[string]dbus.Variant, *dbus.Error)
 		"Items":    dbus.MakeVariant(paths),
 		"Label":    dbus.MakeVariant(c.label),
 		"Locked":   dbus.MakeVariant(locked),
-		"Created":  dbus.MakeVariant(uint64(0)),
-		"Modified": dbus.MakeVariant(uint64(0)),
+		"Created":  dbus.MakeVariant(ts),
+		"Modified": dbus.MakeVariant(ts),
 	}
 
 	return props, nil
