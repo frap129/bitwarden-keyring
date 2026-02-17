@@ -175,11 +175,22 @@ Item {
         }
     }
 
+    // Fix socket permissions after creation (Quickshell creates with 0775, we need 0700)
+    Process {
+        id: chmodProcess
+        command: ["chmod", "0700", root.socketPath]
+    }
+
     // Socket server for receiving password requests and results
     SocketServer {
         id: keyringServer
         active: root.serverActive
         path: root.socketPath
+        onActiveChanged: {
+            if (active && root.socketPath.length > 0) {
+                chmodProcess.running = true
+            }
+        }
 
         handler: Socket {
             id: clientSocket
