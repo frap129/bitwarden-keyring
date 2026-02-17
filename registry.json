@@ -4,13 +4,13 @@
     {
       "id": "noctalia-bitwarden-keyring",
       "name": "Bitwarden Keyring",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "author": "frap129",
       "description": "Password prompts for Bitwarden Keyring vault unlock.",
       "repository": "https://github.com/frap129/bitwarden-keyring",
       "minNoctaliaVersion": "4.0.0",
       "license": "MIT",
-      "lastUpdated": "2026-02-07T00:00:00Z"
+      "lastUpdated": "2026-02-17T00:00:00Z"
     }
   ]
 }
