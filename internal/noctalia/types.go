@@ -72,6 +72,9 @@ var (
 	// ErrCookieMismatch indicates the response cookie doesn't match the request
 	ErrCookieMismatch = errors.New("response cookie does not match request")
 
+	// ErrSessionClosed indicates the authenticated prompt bridge has closed.
+	ErrSessionClosed = errors.New("noctalia session closed")
+
 	// ErrSocketSymlink indicates the socket path is a symbolic link
 	ErrSocketSymlink = errors.New("socket is a symbolic link")
 
