@@ -255,7 +255,9 @@ func assertPanelSource(t *testing.T, source string) {
 	t.Helper()
 	for _, required := range []string{
 		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local inputAccepting`, `local suppressCloseCancel`,
-		`function render()`, `ui.column`, `assets/bitwarden.svg`, `noctalia.getConfig("show_bitwarden_icon")`,
+		`function render()`, `ui.label({ text = title })`, `ui.label({ text = prompt })`, `ui.input({`,
+		`ui.glyph({ name = "lock" })`, `ui.image({ path = "assets/bitwarden.svg" })`, `ui.column({ gap = 12 }, children)`,
+		`noctalia.getConfig("show_bitwarden_icon")`,
 		`key = "password-" .. inputKey`, `value = ""`, `password = true`, `focus = true`, `enabled = auth.phase == "ready"`,
 		`local capturedInputKey = inputKey`, `local capturedId = auth.id`, `onChange = function(value)`, `onSubmit = function()`,
 		`handlePasswordChange(value, capturedInputKey, capturedId)`, `handleUnlock(capturedInputKey, capturedId)`, `panel.render(render())`,
@@ -285,6 +287,7 @@ func assertPanelSource(t *testing.T, source string) {
 		"frameTick", "onFrame", "setUpdateInterval", "setTimeout", "setInterval", "animation", "timer", "geometry",
 		"pluginSettings", "openPanel", "closePanel", "saveSettings",
 		"pluginApi", "SocketServer", "Quickshell", "runAsync", "runStream", "print(",
+		"ui.text(", "ui.textInput(", "source =", "children = children",
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("panel.luau contains forbidden literal %q", forbidden)

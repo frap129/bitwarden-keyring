@@ -69,21 +69,21 @@ function render()
 
   local icon
   if noctalia.getConfig("show_bitwarden_icon") == true then
-    icon = ui.image({ source = "assets/bitwarden.svg" })
+    icon = ui.image({ path = "assets/bitwarden.svg" })
   else
-    icon = ui.text({ text = "🔒" })
+    icon = ui.glyph({ name = "lock" })
   end
 
   local children = {
     icon,
-    ui.text({ text = title }),
-    ui.text({ text = prompt }),
+    ui.label({ text = title }),
+    ui.label({ text = prompt }),
   }
   if auth ~= nil and not confirmOnly then
     if ready then inputAccepting = true end
     local capturedInputKey = inputKey
     local capturedId = auth.id
-    table.insert(children, ui.textInput({
+    table.insert(children, ui.input({
       key = "password-" .. inputKey,
       value = "",
       placeholder = noctalia.tr("panel.password_placeholder"),
@@ -98,7 +98,7 @@ function render()
       end,
     }))
   end
-  table.insert(children, ui.text({ text = errorText }))
+  table.insert(children, ui.label({ text = errorText }))
   if auth == nil then
     table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = true, onClick = "onInvalidDismiss" }))
   elseif auth.phase == "failed" then
@@ -114,7 +114,7 @@ function render()
       onClick = "onUnlock",
     }))
   end
-  return ui.column({ children = children })
+  return ui.column({ gap = 12 }, children)
 end
 
 local function rerender()
