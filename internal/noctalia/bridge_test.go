@@ -65,17 +65,18 @@ func testKeyringResponse(bridge *promptBridge, result, password string) KeyringR
 
 func waitForPendingResult(t *testing.T, bridge *promptBridge) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		bridge.mu.Lock()
-		pending := bridge.pendingResult != nil
+	bridge.mu.Lock()
+	if bridge.pendingResult != nil {
 		bridge.mu.Unlock()
-		if pending {
-			return
-		}
-		time.Sleep(time.Millisecond)
+		return
 	}
-	t.Fatal("timed out waiting for pending result")
+	ready := bridge.pendingReady
+	bridge.mu.Unlock()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pending result")
+	}
 }
 
 type blockingBridgeResponseWriter struct {
@@ -409,6 +410,49 @@ func TestPromptBridgeDescriptorRejectsWriteFailure(t *testing.T) {
 
 	if _, err := newPromptBridge(testPromptRequest()); err == nil {
 		t.Error("newPromptBridge() error = nil, want descriptor write error")
+	}
+}
+
+func TestPromptBridgeDescriptorSyncFailureCleansResources(t *testing.T) {
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(runtimeDir, 0700); err != nil {
+		t.Fatalf("chmod runtime directory: %v", err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	injectedErr := errors.New("injected descriptor sync failure")
+	var descriptorFile *os.File
+	bridge, err := newPromptBridgeWithDescriptorWriter(testPromptRequest(), func(file *os.File, descriptor bridgeDescriptor) error {
+		descriptorFile = file
+		return writeBridgeDescriptorWithSync(file, descriptor, func(*os.File) error {
+			return injectedErr
+		})
+	})
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("newPromptBridgeWithDescriptorWriter() error = %v, want injected sync error", err)
+	}
+	if bridge != nil {
+		t.Fatal("newPromptBridgeWithDescriptorWriter() returned bridge after sync failure")
+	}
+	if descriptorFile == nil {
+		t.Fatal("descriptor writer was not invoked")
+	}
+	if _, statErr := descriptorFile.Stat(); statErr == nil {
+		t.Error("descriptor file remains open after sync failure")
+	}
+
+	child := filepath.Join(runtimeDir, "bitwarden-keyring")
+	entries, err := os.ReadDir(child)
+	if err != nil {
+		t.Fatalf("read bridge directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("bridge directory contains %d entries after sync failure", len(entries))
+	}
+
+	descriptorPath := filepath.Join(child, "noctalia-"+testPromptRequest().Cookie+".json")
+	if _, err := os.Lstat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("descriptor path stat error = %v, want not exists", err)
 	}
 }
 
@@ -865,6 +909,115 @@ func TestPromptBridgeResultFinalizationOrdering(t *testing.T) {
 			t.Errorf("late result status = %d, want %d", recorder.Code, http.StatusNoContent)
 		}
 	})
+}
+
+func TestPromptBridgeResultCancellationAfterClaimedWrite(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	ctx, cancel := context.WithCancel(context.Background())
+	resultDone := make(chan error, 1)
+	go func() {
+		resultDone <- bridge.sendResult(ctx, KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true})
+	}()
+	waitForPendingResult(t, bridge)
+
+	writer := newBlockingBridgeResponseWriter()
+	request := newAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, nil)
+	handlerDone := make(chan struct{})
+	go func() {
+		bridge.server.Handler.ServeHTTP(writer, request)
+		close(handlerDone)
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for claimed result writer")
+	}
+
+	cancel()
+	select {
+	case err := <-resultDone:
+		if !errors.Is(err, ErrCancelled) {
+			t.Fatalf("sendResult() error = %v, want ErrCancelled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cancelled sendResult")
+	}
+
+	bridge.mu.Lock()
+	pendingBeforeRelease := bridge.pendingResult
+	acceptBeforeRelease := bridge.acceptResponse
+	closedBeforeRelease := bridge.closed
+	bridge.mu.Unlock()
+	if pendingBeforeRelease != nil || acceptBeforeRelease || closedBeforeRelease {
+		t.Fatalf("state after cancellation = pending=%v accept=%v closed=%v", pendingBeforeRelease, acceptBeforeRelease, closedBeforeRelease)
+	}
+
+	close(writer.release)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out releasing result writer")
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.pendingResult != pendingBeforeRelease || bridge.acceptResponse != acceptBeforeRelease || bridge.closed != closedBeforeRelease {
+		t.Errorf("late finishDelivery changed state: pending=%v accept=%v closed=%v", bridge.pendingResult, bridge.acceptResponse, bridge.closed)
+	}
+}
+
+func TestPromptBridgeResultCloseAfterClaimedWrite(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	resultDone := make(chan error, 1)
+	go func() {
+		resultDone <- bridge.sendResult(context.Background(), KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true})
+	}()
+	waitForPendingResult(t, bridge)
+
+	writer := newBlockingBridgeResponseWriter()
+	request := newAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, nil)
+	handlerDone := make(chan struct{})
+	go func() {
+		bridge.server.Handler.ServeHTTP(writer, request)
+		close(handlerDone)
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for claimed result writer")
+	}
+
+	if err := bridge.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case err := <-resultDone:
+		if !errors.Is(err, ErrSessionClosed) {
+			t.Fatalf("sendResult() error = %v, want ErrSessionClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for closed sendResult")
+	}
+
+	bridge.mu.Lock()
+	pendingBeforeRelease := bridge.pendingResult
+	acceptBeforeRelease := bridge.acceptResponse
+	closedBeforeRelease := bridge.closed
+	bridge.mu.Unlock()
+	if pendingBeforeRelease != nil || acceptBeforeRelease || !closedBeforeRelease {
+		t.Fatalf("state after close = pending=%v accept=%v closed=%v", pendingBeforeRelease, acceptBeforeRelease, closedBeforeRelease)
+	}
+
+	close(writer.release)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out releasing result writer")
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.pendingResult != pendingBeforeRelease || bridge.acceptResponse != acceptBeforeRelease || bridge.closed != closedBeforeRelease {
+		t.Errorf("late finishDelivery changed state: pending=%v accept=%v closed=%v", bridge.pendingResult, bridge.acceptResponse, bridge.closed)
+	}
 }
 
 func TestPromptBridgeLateResultWriterCannotMutateAbandonedState(t *testing.T) {

@@ -53,9 +53,14 @@ type promptBridge struct {
 	closed         bool
 	acceptResponse bool
 	pendingResult  *resultDelivery
+	pendingReady   chan struct{}
 }
 
 func newPromptBridge(request KeyringRequest) (*promptBridge, error) {
+	return newPromptBridgeWithDescriptorWriter(request, writeBridgeDescriptor)
+}
+
+func newPromptBridgeWithDescriptorWriter(request KeyringRequest, descriptorWriter func(*os.File, bridgeDescriptor) error) (*promptBridge, error) {
 	if !validBridgeCookie(request.Cookie) {
 		return nil, errors.New("invalid noctalia request cookie")
 	}
@@ -143,7 +148,7 @@ func newPromptBridge(request KeyringRequest) (*promptBridge, error) {
 		BaseURL:   "http://" + listener.Addr().String(),
 		Token:     token,
 	}
-	if err := writeBridgeDescriptor(descriptorFile, descriptor); err != nil {
+	if err := descriptorWriter(descriptorFile, descriptor); err != nil {
 		cleanupBridgeDescriptor(directoryFile, descriptorFile, descriptorName)
 		_ = descriptorFile.Close()
 		_ = listener.Close()
@@ -161,6 +166,7 @@ func newPromptBridge(request KeyringRequest) (*promptBridge, error) {
 		responses:      make(chan KeyringResponse, 1),
 		done:           make(chan struct{}),
 		acceptResponse: true,
+		pendingReady:   make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/request", bridge.handleRequest)
@@ -284,6 +290,12 @@ func validateBridgeOwnership(info os.FileInfo) error {
 }
 
 func writeBridgeDescriptor(file *os.File, descriptor bridgeDescriptor) error {
+	return writeBridgeDescriptorWithSync(file, descriptor, func(file *os.File) error {
+		return file.Sync()
+	})
+}
+
+func writeBridgeDescriptorWithSync(file *os.File, descriptor bridgeDescriptor, syncFile func(*os.File) error) error {
 	if err := file.Chmod(0600); err != nil {
 		return err
 	}
@@ -293,7 +305,7 @@ func writeBridgeDescriptor(file *os.File, descriptor bridgeDescriptor) error {
 	if err := json.NewEncoder(file).Encode(descriptor); err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
+	if err := syncFile(file); err != nil {
 		return err
 	}
 	_, err := file.Seek(0, io.SeekStart)
@@ -576,7 +588,10 @@ func (b *promptBridge) sendResult(ctx context.Context, result KeyringResult) err
 		return errors.New("noctalia result already pending")
 	}
 	b.pendingResult = delivery
+	ready := b.pendingReady
+	b.pendingReady = make(chan struct{})
 	b.mu.Unlock()
+	close(ready)
 
 	select {
 	case err := <-delivery.done:
@@ -629,6 +644,7 @@ func (b *promptBridge) Close() error {
 			delivery.abandoned = true
 			b.pendingResult = nil
 		}
+		b.acceptResponse = false
 		close(b.done)
 		b.mu.Unlock()
 
