@@ -45,6 +45,8 @@ type resultDelivery struct {
 	done      chan error
 	claimed   bool
 	abandoned bool
+	completed bool
+	err       error
 }
 
 type promptBridge struct {
@@ -64,6 +66,8 @@ type promptBridge struct {
 	responseSlot            KeyringResponse
 	responseError           error
 	responseReservationHook func()
+	waiterStartHook         func()
+	waiterActive            bool
 	pendingResult           *resultDelivery
 	pendingReady            chan struct{}
 	closeErr                error
@@ -168,11 +172,9 @@ func newPromptBridgeWithDescriptorWriter(request KeyringRequest, descriptorWrite
 	// encoding and syncing succeed, the server starts, and this constructor
 	// returns to the caller that invokes the plugin CLI.
 	if err := descriptorWriter(descriptorFile, descriptor); err != nil {
-		cleanupBridgeDescriptor(directoryFile, descriptorFile, descriptorName)
-		_ = descriptorFile.Close()
-		_ = listener.Close()
-		_ = directoryFile.Close()
-		return nil, fmt.Errorf("write prompt bridge descriptor: %w", err)
+		cleanupErr := cleanupBridgeDescriptor(directoryFile, descriptorFile, descriptorName)
+		cleanupErr = errors.Join(cleanupErr, closeBridgeFile(descriptorFile), listener.Close(), closeBridgeFile(directoryFile))
+		return nil, fmt.Errorf("write prompt bridge descriptor: %w", errors.Join(err, cleanupErr))
 	}
 
 	bridge := &promptBridge{
@@ -532,6 +534,24 @@ func validKeyringResponse(request KeyringRequest, response KeyringResponse) bool
 
 func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) (KeyringResponse, error) {
 	b.mu.Lock()
+	// A reservation is authoritative even if Close has already marked the
+	// transport closed; only a waiter that was already active may consume it.
+	if b.waiterActive {
+		b.mu.Unlock()
+		return KeyringResponse{}, ErrProtocolError
+	}
+	b.waiterActive = true
+	hook := b.waiterStartHook
+	b.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	b.mu.Lock()
+	defer func() {
+		b.mu.Lock()
+		b.waiterActive = false
+		b.mu.Unlock()
+	}()
 	if response, ok := b.consumeResponseLocked(); ok {
 		b.mu.Unlock()
 		return response, nil
@@ -541,7 +561,11 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 		b.mu.Unlock()
 		return KeyringResponse{}, err
 	}
-	if b.responseState == responseStateConsumed || b.closed {
+	if b.responseState == responseStateConsumed {
+		b.mu.Unlock()
+		return KeyringResponse{}, ErrSessionClosed
+	}
+	if b.closed && b.responseState != responseStateReserved {
 		b.mu.Unlock()
 		return KeyringResponse{}, ErrSessionClosed
 	}
@@ -677,6 +701,10 @@ func (b *promptBridge) sendResult(ctx context.Context, result KeyringResult) err
 		b.mu.Unlock()
 		return ErrSessionClosed
 	}
+	if b.responseState != responseStateConsumed && b.responseState != responseStateAccepting {
+		b.mu.Unlock()
+		return ErrProtocolError
+	}
 	if b.pendingResult != nil {
 		b.mu.Unlock()
 		return errors.New("noctalia result already pending")
@@ -702,15 +730,14 @@ func (b *promptBridge) abandonDelivery(delivery *resultDelivery, err error) erro
 	if b.pendingResult == delivery && !delivery.abandoned {
 		delivery.abandoned = true
 		b.pendingResult = nil
-		b.responseState = responseStateTerminal
-		b.responseError = err
-		b.responseSlot = KeyringResponse{}
+		delivery.completed = true
+		delivery.err = err
 		b.mu.Unlock()
 		return err
 	}
-	if delivery.abandoned {
+	if delivery.abandoned || delivery.completed {
 		b.mu.Unlock()
-		return ErrSessionClosed
+		return delivery.err
 	}
 	b.mu.Unlock()
 	return <-delivery.done
@@ -723,7 +750,9 @@ func (b *promptBridge) finishDelivery(delivery *resultDelivery, err error, allow
 		return
 	}
 	b.pendingResult = nil
-	if allowRetry && !b.closed && b.responseState == responseStateConsumed {
+	delivery.completed = true
+	delivery.err = err
+	if allowRetry && err == nil && !b.closed && b.responseState == responseStateConsumed {
 		b.responseState = responseStateAccepting
 		b.responseNotify = make(chan struct{})
 	}
@@ -737,9 +766,13 @@ func (b *promptBridge) Close() error {
 		b.closed = true
 		if delivery := b.pendingResult; delivery != nil {
 			delivery.abandoned = true
+			delivery.completed = true
+			delivery.err = ErrSessionClosed
 			b.pendingResult = nil
 		}
-		if b.responseState == responseStateAccepting {
+		if b.responseState == responseStateReserved {
+			// The active waiter owns this reserved response and may consume it.
+		} else if b.responseState == responseStateAccepting {
 			b.responseState = responseStateTerminal
 			b.responseError = ErrSessionClosed
 			b.responseSlot = KeyringResponse{}
