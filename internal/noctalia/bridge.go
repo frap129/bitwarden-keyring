@@ -811,18 +811,16 @@ func (b *promptBridge) Close() error {
 }
 
 func firstBridgeCloseError(first, err error) error {
-	if first != nil {
+	if err == nil {
 		return first
 	}
-	if err != nil {
-		return errBridgeCleanup
-	}
-	return nil
+	wrapped := errors.Join(errBridgeCleanup, err)
+	return errors.Join(first, wrapped)
 }
 
 func closeBridgeFile(file *os.File) error {
 	if err := file.Close(); err != nil {
-		return errBridgeCleanup
+		return errors.Join(errBridgeCleanup, err)
 	}
 	return nil
 }
@@ -833,17 +831,17 @@ func cleanupBridgeDescriptor(directoryFile, descriptorFile *os.File, name string
 		if errors.Is(err, unix.ENOENT) {
 			return nil
 		}
-		return errBridgeCleanup
+		return errors.Join(errBridgeCleanup, err)
 	}
 	fileInfo, err := descriptorFile.Stat()
 	if err != nil {
-		return errBridgeCleanup
+		return errors.Join(errBridgeCleanup, err)
 	}
 	if !os.SameFile(pathInfo, fileInfo) {
 		return nil
 	}
 	if err := unix.Unlinkat(int(directoryFile.Fd()), name, 0); err != nil {
-		return errBridgeCleanup
+		return errors.Join(errBridgeCleanup, err)
 	}
 	return nil
 }
