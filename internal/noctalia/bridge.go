@@ -694,7 +694,7 @@ func (b *promptBridge) sendResult(ctx context.Context, result KeyringResult) err
 		b.mu.Unlock()
 		return ErrSessionClosed
 	}
-	if b.responseState != responseStateConsumed && b.responseState != responseStateAccepting {
+	if b.responseState != responseStateConsumed {
 		b.mu.Unlock()
 		return ErrProtocolError
 	}

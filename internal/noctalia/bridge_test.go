@@ -63,6 +63,24 @@ func testKeyringResponse(bridge *promptBridge, result, password string) KeyringR
 	return KeyringResponse{Type: MessageTypeResponse, ID: bridge.request.Cookie, Result: result, Password: password}
 }
 
+func consumeResponseForResult(t *testing.T, bridge *promptBridge) KeyringResponse {
+	t.Helper()
+	want := testKeyringResponse(bridge, ResultOK, "password")
+	reply := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, want))
+	reply.Body.Close()
+	if reply.StatusCode != http.StatusAccepted {
+		t.Fatalf("response status = %d, want %d", reply.StatusCode, http.StatusAccepted)
+	}
+	got, err := bridge.waitResponse(context.Background(), time.Second)
+	if err != nil {
+		t.Fatalf("waitResponse() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("waitResponse() = %#v, want %#v", got, want)
+	}
+	return got
+}
+
 func waitForPendingResult(t *testing.T, bridge *promptBridge) {
 	t.Helper()
 	bridge.mu.Lock()
@@ -1036,6 +1054,7 @@ func TestPromptBridgeResponseRejectsUnauthorizedAndOversized(t *testing.T) {
 
 func TestPromptBridgeResultDeliveryAndRetry(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Error: "invalid password", Retry: true}
 	resultDone := make(chan error, 1)
 	go func() { resultDone <- bridge.sendResult(context.Background(), result) }()
@@ -1078,6 +1097,7 @@ func TestPromptBridgeResultDeliveryAndRetry(t *testing.T) {
 
 func TestPromptBridgeResultValidationAndDuplicateClaims(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
 	resultDone := make(chan error, 1)
 	go func() { resultDone <- bridge.sendResult(context.Background(), result) }()
@@ -1137,6 +1157,7 @@ func TestPromptBridgeWaitResponseCancellationTimeoutAndClose(t *testing.T) {
 		t.Errorf("timer wait error = %v, want ErrTimeout", err)
 	}
 	bridge = newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 
 	resultDone := make(chan error, 1)
 	go func() {
@@ -1239,6 +1260,7 @@ func TestPromptBridgeResponseReservationWinsClose(t *testing.T) {
 func TestPromptBridgeResultFinalizationOrdering(t *testing.T) {
 	t.Run("finalize first", func(t *testing.T) {
 		bridge := newTestPromptBridge(t, testPromptRequest())
+		consumeResponseForResult(t, bridge)
 		result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
 		resultDone := make(chan error, 1)
 		go func() { resultDone <- bridge.sendResult(context.Background(), result) }()
@@ -1254,6 +1276,7 @@ func TestPromptBridgeResultFinalizationOrdering(t *testing.T) {
 
 	t.Run("abandon first", func(t *testing.T) {
 		bridge := newTestPromptBridge(t, testPromptRequest())
+		consumeResponseForResult(t, bridge)
 		result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
 		ctx, cancel := context.WithCancel(context.Background())
 		resultDone := make(chan error, 1)
@@ -1275,6 +1298,7 @@ func TestPromptBridgeResultFinalizationOrdering(t *testing.T) {
 
 func TestPromptBridgeResultCancellationAfterClaimedWrite(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	ctx, cancel := context.WithCancel(context.Background())
 	resultDone := make(chan error, 1)
 	go func() {
@@ -1310,7 +1334,7 @@ func TestPromptBridgeResultCancellationAfterClaimedWrite(t *testing.T) {
 	stateBeforeRelease := bridge.responseState
 	closedBeforeRelease := bridge.closed
 	bridge.mu.Unlock()
-	if pendingBeforeRelease != nil || stateBeforeRelease != responseStateAccepting || closedBeforeRelease {
+	if pendingBeforeRelease != nil || stateBeforeRelease != responseStateConsumed || closedBeforeRelease {
 		t.Fatalf("state after cancellation = pending=%v responseState=%v closed=%v", pendingBeforeRelease, stateBeforeRelease, closedBeforeRelease)
 	}
 
@@ -1329,6 +1353,7 @@ func TestPromptBridgeResultCancellationAfterClaimedWrite(t *testing.T) {
 
 func TestPromptBridgeResultCloseAfterClaimedWrite(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	resultDone := make(chan error, 1)
 	go func() {
 		resultDone <- bridge.sendResult(context.Background(), KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true})
@@ -1365,7 +1390,7 @@ func TestPromptBridgeResultCloseAfterClaimedWrite(t *testing.T) {
 	stateBeforeRelease := bridge.responseState
 	closedBeforeRelease := bridge.closed
 	bridge.mu.Unlock()
-	if pendingBeforeRelease != nil || stateBeforeRelease != responseStateTerminal || !closedBeforeRelease {
+	if pendingBeforeRelease != nil || stateBeforeRelease != responseStateConsumed || !closedBeforeRelease {
 		t.Fatalf("state after close = pending=%v responseState=%v closed=%v", pendingBeforeRelease, stateBeforeRelease, closedBeforeRelease)
 	}
 
@@ -1384,6 +1409,7 @@ func TestPromptBridgeResultCloseAfterClaimedWrite(t *testing.T) {
 
 func TestPromptBridgeLateResultWriterCannotMutateAbandonedState(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	resultDone := make(chan error, 1)
@@ -1402,13 +1428,14 @@ func TestPromptBridgeLateResultWriterCannotMutateAbandonedState(t *testing.T) {
 	}
 	bridge.mu.Lock()
 	defer bridge.mu.Unlock()
-	if bridge.pendingResult != nil || bridge.responseState != responseStateAccepting {
+	if bridge.pendingResult != nil || bridge.responseState != responseStateConsumed {
 		t.Errorf("late writer mutated bridge state: pending=%v responseState=%v", bridge.pendingResult, bridge.responseState)
 	}
 }
 
 func TestPromptBridgeRetryEnablesExactlyOneResponse(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Retry: true}
 	resultDone := make(chan error, 1)
 	go func() { resultDone <- bridge.sendResult(context.Background(), result) }()
@@ -1438,6 +1465,7 @@ func TestPromptBridgeRetryEnablesExactlyOneResponse(t *testing.T) {
 
 func TestPromptBridgeDuplicateSendResultCancellation(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
@@ -1529,6 +1557,7 @@ func TestPromptBridgeClosedResponseAndResultAreGoneAfterAuthentication(t *testin
 
 func TestPromptBridgeResultWriterFailureIsDeliveredExactly(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
 	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
 	writerError := errors.New("writer failed")
 	resultDone := make(chan error, 1)
@@ -1558,5 +1587,55 @@ func TestPromptBridgeSendResultRejectsWrongTypeAndID(t *testing.T) {
 		if pending != nil {
 			t.Errorf("invalid result published pending delivery: %#v", pending)
 		}
+	}
+}
+
+func TestPromptBridgeSendResultRejectsInitialAccepting(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie}
+	if err := bridge.sendResult(context.Background(), result); !errors.Is(err, ErrProtocolError) {
+		t.Fatalf("sendResult() error = %v, want ErrProtocolError", err)
+	}
+	response := doAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, "", nil)
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Errorf("initial result status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestPromptBridgeSendResultRejectsReserved(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	response := testKeyringResponse(bridge, ResultOK, "password")
+	reply := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, response))
+	reply.Body.Close()
+	if reply.StatusCode != http.StatusAccepted {
+		t.Fatalf("response status = %d, want %d", reply.StatusCode, http.StatusAccepted)
+	}
+	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie}
+	if err := bridge.sendResult(context.Background(), result); !errors.Is(err, ErrProtocolError) {
+		t.Fatalf("sendResult() error = %v, want ErrProtocolError", err)
+	}
+	resultReply := doAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, "", nil)
+	resultReply.Body.Close()
+	if resultReply.StatusCode != http.StatusNoContent {
+		t.Errorf("reserved result status = %d, want %d", resultReply.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestPromptBridgeSendResultRejectsTerminal(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := bridge.waitResponse(ctx, time.Second); !errors.Is(err, ErrCancelled) {
+		t.Fatalf("waitResponse() error = %v, want ErrCancelled", err)
+	}
+	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie}
+	if err := bridge.sendResult(context.Background(), result); !errors.Is(err, ErrProtocolError) {
+		t.Fatalf("sendResult() error = %v, want ErrProtocolError", err)
+	}
+	resultReply := doAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, "", nil)
+	resultReply.Body.Close()
+	if resultReply.StatusCode != http.StatusNoContent {
+		t.Errorf("terminal result status = %d, want %d", resultReply.StatusCode, http.StatusNoContent)
 	}
 }
