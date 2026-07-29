@@ -1,0 +1,30 @@
+{
+  "settings": {
+    "show_bitwarden_icon": {
+      "label": "Show Bitwarden icon",
+      "description": "Show the Bitwarden icon in the unlock panel."
+    },
+    "auto_close_on_success": {
+      "label": "Close on success",
+      "description": "Close the panel after a successful request."
+    },
+    "auto_close_on_cancel": {
+      "label": "Close on cancel",
+      "description": "Close the panel after a cancelled request."
+    }
+  },
+  "panel": {
+    "title": "Bitwarden Keyring",
+    "password_placeholder": "Master Password",
+    "unlock": "Unlock",
+    "confirm": "Confirm",
+    "unlocking": "Unlocking…",
+    "cancel": "Cancel",
+    "success": "Success",
+    "cancelled": "Cancelled",
+    "invalid_request": "Invalid request",
+    "bridge_unreachable": "Bitwarden Keyring is unreachable",
+    "incorrect_password": "Incorrect master password",
+    "unlock_failed": "Unlock failed"
+  }
+}

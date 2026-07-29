@@ -1,0 +1,45 @@
+id = "frap129/noctalia-bitwarden-keyring"
+name = "Bitwarden Keyring"
+version = "0.5.0"
+plugin_api = 8
+author = "frap129"
+license = "MIT"
+icon = "brand-bitwarden"
+description = "Secure prompts for the Bitwarden-backed Secret Service and SSH agent."
+tags = ["bitwarden", "password", "security"]
+dependencies = ["bitwarden-keyring"]
+
+[[service]]
+id = "service"
+entry = "service.luau"
+
+[[panel]]
+id = "unlock"
+entry = "panel.luau"
+width = 400
+height = 300
+placement = "floating"
+position = "center"
+open_near_click = false
+dismiss_on_outside_click = false
+
+[[setting]]
+key = "show_bitwarden_icon"
+type = "bool"
+label_key = "settings.show_bitwarden_icon.label"
+description_key = "settings.show_bitwarden_icon.description"
+default = true
+
+[[setting]]
+key = "auto_close_on_success"
+type = "bool"
+label_key = "settings.auto_close_on_success.label"
+description_key = "settings.auto_close_on_success.description"
+default = true
+
+[[setting]]
+key = "auto_close_on_cancel"
+type = "bool"
+label_key = "settings.auto_close_on_cancel.label"
+description_key = "settings.auto_close_on_cancel.description"
+default = true
