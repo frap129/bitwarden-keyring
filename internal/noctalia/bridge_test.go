@@ -494,6 +494,162 @@ func TestPromptBridgeWaitResponseTimeoutDisablesLateResponse(t *testing.T) {
 	}
 }
 
+func TestPromptBridgeTerminalBeforeReservationPreservesTerminalError(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := bridge.waitResponse(ctx, time.Second)
+		waitDone <- err
+	}()
+
+	contents, err := json.Marshal(testKeyringResponse(bridge, ResultOK, "late"))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	body := newGatedRequestBody(contents)
+	request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", body)
+	request.Header.Set("Content-Type", "application/json")
+	handlerDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		handlerDone <- recorder.Code
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response decode")
+	}
+	cancel()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, ErrCancelled) {
+			t.Fatalf("waitResponse() error = %v, want ErrCancelled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for terminal wait")
+	}
+	close(body.release)
+	select {
+	case status := <-handlerDone:
+		if status != http.StatusConflict {
+			t.Errorf("terminal response status = %d, want %d", status, http.StatusConflict)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for terminal response")
+	}
+	if _, err := bridge.waitResponse(context.Background(), time.Second); !errors.Is(err, ErrCancelled) {
+		t.Errorf("later waitResponse() error = %v, want original ErrCancelled", err)
+	}
+}
+
+func TestPromptBridgeReservationWinsCancellationWithHook(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	reserved := make(chan struct{})
+	release := make(chan struct{})
+	bridge.responseReservationHook = func() {
+		close(reserved)
+		<-release
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := make(chan KeyringResponse, 1)
+	waitErr := make(chan error, 1)
+	go func() {
+		response, err := bridge.waitResponse(ctx, time.Second)
+		waitDone <- response
+		waitErr <- err
+	}()
+	response := testKeyringResponse(bridge, ResultOK, "password")
+	contents, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	handlerDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", bytes.NewReader(contents))
+		request.Header.Set("Content-Type", "application/json")
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		handlerDone <- recorder.Code
+	}()
+	select {
+	case <-reserved:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response reservation")
+	}
+	cancel()
+	select {
+	case got := <-waitDone:
+		if got != response {
+			t.Errorf("waitResponse() = %#v, want %#v", got, response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for reserved response")
+	}
+	if err := <-waitErr; err != nil {
+		t.Fatalf("waitResponse() error = %v, want nil", err)
+	}
+	close(release)
+	select {
+	case status := <-handlerDone:
+		if status != http.StatusAccepted {
+			t.Errorf("reserved response status = %d, want %d", status, http.StatusAccepted)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for reserved response handler")
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.responseState != responseStateConsumed || bridge.responseSlot != (KeyringResponse{}) {
+		t.Errorf("response state after consume = state %v slot=%#v", bridge.responseState, bridge.responseSlot)
+	}
+}
+
+func TestPromptBridgeReservationWinsCloseWithHook(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	reserved := make(chan struct{})
+	release := make(chan struct{})
+	bridge.responseReservationHook = func() {
+		close(reserved)
+		<-release
+	}
+	response := testKeyringResponse(bridge, ResultOK, "password")
+	contents, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	handlerDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", bytes.NewReader(contents))
+		request.Header.Set("Content-Type", "application/json")
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		handlerDone <- recorder.Code
+	}()
+	select {
+	case <-reserved:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response reservation")
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	close(release)
+	select {
+	case status := <-handlerDone:
+		if status != http.StatusAccepted {
+			t.Errorf("reserved response after close status = %d, want %d", status, http.StatusAccepted)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response handler")
+	}
+	got, err := bridge.waitResponse(context.Background(), time.Second)
+	if err != nil || got != response {
+		t.Errorf("waitResponse() = %#v, %v, want reserved response", got, err)
+	}
+}
+
 func TestPromptBridgeWaitResponseCancellationDisablesLateResponse(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1005,7 +1161,11 @@ func TestPromptBridgeWaitResponseCancellationTimeoutAndClose(t *testing.T) {
 
 func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToCancellation(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
-	bridge.responses <- testKeyringResponse(bridge, ResultOK, "stale")
+	bridge.mu.Lock()
+	bridge.responseState = responseStateAccepting
+	bridge.responseSlot = testKeyringResponse(bridge, ResultOK, "stale")
+	bridge.mu.Unlock()
+	close(bridge.responseNotify)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := bridge.waitResponse(ctx, time.Second); !errors.Is(err, ErrCancelled) {
@@ -1015,7 +1175,11 @@ func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToCancellation(t *tes
 
 func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToClose(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
-	bridge.responses <- testKeyringResponse(bridge, ResultOK, "stale")
+	bridge.mu.Lock()
+	bridge.responseState = responseStateAccepting
+	bridge.responseSlot = testKeyringResponse(bridge, ResultOK, "stale")
+	bridge.mu.Unlock()
+	close(bridge.responseNotify)
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -1034,10 +1198,8 @@ func TestPromptBridgeTerminalWaitDoesNotConsumeLateResponse(t *testing.T) {
 
 	late := testKeyringResponse(bridge, ResultOK, "late")
 	bridge.mu.Lock()
-	bridge.responseInFlight = true
-	bridge.pendingResponse = late
+	bridge.responseSlot = late
 	bridge.mu.Unlock()
-	bridge.responses <- late
 
 	if _, err := bridge.waitResponse(context.Background(), time.Second); !errors.Is(err, ErrCancelled) {
 		t.Errorf("later waitResponse() error = %v, want original ErrCancelled", err)
@@ -1135,11 +1297,11 @@ func TestPromptBridgeResultCancellationAfterClaimedWrite(t *testing.T) {
 
 	bridge.mu.Lock()
 	pendingBeforeRelease := bridge.pendingResult
-	acceptBeforeRelease := bridge.acceptResponse
+	stateBeforeRelease := bridge.responseState
 	closedBeforeRelease := bridge.closed
 	bridge.mu.Unlock()
-	if pendingBeforeRelease != nil || acceptBeforeRelease || closedBeforeRelease {
-		t.Fatalf("state after cancellation = pending=%v accept=%v closed=%v", pendingBeforeRelease, acceptBeforeRelease, closedBeforeRelease)
+	if pendingBeforeRelease != nil || stateBeforeRelease != responseStateTerminal || closedBeforeRelease {
+		t.Fatalf("state after cancellation = pending=%v responseState=%v closed=%v", pendingBeforeRelease, stateBeforeRelease, closedBeforeRelease)
 	}
 
 	close(writer.release)
@@ -1150,8 +1312,8 @@ func TestPromptBridgeResultCancellationAfterClaimedWrite(t *testing.T) {
 	}
 	bridge.mu.Lock()
 	defer bridge.mu.Unlock()
-	if bridge.pendingResult != pendingBeforeRelease || bridge.acceptResponse != acceptBeforeRelease || bridge.closed != closedBeforeRelease {
-		t.Errorf("late finishDelivery changed state: pending=%v accept=%v closed=%v", bridge.pendingResult, bridge.acceptResponse, bridge.closed)
+	if bridge.pendingResult != pendingBeforeRelease || bridge.responseState != stateBeforeRelease || bridge.closed != closedBeforeRelease {
+		t.Errorf("late finishDelivery changed state: pending=%v responseState=%v closed=%v", bridge.pendingResult, bridge.responseState, bridge.closed)
 	}
 }
 
@@ -1190,11 +1352,11 @@ func TestPromptBridgeResultCloseAfterClaimedWrite(t *testing.T) {
 
 	bridge.mu.Lock()
 	pendingBeforeRelease := bridge.pendingResult
-	acceptBeforeRelease := bridge.acceptResponse
+	stateBeforeRelease := bridge.responseState
 	closedBeforeRelease := bridge.closed
 	bridge.mu.Unlock()
-	if pendingBeforeRelease != nil || acceptBeforeRelease || !closedBeforeRelease {
-		t.Fatalf("state after close = pending=%v accept=%v closed=%v", pendingBeforeRelease, acceptBeforeRelease, closedBeforeRelease)
+	if pendingBeforeRelease != nil || stateBeforeRelease != responseStateTerminal || !closedBeforeRelease {
+		t.Fatalf("state after close = pending=%v responseState=%v closed=%v", pendingBeforeRelease, stateBeforeRelease, closedBeforeRelease)
 	}
 
 	close(writer.release)
@@ -1205,8 +1367,8 @@ func TestPromptBridgeResultCloseAfterClaimedWrite(t *testing.T) {
 	}
 	bridge.mu.Lock()
 	defer bridge.mu.Unlock()
-	if bridge.pendingResult != pendingBeforeRelease || bridge.acceptResponse != acceptBeforeRelease || bridge.closed != closedBeforeRelease {
-		t.Errorf("late finishDelivery changed state: pending=%v accept=%v closed=%v", bridge.pendingResult, bridge.acceptResponse, bridge.closed)
+	if bridge.pendingResult != pendingBeforeRelease || bridge.responseState != stateBeforeRelease || bridge.closed != closedBeforeRelease {
+		t.Errorf("late finishDelivery changed state: pending=%v responseState=%v closed=%v", bridge.pendingResult, bridge.responseState, bridge.closed)
 	}
 }
 
@@ -1230,8 +1392,8 @@ func TestPromptBridgeLateResultWriterCannotMutateAbandonedState(t *testing.T) {
 	}
 	bridge.mu.Lock()
 	defer bridge.mu.Unlock()
-	if bridge.pendingResult != nil || bridge.acceptResponse {
-		t.Errorf("late writer mutated bridge state: pending=%v accept=%v", bridge.pendingResult, bridge.acceptResponse)
+	if bridge.pendingResult != nil || bridge.responseState != responseStateTerminal {
+		t.Errorf("late writer mutated bridge state: pending=%v responseState=%v", bridge.pendingResult, bridge.responseState)
 	}
 }
 
