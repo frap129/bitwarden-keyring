@@ -150,14 +150,16 @@ func assertPanelSource(t *testing.T, source string) {
 		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local inputAccepting`, `local suppressCloseCancel`,
 		`function render()`, `ui.column`, `assets/bitwarden.svg`, `noctalia.getConfig("show_bitwarden_icon")`,
 		`key = "password-" .. inputKey`, `value = ""`, `password = true`, `focus = true`, `enabled = auth.phase == "ready"`,
-		`onChange = "onPasswordChange"`, `onSubmit = "onUnlock"`, `panel.render(render())`,
+		`local capturedInputKey = inputKey`, `local capturedId = auth.id`, `onChange = function(value)`, `onSubmit = function()`,
+		`handlePasswordChange(value, capturedInputKey, capturedId)`, `handleUnlock(capturedInputKey, capturedId)`, `panel.render(render())`,
 		`function onOpen()`, `function onClose()`, `panel.close()`, `noctalia.state.set("panel_open", true)`, `noctalia.state.set("panel_open", false)`,
 		`value.id`, `value.title`, `value.prompt`, `value.confirm_only`, `value.phase`, `value.error`,
 		`action = "submit"`, `action = "cancel"`, `action = "confirm"`,
 		`submitted = nil`, `password = ""`, `inputKey = inputKey + 1`,
 		`noctalia.getConfig("auto_close_on_cancel")`, `noctalia.getConfig("auto_close_on_success")`,
 		`noctalia.state.watch("auth", onAuthChanged)`,
-		`if not inputAccepting or auth == nil or auth.phase ~= "ready" or auth.confirm_only then return end`,
+		`if capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id then return end`,
+		`if not inputAccepting or auth.phase ~= "ready" or auth.confirm_only then return end`,
 		`if auth == nil or auth.phase ~= "failed" then return end`,
 	} {
 		if !strings.Contains(source, required) {
@@ -173,15 +175,13 @@ func assertPanelSource(t *testing.T, source string) {
 		t.Error("panel.luau terminal failure is not dismissible with a named callback")
 	}
 	for _, forbidden := range []string{
-		"keyboard_focus", "frameTick", "onFrame", "setUpdateInterval", "pluginSettings", "openPanel", "closePanel", "saveSettings",
+		"keyboard_focus", "frameTick", "onFrame", "setUpdateInterval", "setTimeout", "setInterval", "animation", "timer", "geometry",
+		"pluginSettings", "openPanel", "closePanel", "saveSettings",
 		"pluginApi", "SocketServer", "Quickshell", "runAsync", "runStream", "print(",
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("panel.luau contains forbidden literal %q", forbidden)
 		}
-	}
-	if regexp.MustCompile(`(?s)on(?:Change|Submit|Click)\s*=\s*function\s*\(`).MatchString(source) {
-		t.Error("panel.luau contains an inline UI callback")
 	}
 	if regexp.MustCompile(`(?s)noctalia\.state\.set\("auth"[^\n]*(password)|auth\s*=\s*\{[^}]*password`).MatchString(source) {
 		t.Error("panel.luau places a password in shared auth state")
@@ -195,21 +195,56 @@ func assertPanelSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)function onDismiss\(\)\s+if auth == nil or auth\.phase ~= "failed" then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
 		t.Error("panel.luau dismiss must validate the current failed auth before suppressing close")
 	}
+	if strings.Count(source, `capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id`) != 2 {
+		t.Error("panel.luau must generation- and ID-guard both input callbacks")
+	}
+	inputCallbacks := regexp.MustCompile(`(?s)onChange = function\(value\)(.*?)end,\s+onSubmit = function\(\)(.*?)end,`).FindStringSubmatch(source)
+	if len(inputCallbacks) != 3 {
+		t.Error("panel.luau must define inspectable inline input callbacks")
+	} else if strings.Contains(inputCallbacks[1], "password") || strings.Contains(inputCallbacks[2], "password") {
+		t.Error("panel.luau input closures must not capture or access password values")
+	}
 }
 
 type panelCallbackModel struct {
 	authComplete, inputAccepting, confirmOnly bool
+	inputKey                                  int
+	authID                                    string
 	phase                                     string
 	password                                  string
 	closed, suppressed                        bool
+	submitted                                 bool
 }
 
-func (m *panelCallbackModel) passwordChange(value any) {
+func (m *panelCallbackModel) unlock(capturedInputKey int, capturedID string) {
+	if capturedInputKey != m.inputKey || capturedID != m.authID || !m.inputAccepting || !m.authComplete || m.phase != "ready" || m.confirmOnly || m.password == "" {
+		return
+	}
+	m.submitted = true
+}
+
+func (m *panelCallbackModel) passwordChange(value any, capturedInputKey int, capturedID string) {
 	text, ok := value.(string)
-	if !ok || !m.inputAccepting || !m.authComplete || m.phase != "ready" || m.confirmOnly {
+	if !ok || capturedInputKey != m.inputKey || capturedID != m.authID || !m.inputAccepting || !m.authComplete || m.phase != "ready" || m.confirmOnly {
 		return
 	}
 	m.password = text
+}
+
+func TestPanelModelRejectsStaleUnlocks(t *testing.T) {
+	for _, fixture := range []struct {
+		capturedInputKey  int
+		capturedRequestID string
+	}{
+		{capturedInputKey: 40, capturedRequestID: "new"},
+		{capturedInputKey: 41, capturedRequestID: "old"},
+	} {
+		model := panelCallbackModel{authComplete: true, inputAccepting: true, inputKey: 41, authID: "new", phase: "ready", password: "current"}
+		model.unlock(fixture.capturedInputKey, fixture.capturedRequestID)
+		if model.submitted {
+			t.Fatalf("stale input submitted current request: %#v", model)
+		}
+	}
 }
 
 func (m *panelCallbackModel) dismiss() {
@@ -221,15 +256,19 @@ func (m *panelCallbackModel) dismiss() {
 }
 
 func TestPanelModelRejectsStalePasswordChanges(t *testing.T) {
-	for _, model := range []panelCallbackModel{
-		{inputAccepting: true, phase: "ready"},
-		{authComplete: true, phase: "ready"},
-		{authComplete: true, inputAccepting: true, phase: "busy"},
-		{authComplete: true, inputAccepting: true, phase: "ready", confirmOnly: true},
+	for _, fixture := range []struct {
+		model             panelCallbackModel
+		capturedInputKey  int
+		capturedRequestID string
+	}{
+		{model: panelCallbackModel{authComplete: true, inputAccepting: true, inputKey: 9, authID: "new", phase: "ready"}, capturedInputKey: 8, capturedRequestID: "new"},
+		{model: panelCallbackModel{authComplete: true, inputAccepting: true, inputKey: 9, authID: "new", phase: "ready"}, capturedInputKey: 9, capturedRequestID: "old"},
+		{model: panelCallbackModel{authComplete: true, inputAccepting: true, inputKey: 9, authID: "new", phase: "busy"}, capturedInputKey: 9, capturedRequestID: "new"},
+		{model: panelCallbackModel{authComplete: true, inputAccepting: true, inputKey: 9, authID: "new", phase: "ready", confirmOnly: true}, capturedInputKey: 9, capturedRequestID: "new"},
 	} {
-		model.passwordChange("stale")
-		if model.password != "" {
-			t.Fatalf("stale password callback restored password: %#v", model)
+		fixture.model.passwordChange("stale", fixture.capturedInputKey, fixture.capturedRequestID)
+		if fixture.model.password != "" {
+			t.Fatalf("stale password callback restored password: %#v", fixture.model)
 		}
 	}
 }
@@ -730,7 +769,7 @@ func TestParseManifestValueIntegers(t *testing.T) {
 func assertPluginManifest(t *testing.T, got pluginManifest) {
 	t.Helper()
 	wantRoot := map[string]any{
-		"id": "frap129/noctalia-bitwarden-keyring", "name": "Bitwarden Keyring", "version": "0.5.0", "plugin_api": 8,
+		"id": "frap129/noctalia-bitwarden-keyring", "name": "Bitwarden Keyring", "version": "0.5.0", "plugin_api": 16,
 		"author": "frap129", "license": "MIT", "icon": "brand-bitwarden",
 		"description": "Secure prompts for the Bitwarden-backed Secret Service and SSH agent.",
 		"tags":        []string{"bitwarden", "password", "security"}, "dependencies": []string{"bitwarden-keyring"},

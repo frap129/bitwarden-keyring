@@ -5,6 +5,8 @@ local password = ""
 local inputKey = 0
 local inputAccepting = false
 local suppressCloseCancel = false
+local handlePasswordChange
+local handleUnlock
 
 local function clearPassword()
   inputAccepting = false
@@ -79,6 +81,8 @@ function render()
   }
   if auth ~= nil and not confirmOnly then
     if ready then inputAccepting = true end
+    local capturedInputKey = inputKey
+    local capturedId = auth.id
     table.insert(children, ui.textInput({
       key = "password-" .. inputKey,
       value = "",
@@ -86,8 +90,12 @@ function render()
       password = true,
       focus = true,
       enabled = auth.phase == "ready",
-      onChange = "onPasswordChange",
-      onSubmit = "onUnlock",
+      onChange = function(value)
+        handlePasswordChange(value, capturedInputKey, capturedId)
+      end,
+      onSubmit = function()
+        handleUnlock(capturedInputKey, capturedId)
+      end,
     }))
   end
   table.insert(children, ui.text({ text = errorText }))
@@ -111,11 +119,18 @@ local function rerender()
   panel.render(render())
 end
 
-function onPasswordChange(value)
-  if not inputAccepting or auth == nil or auth.phase ~= "ready" or auth.confirm_only then return end
+function handlePasswordChange(value, capturedInputKey, capturedId)
+  if capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id then return end
+  if not inputAccepting or auth.phase ~= "ready" or auth.confirm_only then return end
   if type(value) ~= "string" then return end
   password = value
   rerender()
+end
+
+function handleUnlock(capturedInputKey, capturedId)
+  if capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id then return end
+  if not inputAccepting or auth.phase ~= "ready" or auth.confirm_only then return end
+  onUnlock()
 end
 
 function onUnlock()

@@ -1,7 +1,7 @@
 id = "frap129/noctalia-bitwarden-keyring"
 name = "Bitwarden Keyring"
 version = "0.5.0"
-plugin_api = 8
+plugin_api = 16
 author = "frap129"
 license = "MIT"
 icon = "brand-bitwarden"
