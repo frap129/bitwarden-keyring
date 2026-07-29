@@ -88,6 +88,55 @@ func TestV5PluginSourceContract(t *testing.T) {
 		var document map[string]any
 		if err := json.Unmarshal(translations, &document); err != nil {
 			t.Errorf("parse translations/en.json: %v", err)
+		} else {
+			settingsPaths := [][]string{
+				{"settings", "show_bitwarden_icon", "label"},
+				{"settings", "show_bitwarden_icon", "description"},
+				{"settings", "auto_close_on_success", "label"},
+				{"settings", "auto_close_on_success", "description"},
+				{"settings", "auto_close_on_cancel", "label"},
+				{"settings", "auto_close_on_cancel", "description"},
+			}
+			for _, path := range settingsPaths {
+				requireTranslationString(t, document, path...)
+			}
+
+			panelKeys := []string{
+				"title", "password_placeholder", "unlock", "confirm", "unlocking", "cancel",
+				"success", "cancelled", "invalid_request", "bridge_unreachable", "incorrect_password", "unlock_failed",
+			}
+			for _, key := range panelKeys {
+				requireTranslationString(t, document, "panel", key)
+			}
+			if got := requireTranslationString(t, document, "panel", "title"); got != "Bitwarden Keyring" {
+				t.Errorf("translation panel.title = %q, want %q", got, "Bitwarden Keyring")
+			}
+			if got := requireTranslationString(t, document, "panel", "password_placeholder"); got != "Master Password" {
+				t.Errorf("translation panel.password_placeholder = %q, want %q", got, "Master Password")
+			}
 		}
 	}
+}
+
+func requireTranslationString(t *testing.T, document map[string]any, path ...string) string {
+	t.Helper()
+	var value any = document
+	for _, key := range path {
+		object, ok := value.(map[string]any)
+		if !ok {
+			t.Errorf("translation %s has invalid nesting", strings.Join(path, "."))
+			return ""
+		}
+		value, ok = object[key]
+		if !ok {
+			t.Errorf("translation %s is missing", strings.Join(path, "."))
+			return ""
+		}
+	}
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		t.Errorf("translation %s must be a nonempty string", strings.Join(path, "."))
+		return ""
+	}
+	return text
 }
