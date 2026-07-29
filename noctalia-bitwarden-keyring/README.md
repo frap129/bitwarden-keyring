@@ -37,9 +37,8 @@ Run these repeatable commands from the repository root:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)" || exit 1
-noctalia msg plugins source list
 sources=$(noctalia msg plugins source list) || exit 1
-if printf '%s\n' "$sources" | grep -Fqx "bitwarden-keyring $PWD"; then
+if printf '%s\n' "$sources" | grep -Fqx "bitwarden-keyring path $PWD"; then
   :
 elif printf '%s\n' "$sources" | grep -Eq '^bitwarden-keyring([[:space:]]|$)'; then
   printf '%s\n' 'Source bitwarden-keyring points elsewhere; repoint it in Noctalia settings.' >&2

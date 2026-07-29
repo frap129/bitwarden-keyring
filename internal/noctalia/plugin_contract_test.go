@@ -207,6 +207,23 @@ func TestV5PluginSourceContract(t *testing.T) {
 	}
 }
 
+func TestV5PluginDocumentationParsesThreeFieldSourceList(t *testing.T) {
+	root := repositoryRoot(t)
+	for _, name := range []string{"README.md", filepath.Join("noctalia-bitwarden-keyring", "README.md")} {
+		contents, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		text := string(contents)
+		if !strings.Contains(text, `grep -Fqx "bitwarden-keyring path $PWD"`) {
+			t.Errorf("%s does not match Noctalia's name/type/location source format", name)
+		}
+		if strings.Contains(text, "noctalia msg plugins source list\nsources=") {
+			t.Errorf("%s prints unrelated plugin sources", name)
+		}
+	}
+}
+
 func assertTranslationReferences(t *testing.T, source string, contents []byte) {
 	t.Helper()
 	var document map[string]any
