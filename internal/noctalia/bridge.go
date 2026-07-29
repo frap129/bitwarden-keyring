@@ -365,26 +365,31 @@ func (b *promptBridge) handleResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b.mu.Lock()
+	status := http.StatusAccepted
 	if b.closed {
-		b.mu.Unlock()
-		writeBridgeStatus(w, http.StatusGone)
-		return
+		status = http.StatusGone
+	} else if !b.acceptResponse {
+		status = http.StatusConflict
+	} else if !validKeyringResponse(b.request, response) {
+		status = http.StatusBadRequest
+	} else {
+		b.acceptResponse = false
 	}
-	if !b.acceptResponse {
-		b.mu.Unlock()
-		writeBridgeStatus(w, http.StatusConflict)
-		return
-	}
-	if !validKeyringResponse(b.request, response) {
-		b.mu.Unlock()
-		writeBridgeStatus(w, http.StatusBadRequest)
-		return
-	}
-	b.acceptResponse = false
 	b.mu.Unlock()
+	if status != http.StatusAccepted {
+		writeBridgeStatus(w, status)
+		return
+	}
 
 	select {
 	case b.responses <- response:
+		b.mu.Lock()
+		closed := b.closed
+		b.mu.Unlock()
+		if closed {
+			writeBridgeStatus(w, http.StatusGone)
+			return
+		}
 		writeBridgeStatus(w, http.StatusAccepted)
 	case <-b.done:
 		writeBridgeStatus(w, http.StatusGone)
@@ -513,6 +518,7 @@ func validKeyringResponse(request KeyringRequest, response KeyringResponse) bool
 
 func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) (KeyringResponse, error) {
 	if err := bridgeContextError(ctx); err != nil {
+		b.disableResponses()
 		return KeyringResponse{}, err
 	}
 	b.mu.Lock()
@@ -522,6 +528,7 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 		return KeyringResponse{}, ErrSessionClosed
 	}
 	if timeout <= 0 {
+		b.disableResponses()
 		return KeyringResponse{}, ErrTimeout
 	}
 
@@ -537,9 +544,11 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 			return KeyringResponse{}, ErrSessionClosed
 		}
 		if err := bridgeContextError(ctx); err != nil {
+			b.disableResponses()
 			return KeyringResponse{}, err
 		}
 		if !time.Now().Before(deadline) {
+			b.disableResponses()
 			return KeyringResponse{}, ErrTimeout
 		}
 		return response, nil
@@ -547,18 +556,28 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 		if b.isClosed() {
 			return KeyringResponse{}, ErrSessionClosed
 		}
-		return KeyringResponse{}, bridgeContextError(ctx)
+		err := bridgeContextError(ctx)
+		b.disableResponses()
+		return KeyringResponse{}, err
 	case <-timer.C:
 		if b.isClosed() {
 			return KeyringResponse{}, ErrSessionClosed
 		}
 		if err := bridgeContextError(ctx); err != nil {
+			b.disableResponses()
 			return KeyringResponse{}, err
 		}
+		b.disableResponses()
 		return KeyringResponse{}, ErrTimeout
 	case <-b.done:
 		return KeyringResponse{}, ErrSessionClosed
 	}
+}
+
+func (b *promptBridge) disableResponses() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.acceptResponse = false
 }
 
 func bridgeContextError(ctx context.Context) error {
@@ -576,6 +595,9 @@ func bridgeContextError(ctx context.Context) error {
 func (b *promptBridge) sendResult(ctx context.Context, result KeyringResult) error {
 	if err := bridgeContextError(ctx); err != nil {
 		return err
+	}
+	if result.Type != MessageTypeResult || result.ID != b.request.Cookie {
+		return ErrProtocolError
 	}
 	delivery := &resultDelivery{result: result, done: make(chan error, 1)}
 	b.mu.Lock()

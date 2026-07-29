@@ -92,6 +92,29 @@ type errorBridgeResponseWriter struct {
 	err    error
 }
 
+type gatedRequestBody struct {
+	reader  *bytes.Reader
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newGatedRequestBody(contents []byte) *gatedRequestBody {
+	return &gatedRequestBody{
+		reader:  bytes.NewReader(contents),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (b *gatedRequestBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return b.reader.Read(p)
+}
+
+func (b *gatedRequestBody) Close() error { return nil }
+
 func (w *errorBridgeResponseWriter) Header() http.Header { return w.header }
 
 func (w *errorBridgeResponseWriter) WriteHeader(int) {}
@@ -453,6 +476,116 @@ func TestPromptBridgeDescriptorSyncFailureCleansResources(t *testing.T) {
 	descriptorPath := filepath.Join(child, "noctalia-"+testPromptRequest().Cookie+".json")
 	if _, err := os.Lstat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("descriptor path stat error = %v, want not exists", err)
+	}
+}
+
+func TestPromptBridgeWaitResponseTimeoutDisablesLateResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	if _, err := bridge.waitResponse(context.Background(), time.Millisecond); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("waitResponse() error = %v, want ErrTimeout", err)
+	}
+	if _, err := bridge.waitResponse(context.Background(), time.Second); !errors.Is(err, ErrTimeout) {
+		t.Errorf("second waitResponse() error = %v, want ErrTimeout", err)
+	}
+	response := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, testKeyringResponse(bridge, ResultOK, "late")))
+	response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Errorf("late response status = %d, want %d", response.StatusCode, http.StatusConflict)
+	}
+}
+
+func TestPromptBridgeWaitResponseCancellationDisablesLateResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := bridge.waitResponse(ctx, time.Second); !errors.Is(err, ErrCancelled) {
+		t.Fatalf("waitResponse() error = %v, want ErrCancelled", err)
+	}
+	response := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, testKeyringResponse(bridge, ResultOK, "late")))
+	response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Errorf("late response status = %d, want %d", response.StatusCode, http.StatusConflict)
+	}
+}
+
+func TestPromptBridgeWaitResponseCancellationWinsInFlightResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := bridge.waitResponse(ctx, time.Second)
+		waitDone <- err
+	}()
+
+	contents, err := json.Marshal(testKeyringResponse(bridge, ResultOK, "late"))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	body := newGatedRequestBody(contents)
+	request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", body)
+	request.Header.Set("Content-Type", "application/json")
+	handlerDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		handlerDone <- recorder.Code
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight response")
+	}
+	cancel()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, ErrCancelled) {
+			t.Fatalf("waitResponse() error = %v, want ErrCancelled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cancellation")
+	}
+	close(body.release)
+	select {
+	case status := <-handlerDone:
+		if status != http.StatusConflict {
+			t.Errorf("in-flight response status = %d, want %d", status, http.StatusConflict)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight response completion")
+	}
+}
+
+func TestPromptBridgeCloseWinsInFlightResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	contents, err := json.Marshal(testKeyringResponse(bridge, ResultOK, "late"))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	body := newGatedRequestBody(contents)
+	request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", body)
+	request.Header.Set("Content-Type", "application/json")
+	handlerDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		handlerDone <- recorder.Code
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight response")
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	close(body.release)
+	select {
+	case status := <-handlerDone:
+		if status != http.StatusGone {
+			t.Errorf("in-flight response status = %d, want %d", status, http.StatusGone)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight response completion")
 	}
 }
 
@@ -1178,5 +1311,23 @@ func TestPromptBridgeResultWriterFailureIsDeliveredExactly(t *testing.T) {
 	bridge.server.Handler.ServeHTTP(writer, request)
 	if err := <-resultDone; !errors.Is(err, writerError) {
 		t.Errorf("sendResult() error = %v, want writer error", err)
+	}
+}
+
+func TestPromptBridgeSendResultRejectsWrongTypeAndID(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	for _, result := range []KeyringResult{
+		{Type: MessageTypeRequest, ID: bridge.request.Cookie},
+		{Type: MessageTypeResult, ID: strings.Repeat("b", 32)},
+	} {
+		if err := bridge.sendResult(context.Background(), result); err == nil {
+			t.Errorf("sendResult(%#v) error = nil, want validation error", result)
+		}
+		bridge.mu.Lock()
+		pending := bridge.pendingResult
+		bridge.mu.Unlock()
+		if pending != nil {
+			t.Errorf("invalid result published pending delivery: %#v", pending)
+		}
 	}
 }
