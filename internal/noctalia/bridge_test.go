@@ -502,7 +502,7 @@ func TestPromptBridgeCloseIsIdempotentAndRemovesDescriptor(t *testing.T) {
 		t.Fatalf("stat retained descriptor: %v", err)
 	}
 	if !os.SameFile(pathInfo, descriptorInfo) {
-		t.Error("nofollow descriptor info does not match retained descriptor")
+		t.Error("nofollow descriptor identity does not match retained descriptor")
 	}
 
 	if err := bridge.Close(); err != nil {

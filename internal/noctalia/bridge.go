@@ -256,6 +256,9 @@ func validateBridgeFileDirectory(file *os.File) error {
 	if !info.IsDir() {
 		return errors.New("path is not a directory")
 	}
+	if info.Mode().Perm() != 0700 {
+		return errors.New("directory mode is not 0700")
+	}
 	return validateBridgeFileInfo(info)
 }
 
