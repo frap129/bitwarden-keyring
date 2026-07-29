@@ -585,6 +585,99 @@ func TestNoctaliaTimeoutRetryUsesConfiguredTimeout(t *testing.T) {
 	assertNoctaliaTimeout(t, err, time.Since(started))
 }
 
+func TestNoctaliaSessionStaleNotifierDoesNotAffectNewerSession(t *testing.T) {
+	runtimeDir := setNoctaliaTestRuntime(t)
+	cookies := make(chan string, 2)
+	results := make(chan noctalia.KeyringResult, 2)
+	helperErr := make(chan error, 2)
+	runner := func(_ context.Context, _ string, args ...string) error {
+		cookie := args[len(args)-1]
+		cookies <- cookie
+		go func() { helperErr <- serveNoctaliaPasswordAndResult(runtimeDir, cookie, results) }()
+		return nil
+	}
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, noctalia.NewClient(noctalia.WithCommandRunner(runner)))
+
+	_, staleNotifier, err := sm.promptNoctalia("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm.noctaliaMu.Lock()
+	firstSession := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	firstCookie := <-cookies
+	_, currentNotifier, err := sm.promptNoctalia("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm.noctaliaMu.Lock()
+	currentSession := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	secondCookie := <-cookies
+	defer firstSession.Close()
+	defer currentSession.Close()
+
+	staleNotifier(false, "stale", true)
+	result := <-results
+	if result.ID != firstCookie {
+		t.Fatalf("stale notifier sent result for %q, want first session %q (newer %q)", result.ID, firstCookie, secondCookie)
+	}
+	sm.noctaliaMu.Lock()
+	retainedSession := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	if retainedSession != currentSession {
+		t.Fatal("stale notifier changed the current session")
+	}
+	currentNotifier(false, "done", false)
+	for range 2 {
+		if err := <-helperErr; err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestNoctaliaSessionConcurrentNotifierInvocation(t *testing.T) {
+	runtimeDir := setNoctaliaTestRuntime(t)
+	results := make(chan noctalia.KeyringResult, 1)
+	helperErr := make(chan error, 1)
+	runner := func(_ context.Context, _ string, args ...string) error {
+		cookie := args[len(args)-1]
+		go func() { helperErr <- serveNoctaliaPasswordAndResult(runtimeDir, cookie, results) }()
+		return nil
+	}
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, noctalia.NewClient(noctalia.WithCommandRunner(runner)))
+	_, notifier, err := sm.promptNoctalia("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm.noctaliaMu.Lock()
+	session := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	defer session.Close()
+
+	started := make(chan struct{})
+	done := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			<-started
+			notifier(false, "done", false)
+			done <- struct{}{}
+		}()
+	}
+	close(started)
+	<-done
+	<-done
+	sm.noctaliaMu.Lock()
+	retainedSession := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	if retainedSession != nil {
+		t.Fatal("completed notifier retained the session")
+	}
+	if err := <-helperErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
 func setNoctaliaTestRuntime(t *testing.T) string {
 	t.Helper()
 	runtimeDir := t.TempDir()
@@ -616,7 +709,10 @@ func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
 	if err := pollNoctalia(ctx, func() (bool, error) {
 		contents, err := os.ReadFile(descriptorPath)
 		if err != nil {
-			return false, nil
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
 		}
 		return true, json.Unmarshal(contents, &descriptor)
 	}); err != nil {
@@ -657,6 +753,65 @@ func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
 			return false, err
 		}
 		return result.Retry, nil
+	})
+}
+
+func serveNoctaliaPasswordAndResult(runtimeDir, cookie string, results chan<- noctalia.KeyringResult) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	descriptorPath := filepath.Join(runtimeDir, "bitwarden-keyring", "noctalia-"+cookie+".json")
+	var descriptor struct {
+		BaseURL string `json:"base_url"`
+		Token   string `json:"token"`
+	}
+	if err := pollNoctalia(ctx, func() (bool, error) {
+		contents, err := os.ReadFile(descriptorPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, json.Unmarshal(contents, &descriptor)
+	}); err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: time.Second}
+	do := func(method, path, body string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, method, descriptor.BaseURL+path, strings.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+descriptor.Token)
+		req.Header.Set("Content-Type", "application/json")
+		return client.Do(req)
+	}
+	response, err := do(http.MethodGet, "/v1/request", "")
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	body := fmt.Sprintf(`{"type":"keyring_response","id":%q,"result":"ok","password":"password"}`, cookie)
+	response, err = do(http.MethodPost, "/v1/response", body)
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	return pollNoctalia(ctx, func() (bool, error) {
+		response, err := do(http.MethodGet, "/v1/result?id="+cookie, "")
+		if err != nil {
+			return false, err
+		}
+		defer response.Body.Close()
+		if response.StatusCode == http.StatusNoContent {
+			return false, nil
+		}
+		var result noctalia.KeyringResult
+		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+			return false, err
+		}
+		results <- result
+		return true, nil
 	})
 }
 

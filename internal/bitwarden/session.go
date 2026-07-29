@@ -92,6 +92,7 @@ type SessionManager struct {
 	noctaliaEnabled        bool
 	noctaliaTimeout        time.Duration
 	noctaliaSession        *noctalia.PasswordSession // Active Noctalia session for retry support
+	noctaliaMu             sync.Mutex
 	allowInsecurePrompts   bool
 	systemdAskPasswordPath string
 	pathDiscoveryWarned    bool
@@ -109,10 +110,7 @@ func NewSessionManager() *SessionManager {
 func NewSessionManagerWithConfig(cfg SessionConfig) *SessionManager {
 	var client *noctalia.Client
 	if cfg.NoctaliaEnabled {
-		timeout := cfg.NoctaliaTimeout
-		if timeout <= 0 {
-			timeout = noctalia.DefaultTimeout
-		}
+		timeout := normalizeNoctaliaTimeout(cfg.NoctaliaTimeout)
 		client = noctalia.NewClient(noctalia.WithTimeout(timeout))
 	}
 	return newSessionManager(cfg, client)
@@ -128,15 +126,10 @@ func newSessionManager(cfg SessionConfig, client *noctalia.Client) *SessionManag
 		maxRetries = 3
 	}
 
-	noctaliaTimeout := cfg.NoctaliaTimeout
-	if noctaliaTimeout <= 0 {
-		noctaliaTimeout = noctalia.DefaultTimeout
-	}
-
 	sm := &SessionManager{
 		noctaliaClient:         client,
 		noctaliaEnabled:        cfg.NoctaliaEnabled,
-		noctaliaTimeout:        noctaliaTimeout,
+		noctaliaTimeout:        normalizeNoctaliaTimeout(cfg.NoctaliaTimeout),
 		allowInsecurePrompts:   cfg.AllowInsecurePrompts,
 		systemdAskPasswordPath: cfg.SystemdAskPasswordPath,
 		sessionStore:           cfg.SessionStore,
@@ -152,6 +145,13 @@ func newSessionManager(cfg SessionConfig, client *noctalia.Client) *SessionManag
 	// Try to load session from environment or file
 	sm.loadSession()
 	return sm
+}
+
+func normalizeNoctaliaTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return noctalia.DefaultTimeout
+	}
+	return timeout
 }
 
 // GetSession returns the current session key
@@ -480,11 +480,14 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 	}
 
 	// Check if we have an existing session waiting for retry
-	if sm.noctaliaSession != nil && errMsg != "" {
+	sm.noctaliaMu.Lock()
+	session := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	if session != nil && errMsg != "" {
 		// Wait for the user to enter a new password on the existing session
-		password, err := sm.noctaliaSession.WaitForRetry(context.Background(), sm.noctaliaTimeout)
+		password, err := session.WaitForRetry(context.Background(), sm.noctaliaTimeout)
 		if err != nil {
-			sm.noctaliaSession = nil
+			sm.clearNoctaliaSession(session)
 			if errors.Is(err, noctalia.ErrCancelled) {
 				return "", nil, err
 			}
@@ -492,18 +495,7 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 			return "", nil, err
 		}
 
-		// Return notifier that uses the existing session
-		notifier := func(success bool, errMsg string, allowRetry bool) {
-			if sm.noctaliaSession != nil {
-				if err := sm.noctaliaSession.SendResult(success, errMsg, allowRetry); err != nil {
-					_ = sm.noctaliaSession.Close()
-					sm.noctaliaSession = nil
-				} else if success || !allowRetry {
-					sm.noctaliaSession = nil
-				}
-			}
-		}
-		return password, notifier, nil
+		return password, sm.noctaliaNotifier(session), nil
 	}
 
 	// Create a new session
@@ -521,21 +513,33 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 	}
 
 	// Store the session for potential retry
+	sm.noctaliaMu.Lock()
 	sm.noctaliaSession = session
+	sm.noctaliaMu.Unlock()
 
-	// Create notifier that uses the session
-	notifier := func(success bool, errMsg string, allowRetry bool) {
-		if sm.noctaliaSession != nil {
-			if err := sm.noctaliaSession.SendResult(success, errMsg, allowRetry); err != nil {
-				_ = sm.noctaliaSession.Close()
-				sm.noctaliaSession = nil
-			} else if success || !allowRetry {
-				sm.noctaliaSession = nil
-			}
+	return password, sm.noctaliaNotifier(session), nil
+}
+
+func (sm *SessionManager) noctaliaNotifier(session *noctalia.PasswordSession) ResultNotifier {
+	var notifierMu sync.Mutex
+	return func(success bool, errMsg string, allowRetry bool) {
+		notifierMu.Lock()
+		defer notifierMu.Unlock()
+
+		err := session.SendResult(success, errMsg, allowRetry)
+		if err != nil || success || !allowRetry {
+			_ = session.Close()
+			sm.clearNoctaliaSession(session)
 		}
 	}
+}
 
-	return password, notifier, nil
+func (sm *SessionManager) clearNoctaliaSession(session *noctalia.PasswordSession) {
+	sm.noctaliaMu.Lock()
+	if sm.noctaliaSession == session {
+		sm.noctaliaSession = nil
+	}
+	sm.noctaliaMu.Unlock()
 }
 
 // promptZenity uses zenity for a GTK password dialog
