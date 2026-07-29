@@ -57,8 +57,6 @@ func commandExists(name string) bool {
 type SessionConfig struct {
 	// NoctaliaEnabled enables Noctalia UI integration for password prompts
 	NoctaliaEnabled bool
-	// NoctaliaSocket is an optional custom socket path for Noctalia
-	NoctaliaSocket string
 	// NoctaliaTimeout is the timeout for Noctalia password prompts
 	NoctaliaTimeout time.Duration
 	// AllowInsecurePrompts allows using insecure prompt methods like dmenu (default: false)
@@ -77,7 +75,6 @@ type SessionConfig struct {
 func DefaultSessionConfig() SessionConfig {
 	return SessionConfig{
 		NoctaliaEnabled:        false,
-		NoctaliaSocket:         "",
 		NoctaliaTimeout:        noctalia.DefaultTimeout,
 		AllowInsecurePrompts:   false,
 		SystemdAskPasswordPath: "",
@@ -93,6 +90,7 @@ type SessionManager struct {
 	mu                     sync.RWMutex
 	noctaliaClient         *noctalia.Client
 	noctaliaEnabled        bool
+	noctaliaTimeout        time.Duration
 	noctaliaSession        *noctalia.PasswordSession // Active Noctalia session for retry support
 	allowInsecurePrompts   bool
 	systemdAskPasswordPath string
@@ -109,13 +107,36 @@ func NewSessionManager() *SessionManager {
 
 // NewSessionManagerWithConfig creates a new session manager with the given config
 func NewSessionManagerWithConfig(cfg SessionConfig) *SessionManager {
+	var client *noctalia.Client
+	if cfg.NoctaliaEnabled {
+		timeout := cfg.NoctaliaTimeout
+		if timeout <= 0 {
+			timeout = noctalia.DefaultTimeout
+		}
+		client = noctalia.NewClient(noctalia.WithTimeout(timeout))
+	}
+	return newSessionManager(cfg, client)
+}
+
+func newSessionManagerWithNoctaliaClient(cfg SessionConfig, client *noctalia.Client) *SessionManager {
+	return newSessionManager(cfg, client)
+}
+
+func newSessionManager(cfg SessionConfig, client *noctalia.Client) *SessionManager {
 	maxRetries := cfg.MaxPasswordRetries
 	if maxRetries <= 0 {
 		maxRetries = 3
 	}
 
+	noctaliaTimeout := cfg.NoctaliaTimeout
+	if noctaliaTimeout <= 0 {
+		noctaliaTimeout = noctalia.DefaultTimeout
+	}
+
 	sm := &SessionManager{
+		noctaliaClient:         client,
 		noctaliaEnabled:        cfg.NoctaliaEnabled,
+		noctaliaTimeout:        noctaliaTimeout,
 		allowInsecurePrompts:   cfg.AllowInsecurePrompts,
 		systemdAskPasswordPath: cfg.SystemdAskPasswordPath,
 		sessionStore:           cfg.SessionStore,
@@ -126,18 +147,6 @@ func NewSessionManagerWithConfig(cfg SessionConfig) *SessionManager {
 	// Default to "memory" if not specified
 	if sm.sessionStore == "" {
 		sm.sessionStore = "memory"
-	}
-
-	// Initialize Noctalia client if enabled
-	if cfg.NoctaliaEnabled {
-		var opts []noctalia.Option
-		if cfg.NoctaliaSocket != "" {
-			opts = append(opts, noctalia.WithSocketPath(cfg.NoctaliaSocket))
-		}
-		if cfg.NoctaliaTimeout > 0 {
-			opts = append(opts, noctalia.WithTimeout(cfg.NoctaliaTimeout))
-		}
-		sm.noctaliaClient = noctalia.NewClient(opts...)
 	}
 
 	// Try to load session from environment or file
@@ -385,7 +394,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 				// User explicitly cancelled - don't try fallback methods
 				return "", nil, ErrUserCancelled
 			}
-			if !errors.Is(err, noctalia.ErrSocketNotFound) && !errors.Is(err, noctalia.ErrConnectionFailed) {
+			if !errors.Is(err, noctalia.ErrPluginUnavailable) {
 				// Only log non-connection errors (connection errors just mean agent isn't running)
 				logging.L.Info("noctalia prompt failed, trying fallback methods", "error", err)
 			}
@@ -467,17 +476,13 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 // Returns the password, a notifier function for sending results, and an error.
 func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier, error) {
 	if sm.noctaliaClient == nil {
-		return "", nil, noctalia.ErrSocketNotFound
-	}
-
-	if !sm.noctaliaClient.IsAvailable() {
-		return "", nil, noctalia.ErrSocketNotFound
+		return "", nil, noctalia.ErrPluginUnavailable
 	}
 
 	// Check if we have an existing session waiting for retry
 	if sm.noctaliaSession != nil && errMsg != "" {
 		// Wait for the user to enter a new password on the existing session
-		password, err := sm.noctaliaSession.WaitForRetry(context.Background(), noctalia.DefaultTimeout)
+		password, err := sm.noctaliaSession.WaitForRetry(context.Background(), sm.noctaliaTimeout)
 		if err != nil {
 			sm.noctaliaSession = nil
 			if errors.Is(err, noctalia.ErrCancelled) {
@@ -490,8 +495,10 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 		// Return notifier that uses the existing session
 		notifier := func(success bool, errMsg string, allowRetry bool) {
 			if sm.noctaliaSession != nil {
-				_ = sm.noctaliaSession.SendResult(success, errMsg, allowRetry)
-				if success || !allowRetry {
+				if err := sm.noctaliaSession.SendResult(success, errMsg, allowRetry); err != nil {
+					_ = sm.noctaliaSession.Close()
+					sm.noctaliaSession = nil
+				} else if success || !allowRetry {
 					sm.noctaliaSession = nil
 				}
 			}
@@ -500,7 +507,7 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 	}
 
 	// Create a new session
-	ctx, cancel := context.WithTimeout(context.Background(), noctalia.DefaultTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), sm.noctaliaTimeout)
 	defer cancel()
 
 	message := "Enter your Bitwarden Master Password:"
@@ -519,8 +526,10 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 	// Create notifier that uses the session
 	notifier := func(success bool, errMsg string, allowRetry bool) {
 		if sm.noctaliaSession != nil {
-			_ = sm.noctaliaSession.SendResult(success, errMsg, allowRetry)
-			if success || !allowRetry {
+			if err := sm.noctaliaSession.SendResult(success, errMsg, allowRetry); err != nil {
+				_ = sm.noctaliaSession.Close()
+				sm.noctaliaSession = nil
+			} else if success || !allowRetry {
 				sm.noctaliaSession = nil
 			}
 		}

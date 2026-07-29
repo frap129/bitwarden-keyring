@@ -51,8 +51,6 @@ type KeyringResult struct {
 // Error types for Noctalia v5 operations.
 var (
 	ErrPluginUnavailable = errors.New("noctalia v5 plugin unavailable")
-	ErrSocketNotFound    = ErrPluginUnavailable
-	ErrConnectionFailed  = ErrPluginUnavailable
 
 	ErrTimeout = errors.New("noctalia request timed out")
 

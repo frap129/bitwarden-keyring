@@ -246,13 +246,6 @@ func TestNewClientDefaultsAndTimeoutOverride(t *testing.T) {
 	}
 }
 
-func TestNewClientSocketPathCompatibilityIsNoOp(t *testing.T) {
-	client := NewClient(WithSocketPath("/not-used"))
-	if client.IsAvailable() != true {
-		t.Error("IsAvailable() = false, want true")
-	}
-}
-
 func TestClientCommandFailure(t *testing.T) {
 	runtimeDir := newTestRuntime(t)
 	wantErr := errors.New("runner failed")

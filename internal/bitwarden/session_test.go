@@ -1,11 +1,18 @@
 package bitwarden
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/joe/bitwarden-keyring/internal/noctalia"
 )
 
 // --- M5: Prompt Hardening Tests ---
@@ -523,5 +530,148 @@ func TestSessionManager_SaveSession_RejectsSymlink(t *testing.T) {
 	}
 	if string(got) != "old" {
 		t.Fatalf("target was overwritten via symlink: got %q", string(got))
+	}
+}
+
+func TestNoctaliaTimeoutNormalizesNonpositiveValues(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true, NoctaliaTimeout: timeout}, noctalia.NewClient())
+		if sm.noctaliaTimeout != noctalia.DefaultTimeout {
+			t.Fatalf("timeout %v normalized to %v, want %v", timeout, sm.noctaliaTimeout, noctalia.DefaultTimeout)
+		}
+	}
+}
+
+func TestNoctaliaUnavailableNilClient(t *testing.T) {
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, nil)
+	_, _, err := sm.promptNoctalia("")
+	if !errors.Is(err, noctalia.ErrPluginUnavailable) {
+		t.Fatalf("promptNoctalia() error = %v, want ErrPluginUnavailable", err)
+	}
+}
+
+func TestNoctaliaTimeoutInitialPromptUsesConfiguredTimeout(t *testing.T) {
+	setNoctaliaTestRuntime(t)
+	client := noctalia.NewClient(noctalia.WithCommandRunner(func(context.Context, string, ...string) error { return nil }))
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true, NoctaliaTimeout: 25 * time.Millisecond}, client)
+
+	started := time.Now()
+	_, _, err := sm.promptNoctalia("")
+	assertNoctaliaTimeout(t, err, time.Since(started))
+}
+
+func TestNoctaliaTimeoutRetryUsesConfiguredTimeout(t *testing.T) {
+	runtimeDir := setNoctaliaTestRuntime(t)
+	helperErr := make(chan error, 1)
+	runner := func(_ context.Context, _ string, args ...string) error {
+		cookie := args[len(args)-1]
+		go func() { helperErr <- serveNoctaliaInitialPassword(runtimeDir, cookie) }()
+		return nil
+	}
+	client := noctalia.NewClient(noctalia.WithCommandRunner(runner))
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true, NoctaliaTimeout: 25 * time.Millisecond}, client)
+
+	password, notify, err := sm.promptNoctalia("")
+	if err != nil || password != "password" {
+		t.Fatalf("promptNoctalia() = %q, %v, want password", password, err)
+	}
+	notify(false, "invalid password", true)
+	if err := <-helperErr; err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	_, _, err = sm.promptNoctalia("invalid password")
+	assertNoctaliaTimeout(t, err, time.Since(started))
+}
+
+func setNoctaliaTestRuntime(t *testing.T) string {
+	t.Helper()
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(runtimeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	return runtimeDir
+}
+
+func assertNoctaliaTimeout(t *testing.T, err error, elapsed time.Duration) {
+	t.Helper()
+	if !errors.Is(err, noctalia.ErrTimeout) {
+		t.Fatalf("error = %v, want ErrTimeout", err)
+	}
+	if elapsed < 15*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("elapsed = %v, want 15ms-250ms", elapsed)
+	}
+}
+
+func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	descriptorPath := filepath.Join(runtimeDir, "bitwarden-keyring", "noctalia-"+cookie+".json")
+	var descriptor struct {
+		BaseURL string `json:"base_url"`
+		Token   string `json:"token"`
+	}
+	if err := pollNoctalia(ctx, func() (bool, error) {
+		contents, err := os.ReadFile(descriptorPath)
+		if err != nil {
+			return false, nil
+		}
+		return true, json.Unmarshal(contents, &descriptor)
+	}); err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: time.Second}
+	do := func(method, path, body string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, method, descriptor.BaseURL+path, strings.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+descriptor.Token)
+		req.Header.Set("Content-Type", "application/json")
+		return client.Do(req)
+	}
+	response, err := do(http.MethodGet, "/v1/request", "")
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	body := fmt.Sprintf(`{"type":"keyring_response","id":%q,"result":"ok","password":"password"}`, cookie)
+	response, err = do(http.MethodPost, "/v1/response", body)
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	return pollNoctalia(ctx, func() (bool, error) {
+		response, err := do(http.MethodGet, "/v1/result?id="+cookie, "")
+		if err != nil {
+			return false, err
+		}
+		defer response.Body.Close()
+		if response.StatusCode == http.StatusNoContent {
+			return false, nil
+		}
+		var result noctalia.KeyringResult
+		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+			return false, err
+		}
+		return result.Retry, nil
+	})
+}
+
+func pollNoctalia(ctx context.Context, attempt func() (bool, error)) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		done, err := attempt()
+		if err != nil || done {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }

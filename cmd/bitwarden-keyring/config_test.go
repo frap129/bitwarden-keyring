@@ -281,16 +281,6 @@ func TestConfigFromArgs(t *testing.T) {
 			},
 		},
 		{
-			name:    "custom noctalia-socket",
-			args:    []string{"--noctalia-socket=/tmp/test.sock"},
-			wantErr: false,
-			checkFunc: func(t *testing.T, cfg Config) {
-				if cfg.NoctaliaSocket != "/tmp/test.sock" {
-					t.Errorf("NoctaliaSocket = %s, want /tmp/test.sock", cfg.NoctaliaSocket)
-				}
-			},
-		},
-		{
 			name:    "custom noctalia-timeout",
 			args:    []string{"--noctalia-timeout=60s"},
 			wantErr: false,
@@ -490,8 +480,7 @@ func TestSessionConfigMapping(t *testing.T) {
 			name: "full session config mapping",
 			config: Config{
 				NoctaliaEnabled:        true,
-				NoctaliaSocket:         "/tmp/noctalia.sock",
-				NoctaliaTimeout:        60 * time.Second,
+				NoctaliaTimeout:        45 * time.Second,
 				AllowInsecurePrompts:   true,
 				SystemdAskPasswordPath: "/usr/bin/systemd-ask-password",
 				SessionStore:           "file",
@@ -508,9 +497,6 @@ func TestSessionConfigMapping(t *testing.T) {
 			// Verify all fields are correctly mapped
 			if sc.NoctaliaEnabled != tt.config.NoctaliaEnabled {
 				t.Errorf("NoctaliaEnabled = %v, want %v", sc.NoctaliaEnabled, tt.config.NoctaliaEnabled)
-			}
-			if sc.NoctaliaSocket != tt.config.NoctaliaSocket {
-				t.Errorf("NoctaliaSocket = %s, want %s", sc.NoctaliaSocket, tt.config.NoctaliaSocket)
 			}
 			if sc.NoctaliaTimeout != tt.config.NoctaliaTimeout {
 				t.Errorf("NoctaliaTimeout = %v, want %v", sc.NoctaliaTimeout, tt.config.NoctaliaTimeout)
@@ -531,6 +517,20 @@ func TestSessionConfigMapping(t *testing.T) {
 				t.Errorf("MaxPasswordRetries = %d, want %d", sc.MaxPasswordRetries, tt.config.MaxPasswordRetries)
 			}
 		})
+	}
+}
+
+func TestNoctaliaSocketFlagRemoved(t *testing.T) {
+	_, err := ConfigFromArgs([]string{"--noctalia-socket=/tmp/legacy.sock"})
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("ConfigFromArgs() error = %v, want undefined flag error", err)
+	}
+}
+
+func TestNoctaliaTimeoutSessionConfigPreservesValue(t *testing.T) {
+	cfg := Config{NoctaliaTimeout: 45 * time.Second}
+	if got := cfg.SessionConfig().NoctaliaTimeout; got != 45*time.Second {
+		t.Fatalf("SessionConfig().NoctaliaTimeout = %v, want 45s", got)
 	}
 }
 

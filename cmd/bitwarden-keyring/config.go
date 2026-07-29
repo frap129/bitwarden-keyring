@@ -30,7 +30,6 @@ type Config struct {
 	Debug                  bool
 	DebugHTTP              bool
 	NoctaliaEnabled        bool
-	NoctaliaSocket         string
 	NoctaliaTimeout        time.Duration
 	AllowInsecurePrompts   bool
 	SystemdAskPasswordPath string
@@ -47,7 +46,6 @@ type Config struct {
 func (c *Config) SessionConfig() bitwarden.SessionConfig {
 	return bitwarden.SessionConfig{
 		NoctaliaEnabled:        c.NoctaliaEnabled,
-		NoctaliaSocket:         c.NoctaliaSocket,
 		NoctaliaTimeout:        c.NoctaliaTimeout,
 		AllowInsecurePrompts:   c.AllowInsecurePrompts,
 		SystemdAskPasswordPath: c.SystemdAskPasswordPath,
@@ -153,7 +151,6 @@ func ConfigFromArgs(args []string) (Config, error) {
 		fDebug                  = fs.Bool("debug", false, "Enable debug logging")
 		fDebugHTTP              = fs.Bool("debug-http", false, "Enable HTTP body logging for errors (requires --debug to be effective)")
 		fNoctaliaFlag           = fs.Bool("noctalia", false, "Enable Noctalia UI integration for password prompts")
-		fNoctaliaSocket         = fs.String("noctalia-socket", "", "Custom Noctalia socket path (default: $XDG_RUNTIME_DIR/noctalia-keyring.sock)")
 		fNoctaliaTimeout        = fs.Duration("noctalia-timeout", 120*time.Second, "Noctalia prompt timeout")
 		fComponents             = fs.String("components", "", "Components to enable (comma-separated): secrets,ssh. Default: all")
 		fSshSocket              = fs.String("ssh-socket", "", "SSH agent socket path (default: $XDG_RUNTIME_DIR/bitwarden-keyring/ssh.sock)")
@@ -196,7 +193,6 @@ func ConfigFromArgs(args []string) (Config, error) {
 		Debug:                  *fDebug,
 		DebugHTTP:              *fDebugHTTP,
 		NoctaliaEnabled:        noctaliaEnabled,
-		NoctaliaSocket:         *fNoctaliaSocket,
 		NoctaliaTimeout:        *fNoctaliaTimeout,
 		AllowInsecurePrompts:   *fAllowInsecurePrompts,
 		SystemdAskPasswordPath: *fSystemdAskPasswordPath,

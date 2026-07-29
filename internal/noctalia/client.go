@@ -44,11 +44,6 @@ func WithCommandRunner(run CommandRunner) Option {
 	}
 }
 
-// WithSocketPath is retained temporarily for internal/bitwarden compatibility.
-func WithSocketPath(string) Option {
-	return func(*Client) {}
-}
-
 // WithTimeout sets the timeout for Noctalia v5 password prompts.
 func WithTimeout(timeout time.Duration) Option {
 	return func(client *Client) {
@@ -75,11 +70,6 @@ func NewClient(opts ...Option) *Client {
 		client.timeout = DefaultTimeout
 	}
 	return client
-}
-
-// IsAvailable is retained temporarily for internal/bitwarden compatibility.
-func (c *Client) IsAvailable() bool {
-	return true
 }
 
 // PasswordSession represents an authenticated Noctalia v5 prompt bridge.
