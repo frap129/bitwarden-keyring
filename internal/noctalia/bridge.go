@@ -54,7 +54,10 @@ type promptBridge struct {
 	acceptResponse bool
 	pendingResult  *resultDelivery
 	pendingReady   chan struct{}
+	closeErr       error
 }
+
+var errBridgeCleanup = errors.New("failed to clean up noctalia prompt bridge")
 
 func newPromptBridge(request KeyringRequest) (*promptBridge, error) {
 	return newPromptBridgeWithDescriptorWriter(request, writeBridgeDescriptor)
@@ -148,6 +151,10 @@ func newPromptBridgeWithDescriptorWriter(request KeyringRequest, descriptorWrite
 		BaseURL:   "http://" + listener.Addr().String(),
 		Token:     token,
 	}
+	// The descriptor is intentionally created at its final name as required by
+	// the v5 contract. It is not consumable by the intended plugin flow until
+	// encoding and syncing succeed, the server starts, and this constructor
+	// returns to the caller that invokes the plugin CLI.
 	if err := descriptorWriter(descriptorFile, descriptor); err != nil {
 		cleanupBridgeDescriptor(directoryFile, descriptorFile, descriptorName)
 		_ = descriptorFile.Close()
@@ -384,13 +391,12 @@ func (b *promptBridge) handleResponse(w http.ResponseWriter, r *http.Request) {
 	select {
 	case b.responses <- response:
 		b.mu.Lock()
-		closed := b.closed
-		b.mu.Unlock()
-		if closed {
+		if b.closed {
 			writeBridgeStatus(w, http.StatusGone)
-			return
+		} else {
+			writeBridgeStatus(w, http.StatusAccepted)
 		}
-		writeBridgeStatus(w, http.StatusAccepted)
+		b.mu.Unlock()
 	case <-b.done:
 		writeBridgeStatus(w, http.StatusGone)
 	}
@@ -518,8 +524,7 @@ func validKeyringResponse(request KeyringRequest, response KeyringResponse) bool
 
 func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) (KeyringResponse, error) {
 	if err := bridgeContextError(ctx); err != nil {
-		b.disableResponses()
-		return KeyringResponse{}, err
+		return KeyringResponse{}, b.terminateResponseWait(err)
 	}
 	b.mu.Lock()
 	closed := b.closed
@@ -528,8 +533,7 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 		return KeyringResponse{}, ErrSessionClosed
 	}
 	if timeout <= 0 {
-		b.disableResponses()
-		return KeyringResponse{}, ErrTimeout
+		return KeyringResponse{}, b.terminateResponseWait(ErrTimeout)
 	}
 
 	deadline := time.Now().Add(timeout)
@@ -544,40 +548,44 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 			return KeyringResponse{}, ErrSessionClosed
 		}
 		if err := bridgeContextError(ctx); err != nil {
-			b.disableResponses()
-			return KeyringResponse{}, err
+			b.acceptResponse = false
+			return KeyringResponse{}, b.terminateResponseWaitLocked(err)
 		}
 		if !time.Now().Before(deadline) {
-			b.disableResponses()
-			return KeyringResponse{}, ErrTimeout
+			b.acceptResponse = false
+			return KeyringResponse{}, b.terminateResponseWaitLocked(ErrTimeout)
 		}
 		return response, nil
 	case <-ctx.Done():
 		if b.isClosed() {
 			return KeyringResponse{}, ErrSessionClosed
 		}
-		err := bridgeContextError(ctx)
-		b.disableResponses()
-		return KeyringResponse{}, err
+		return KeyringResponse{}, b.terminateResponseWait(bridgeContextError(ctx))
 	case <-timer.C:
 		if b.isClosed() {
 			return KeyringResponse{}, ErrSessionClosed
 		}
 		if err := bridgeContextError(ctx); err != nil {
-			b.disableResponses()
-			return KeyringResponse{}, err
+			return KeyringResponse{}, b.terminateResponseWait(err)
 		}
-		b.disableResponses()
-		return KeyringResponse{}, ErrTimeout
+		return KeyringResponse{}, b.terminateResponseWait(ErrTimeout)
 	case <-b.done:
 		return KeyringResponse{}, ErrSessionClosed
 	}
 }
 
-func (b *promptBridge) disableResponses() {
+func (b *promptBridge) terminateResponseWait(err error) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.terminateResponseWaitLocked(err)
+}
+
+func (b *promptBridge) terminateResponseWaitLocked(err error) error {
+	if b.closed {
+		return ErrSessionClosed
+	}
 	b.acceptResponse = false
+	return err
 }
 
 func bridgeContextError(ctx context.Context) error {
@@ -658,8 +666,8 @@ func (b *promptBridge) finishDelivery(delivery *resultDelivery, err error, allow
 }
 
 func (b *promptBridge) Close() error {
-	var closeErr error
 	b.closeOnce.Do(func() {
+		var closeErr error
 		b.mu.Lock()
 		b.closed = true
 		if delivery := b.pendingResult; delivery != nil {
@@ -671,36 +679,60 @@ func (b *promptBridge) Close() error {
 		b.mu.Unlock()
 
 		if b.server != nil {
-			closeErr = b.server.Close()
+			closeErr = firstBridgeCloseError(closeErr, b.server.Close())
 		} else if b.listener != nil {
-			closeErr = b.listener.Close()
+			closeErr = firstBridgeCloseError(closeErr, b.listener.Close())
 		}
 		if b.descriptorFile != nil && b.directoryFile != nil {
-			cleanupBridgeDescriptor(b.directoryFile, b.descriptorFile, filepath.Base(b.descriptor))
+			closeErr = firstBridgeCloseError(closeErr, cleanupBridgeDescriptor(b.directoryFile, b.descriptorFile, filepath.Base(b.descriptor)))
 		}
 		if b.descriptorFile != nil {
-			_ = b.descriptorFile.Close()
+			closeErr = firstBridgeCloseError(closeErr, closeBridgeFile(b.descriptorFile))
 		}
 		if b.directoryFile != nil {
-			_ = b.directoryFile.Close()
+			closeErr = firstBridgeCloseError(closeErr, closeBridgeFile(b.directoryFile))
 		}
+		b.closeErr = closeErr
 	})
-	return closeErr
+	return b.closeErr
 }
 
-func cleanupBridgeDescriptor(directoryFile, descriptorFile *os.File, name string) {
+func firstBridgeCloseError(first, err error) error {
+	if first != nil {
+		return first
+	}
+	if err != nil {
+		return errBridgeCleanup
+	}
+	return nil
+}
+
+func closeBridgeFile(file *os.File) error {
+	if err := file.Close(); err != nil {
+		return errBridgeCleanup
+	}
+	return nil
+}
+
+func cleanupBridgeDescriptor(directoryFile, descriptorFile *os.File, name string) error {
 	pathInfo, err := fstatatInfo(int(directoryFile.Fd()), name)
 	if err != nil {
-		return
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return errBridgeCleanup
 	}
 	fileInfo, err := descriptorFile.Stat()
 	if err != nil {
-		return
+		return errBridgeCleanup
 	}
 	if !os.SameFile(pathInfo, fileInfo) {
-		return
+		return nil
 	}
-	_ = unix.Unlinkat(int(directoryFile.Fd()), name, 0)
+	if err := unix.Unlinkat(int(directoryFile.Fd()), name, 0); err != nil {
+		return errBridgeCleanup
+	}
+	return nil
 }
 
 func fstatatInfo(directoryFD int, name string) (os.FileInfo, error) {

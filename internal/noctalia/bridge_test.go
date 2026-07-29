@@ -693,6 +693,22 @@ func TestPromptBridgeCloseIsIdempotentAndRemovesDescriptor(t *testing.T) {
 	}
 }
 
+func TestPromptBridgeCloseReportsFirstCleanupError(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	if err := bridge.descriptorFile.Close(); err != nil {
+		t.Fatalf("pre-close descriptor close: %v", err)
+	}
+
+	firstErr := bridge.Close()
+	if firstErr == nil {
+		t.Fatal("first Close() error = nil, want cleanup error")
+	}
+	secondErr := bridge.Close()
+	if secondErr == nil || secondErr.Error() != firstErr.Error() {
+		t.Errorf("second Close() error = %v, want first error %v", secondErr, firstErr)
+	}
+}
+
 func TestPromptBridgeClosePreservesDescriptorPathReplacement(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	replacement := []byte("replacement")
