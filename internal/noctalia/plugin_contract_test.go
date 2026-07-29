@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -68,6 +69,15 @@ func TestV5PluginSourceContract(t *testing.T) {
 		}
 	}
 
+	if available["service.luau"] {
+		contents, err := os.ReadFile(filepath.Join(pluginDir, "service.luau"))
+		if err != nil {
+			t.Errorf("read required plugin file service.luau: %v", err)
+		} else {
+			assertServiceSource(t, string(contents))
+		}
+	}
+
 	if available["plugin.toml"] {
 		contents, err := os.ReadFile(filepath.Join(pluginDir, "plugin.toml"))
 		if err != nil {
@@ -86,6 +96,163 @@ func TestV5PluginSourceContract(t *testing.T) {
 			t.Errorf("read required plugin file %s: %v", translationName, err)
 		} else {
 			assertTranslations(t, contents)
+		}
+	}
+}
+
+func assertServiceSource(t *testing.T, source string) {
+	t.Helper()
+	for _, required := range []string{
+		`--!nonstrict`, `noctalia.getenv("XDG_RUNTIME_DIR")`, `noctalia.readFile`,
+		`Authorization = "Bearer "`, `/v1/request`, `/v1/response`, `/v1/result`,
+		`noctalia.setUpdateInterval(250)`, `function update()`, `capturedGeneration ~= generation`,
+		`capturedId ~= pendingId`, `capturedId ~= active.id`, `status ~= 200 and status ~= 204 and status ~= 409`,
+		`noctalia.state.set("command", nil)`, `noctalia.state.set("auth", false)`, `noctalia.state.get("panel_open")`,
+		`id = id`, `title = title`, `prompt = prompt`, `confirm_only = confirmOnly`, `phase = phase`, `error = errorText`,
+		`value.password = nil`, `wire.password = nil`, `body = nil`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Errorf("service.luau does not contain required literal %q", required)
+		}
+	}
+	if strings.Count(source, `capturedGeneration ~= generation`) < 3 {
+		t.Error("service.luau must generation-guard every HTTP callback")
+	}
+	if strings.Count(source, `capturedId ~=`) < 3 {
+		t.Error("service.luau must ID-guard every HTTP callback")
+	}
+	for _, forbidden := range []string{
+		`panel_open", nil`, `panel_open", false`, `panel_open", true`,
+		"os.execute", "io.popen", "noctalia.exec", "noctalia.spawn", "console.log", "logger", "notify(",
+		`publish(active.id, active.title, active.prompt, active.confirmOnly, "cancelling"`, `result.error`,
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Errorf("service.luau contains forbidden literal %q", forbidden)
+		}
+	}
+	if regexp.MustCompile(`(?i)(url|base_url)[^\n]*(token)|token[^\n]*(url|base_url)`).MatchString(source) {
+		t.Error("service.luau appears to place the token in a URL")
+	}
+}
+
+type serviceModel struct {
+	generation                 int
+	active, pending            bool
+	fetching, posting, polling bool
+	auth, command              bool
+	phase                      string
+	panelOpen, requestOpen     bool
+}
+
+func (m *serviceModel) commandFor(generation int) {
+	if generation != m.generation || !m.active || m.phase != "ready" || m.posting {
+		return
+	}
+	m.posting = true
+	m.phase = "busy"
+	m.auth = true
+}
+
+func (m *serviceModel) callback(generation int, idCurrent bool) {
+	if generation != m.generation || !idCurrent {
+		return
+	}
+	m.posting = false
+}
+
+func (m *serviceModel) retry(generation int, idCurrent bool) {
+	if generation != m.generation || !idCurrent {
+		return
+	}
+	m.posting = false
+	m.polling = false
+	m.phase = "ready"
+	m.auth = true
+	m.requestOpen = !m.panelOpen
+}
+
+func (m *serviceModel) panelClosed() {
+	if m.phase == "busy" {
+		m.panelOpen = false
+	}
+}
+
+func (m *serviceModel) restart() {
+	m.generation++
+	m.active = false
+	m.pending = false
+	m.fetching = false
+	m.posting = false
+	m.polling = false
+	m.auth = false
+	m.command = false
+	m.phase = ""
+	m.requestOpen = false
+}
+
+func TestServiceModelDuplicateCommandDoesNotMutateState(t *testing.T) {
+	want := serviceModel{generation: 3, active: true, posting: true, auth: true, phase: "busy"}
+	got := want
+	got.commandFor(3)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("duplicate command changed state: got %#v, want %#v", got, want)
+	}
+}
+
+func TestServiceModelStaleCallbackDoesNotMutateState(t *testing.T) {
+	want := serviceModel{generation: 4, active: true, posting: true, polling: true, auth: true, phase: "busy"}
+	for _, callback := range []func(*serviceModel){
+		func(m *serviceModel) { m.callback(3, true) },
+		func(m *serviceModel) { m.callback(4, false) },
+	} {
+		got := want
+		callback(&got)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("stale callback changed state: got %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestServiceModelRetryTransitionsBusyToReady(t *testing.T) {
+	got := serviceModel{generation: 5, active: true, posting: true, polling: true, auth: true, phase: "busy"}
+	got.retry(5, true)
+	want := serviceModel{generation: 5, active: true, auth: true, phase: "ready", requestOpen: true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("retry state = %#v, want %#v", got, want)
+	}
+}
+
+func TestServiceModelBusyCloseAndRetryReopen(t *testing.T) {
+	got := serviceModel{generation: 2, active: true, polling: true, auth: true, phase: "busy", panelOpen: true}
+	got.panelClosed()
+	if got.panelOpen {
+		t.Fatal("busy close did not record panel_open false")
+	}
+	got.retry(2, true)
+	if !got.requestOpen {
+		t.Fatal("retry after busy close did not request panel reopen")
+	}
+}
+
+func TestServiceModelRestartPreservesPanelAndInvalidatesCallbacks(t *testing.T) {
+	got := serviceModel{generation: 8, active: true, pending: true, fetching: true, posting: true, polling: true, auth: true, command: true, phase: "busy", panelOpen: true}
+	got.restart()
+	want := serviceModel{generation: 9, panelOpen: true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("restart state = %#v, want %#v", got, want)
+	}
+	got.callback(8, true)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("late callback changed restarted state: got %#v, want %#v", got, want)
+	}
+}
+
+func TestServiceModelContainsNoSecretsOrLocations(t *testing.T) {
+	typeOfModel := reflect.TypeOf(serviceModel{})
+	for i := 0; i < typeOfModel.NumField(); i++ {
+		name := strings.ToLower(typeOfModel.Field(i).Name)
+		if strings.Contains(name, "password") || strings.Contains(name, "token") || strings.Contains(name, "url") {
+			t.Errorf("model contains durable secret or location field %q", name)
 		}
 	}
 }
