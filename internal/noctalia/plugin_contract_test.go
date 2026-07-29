@@ -110,6 +110,8 @@ func assertServiceSource(t *testing.T, source string) {
 		`noctalia.state.set("command", nil)`, `noctalia.state.set("auth", false)`, `noctalia.state.get("panel_open")`,
 		`id = id`, `title = title`, `prompt = prompt`, `confirm_only = confirmOnly`, `phase = phase`, `error = errorText`,
 		`value.password = nil`, `wire.password = nil`, `body = nil`,
+		`value.retry == nil or type(value.retry) == "boolean"`, `local terminal = {`,
+		`noctalia.state.set("auth", terminal)`, `local showPanel = owner == nil and validId(pendingId)`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
@@ -121,10 +123,19 @@ func assertServiceSource(t *testing.T, source string) {
 	if strings.Count(source, `capturedId ~=`) < 3 {
 		t.Error("service.luau must ID-guard every HTTP callback")
 	}
+	publishTerminal := strings.Index(source, `noctalia.state.set("auth", terminal)`)
+	invalidateTerminal := strings.Index(source, "generation = generation + 1")
+	if publishTerminal < 0 || invalidateTerminal < 0 || publishTerminal > invalidateTerminal {
+		t.Error("service.luau must publish terminal auth before invalidating callbacks")
+	}
 	for _, forbidden := range []string{
 		`panel_open", nil`, `panel_open", false`, `panel_open", true`,
 		"os.execute", "io.popen", "noctalia.exec", "noctalia.spawn", "console.log", "logger", "notify(",
 		`publish(active.id, active.title, active.prompt, active.confirmOnly, "cancelling"`, `result.error`,
+		`function(res)
+    body`, `function(res)
+    token`, `function(res)
+    baseUrl`,
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("service.luau contains forbidden literal %q", forbidden)
@@ -132,6 +143,40 @@ func assertServiceSource(t *testing.T, source string) {
 	}
 	if regexp.MustCompile(`(?i)(url|base_url)[^\n]*(token)|token[^\n]*(url|base_url)`).MatchString(source) {
 		t.Error("service.luau appears to place the token in a URL")
+	}
+	callbackPattern := regexp.MustCompile(`(?s)\}, function\(res\)\n(.*?)\n  end\)`)
+	callbacks := callbackPattern.FindAllStringSubmatch(source, -1)
+	if len(callbacks) != 3 {
+		t.Errorf("service.luau HTTP callbacks = %d, want 3 inspectable callbacks", len(callbacks))
+	}
+	for _, callback := range callbacks {
+		for _, capturedSecret := range []string{"token =", "baseUrl =", "body = nil", "descriptor"} {
+			if strings.Contains(callback[1], capturedSecret) {
+				t.Errorf("service.luau callback retains local secret via %q", capturedSecret)
+			}
+		}
+	}
+}
+
+type serviceResultFixture struct {
+	Type    string `json:"type"`
+	ID      string `json:"id"`
+	Success bool   `json:"success"`
+	Retry   *bool  `json:"retry"`
+}
+
+func validServiceResultFixture(value serviceResultFixture, id string) bool {
+	return value.Type == "keyring_result" && value.ID == id
+}
+
+func TestServiceResultAcceptsTerminalJSONWithoutRetry(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	var result serviceResultFixture
+	if err := json.Unmarshal([]byte(`{"type":"keyring_result","id":"`+id+`","success":false}`), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !validServiceResultFixture(result, id) || result.Retry != nil {
+		t.Fatalf("terminal result without retry rejected: %#v", result)
 	}
 }
 
@@ -190,6 +235,18 @@ func (m *serviceModel) restart() {
 	m.requestOpen = false
 }
 
+func (m *serviceModel) failPending() {
+	if !m.pending {
+		return
+	}
+	m.auth = true
+	m.phase = "failed"
+	m.requestOpen = !m.panelOpen
+	m.generation++
+	m.pending = false
+	m.fetching = false
+}
+
 func TestServiceModelDuplicateCommandDoesNotMutateState(t *testing.T) {
 	want := serviceModel{generation: 3, active: true, posting: true, auth: true, phase: "busy"}
 	got := want
@@ -244,6 +301,19 @@ func TestServiceModelRestartPreservesPanelAndInvalidatesCallbacks(t *testing.T) 
 	got.callback(8, true)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("late callback changed restarted state: got %#v, want %#v", got, want)
+	}
+}
+
+func TestServiceModelPreActiveFailurePublishesAndOpensPanel(t *testing.T) {
+	got := serviceModel{generation: 6, pending: true, fetching: true}
+	got.failPending()
+	want := serviceModel{generation: 7, auth: true, phase: "failed", requestOpen: true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pre-active failure state = %#v, want %#v", got, want)
+	}
+	got.callback(6, true)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("late pre-active callback changed terminal state: got %#v, want %#v", got, want)
 	}
 }
 

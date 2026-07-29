@@ -8,6 +8,11 @@ local generation = 0
 local fetching = false
 local posting = false
 local polling = false
+local bridgeToken = nil
+local bridgeBaseUrl = nil
+local activeRequest = nil
+local encodedBody = nil
+local postAction = nil
 
 local function validId(value)
   return type(value)=="string" and #value==32 and string.match(value,"^[0-9a-f]+$")~=nil
@@ -58,20 +63,28 @@ local function finish(phase, errorText)
     prompt = owner.prompt
     confirmOnly = owner.confirmOnly
   end
+  local showPanel = owner == nil and validId(pendingId)
+  local terminal = {
+    id = id,
+    title = title,
+    prompt = prompt,
+    confirm_only = confirmOnly,
+    phase = phase,
+    error = errorText,
+  }
+  noctalia.state.set("auth", terminal)
   generation = generation + 1
-  if owner ~= nil then
-    owner.token = nil
-    owner.baseUrl = nil
-    owner.request = nil
-    owner.body = nil
-    owner.password = nil
-  end
   active = nil
   pendingId = nil
   fetching = false
   posting = false
   polling = false
-  publish(id, title, prompt, confirmOnly, phase, errorText)
+  bridgeToken = nil
+  bridgeBaseUrl = nil
+  activeRequest = nil
+  encodedBody = nil
+  postAction = nil
+  if showPanel then openPanel() end
 end
 
 local function bridgeFailure()
@@ -124,28 +137,24 @@ local function openRequest(id)
     return
   end
 
-  local baseUrl = descriptor.base_url
-  local token = descriptor.token
+  bridgeBaseUrl = descriptor.base_url
+  bridgeToken = descriptor.token
   descriptor.token = nil
   descriptor.base_url = nil
   descriptor = nil
   local started = noctalia.http.request({
     method = "GET",
-    url = baseUrl .. "/v1/request",
-    headers = requestHeaders(token),
+    url = bridgeBaseUrl .. "/v1/request",
+    headers = requestHeaders(bridgeToken),
   }, function(res)
     if capturedGeneration ~= generation or capturedId ~= pendingId then return end
     fetching = false
     if type(res) ~= "table" or res.error ~= nil or res.status ~= 200 or type(res.body) ~= "string" then
-      token = nil
-      baseUrl = nil
       bridgeFailure()
       return
     end
     local decodedRequest, request = pcall(noctalia.json.decode, res.body)
     if not decodedRequest or not validRequest(request, capturedId) then
-      token = nil
-      baseUrl = nil
       finish("failed", translated("panel.invalid_request"))
       return
     end
@@ -155,20 +164,14 @@ local function openRequest(id)
       prompt = request.message,
       confirmOnly = request.confirm_only == true,
       phase = "ready",
-      token = token,
-      baseUrl = baseUrl,
-      request = request,
     }
+    activeRequest = request
     request = nil
-    token = nil
-    baseUrl = nil
     pendingId = nil
     publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
     openPanel()
   end)
   if started == false then
-    token = nil
-    baseUrl = nil
     fetching = false
     bridgeFailure()
   end
@@ -205,29 +208,35 @@ local function onCommand(value)
 
   local capturedGeneration = generation
   local capturedId = id
+  encodedBody = body
+  body = nil
+  postAction = action
+  action = nil
   posting = true
-  active.phase = action == "submit" and "busy" or "cancelling"
-  if action == "submit" then
+  active.phase = postAction == "submit" and "busy" or "cancelling"
+  if postAction == "submit" then
     publish(active.id, active.title, active.prompt, active.confirmOnly, "busy", "")
   end
   local started = noctalia.http.request({
     method = "POST",
-    url = active.baseUrl .. "/v1/response",
-    headers = responseHeaders(active.token),
-    body = body,
+    url = bridgeBaseUrl .. "/v1/response",
+    headers = responseHeaders(bridgeToken),
+    body = encodedBody,
   }, function(res)
-    body = nil
     if capturedGeneration ~= generation or active == nil or capturedId ~= active.id then return end
+    encodedBody = nil
     posting = false
     if type(res) ~= "table" or res.error ~= nil or res.status ~= 202 then bridgeFailure() return end
-    if action == "cancel" then
+    if postAction == "cancel" then
       finish("cancelled", translated("panel.cancelled"))
-    elseif action == "confirm" then
+    elseif postAction == "confirm" then
       finish("confirmed", translated("panel.success"))
+    else
+      postAction = nil
     end
   end)
   if started == false then
-    body = nil
+    encodedBody = nil
     posting = false
     bridgeFailure()
   end
@@ -235,7 +244,9 @@ end
 
 local function validResult(value, id)
   return type(value) == "table" and value.type == "keyring_result" and value.id == id
-    and type(value.success) == "boolean" and type(value.retry) == "boolean"
+    and type(value.success) == "boolean"
+    and (value.retry == nil or type(value.retry) == "boolean")
+    and (value.error == nil or type(value.error) == "string")
 end
 
 function update()
@@ -247,8 +258,8 @@ function update()
   polling = true
   local started = noctalia.http.request({
     method = "GET",
-    url = active.baseUrl .. "/v1/result?id=" .. capturedId,
-    headers = requestHeaders(active.token),
+    url = bridgeBaseUrl .. "/v1/result?id=" .. capturedId,
+    headers = requestHeaders(bridgeToken),
   }, function(res)
     if capturedGeneration ~= generation or active == nil or capturedId ~= active.id then return end
     polling = false
@@ -285,18 +296,16 @@ end
 
 function onExit()
   generation = generation + 1
-  if active ~= nil then
-    active.token = nil
-    active.baseUrl = nil
-    active.request = nil
-    active.body = nil
-    active.password = nil
-  end
   active = nil
   pendingId = nil
   fetching = false
   posting = false
   polling = false
+  bridgeToken = nil
+  bridgeBaseUrl = nil
+  activeRequest = nil
+  encodedBody = nil
+  postAction = nil
   noctalia.state.set("command", nil)
   noctalia.state.set("auth", false)
 end
