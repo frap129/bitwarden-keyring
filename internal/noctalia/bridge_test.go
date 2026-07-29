@@ -966,6 +966,7 @@ func TestPromptBridgeWaitResponseCancellationTimeoutAndClose(t *testing.T) {
 	if _, err := bridge.waitResponse(cancelled, time.Second); !errors.Is(err, ErrCancelled) {
 		t.Errorf("cancelled wait error = %v, want ErrCancelled", err)
 	}
+	bridge = newTestPromptBridge(t, testPromptRequest())
 	deadline, deadlineCancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer deadlineCancel()
 	if _, err := bridge.waitResponse(deadline, time.Second); !errors.Is(err, ErrTimeout) {

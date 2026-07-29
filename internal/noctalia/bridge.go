@@ -39,22 +39,25 @@ type resultDelivery struct {
 }
 
 type promptBridge struct {
-	listener       net.Listener
-	server         *http.Server
-	request        KeyringRequest
-	token          string
-	descriptor     string
-	descriptorFile *os.File
-	directoryFile  *os.File
-	responses      chan KeyringResponse
-	done           chan struct{}
-	closeOnce      sync.Once
-	mu             sync.Mutex
-	closed         bool
-	acceptResponse bool
-	pendingResult  *resultDelivery
-	pendingReady   chan struct{}
-	closeErr       error
+	listener         net.Listener
+	server           *http.Server
+	request          KeyringRequest
+	token            string
+	descriptor       string
+	descriptorFile   *os.File
+	directoryFile    *os.File
+	responses        chan KeyringResponse
+	done             chan struct{}
+	closeOnce        sync.Once
+	mu               sync.Mutex
+	closed           bool
+	acceptResponse   bool
+	pendingResult    *resultDelivery
+	pendingReady     chan struct{}
+	responseInFlight bool
+	responseTerminal error
+	pendingResponse  KeyringResponse
+	closeErr         error
 }
 
 var errBridgeCleanup = errors.New("failed to clean up noctalia prompt bridge")
@@ -388,18 +391,23 @@ func (b *promptBridge) handleResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	b.mu.Lock()
+	b.responseInFlight = true
+	b.pendingResponse = response
+	b.mu.Unlock()
 	select {
 	case b.responses <- response:
-		b.mu.Lock()
-		if b.closed {
-			writeBridgeStatus(w, http.StatusGone)
-		} else {
-			writeBridgeStatus(w, http.StatusAccepted)
-		}
-		b.mu.Unlock()
-	case <-b.done:
-		writeBridgeStatus(w, http.StatusGone)
 	}
+	b.mu.Lock()
+	if b.closed || b.responseTerminal != nil {
+		b.responseInFlight = false
+		b.responseTerminal = ErrSessionClosed
+		b.mu.Unlock()
+		writeBridgeStatus(w, http.StatusGone)
+		return
+	}
+	b.mu.Unlock()
+	writeBridgeStatus(w, http.StatusAccepted)
 }
 
 func (b *promptBridge) handleResult(w http.ResponseWriter, r *http.Request) {
@@ -524,60 +532,84 @@ func validKeyringResponse(request KeyringRequest, response KeyringResponse) bool
 
 func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) (KeyringResponse, error) {
 	if err := bridgeContextError(ctx); err != nil {
-		return KeyringResponse{}, b.terminateResponseWait(err)
+		b.mu.Lock()
+		err = b.terminateResponseWaitLocked(err)
+		b.mu.Unlock()
+		return KeyringResponse{}, err
 	}
 	b.mu.Lock()
 	closed := b.closed
+	responseInFlight := b.responseInFlight
+	terminal := b.responseTerminal
 	b.mu.Unlock()
-	if closed {
+	if closed && !responseInFlight {
 		return KeyringResponse{}, ErrSessionClosed
+	}
+	if terminal != nil && !responseInFlight {
+		return KeyringResponse{}, terminal
 	}
 	if timeout <= 0 {
-		return KeyringResponse{}, b.terminateResponseWait(ErrTimeout)
+		b.mu.Lock()
+		err := b.terminateResponseWaitLocked(ErrTimeout)
+		b.mu.Unlock()
+		return KeyringResponse{}, err
 	}
 
-	deadline := time.Now().Add(timeout)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case response := <-b.responses:
-		b.mu.Lock()
-		closed = b.closed
-		b.mu.Unlock()
-		if closed {
+	ctxDone := ctx.Done()
+	timerDone := timer.C
+	bridgeDone := b.done
+	for {
+		select {
+		case response := <-b.responses:
+			b.mu.Lock()
+			if b.responseInFlight {
+				b.responseInFlight = false
+				b.pendingResponse = KeyringResponse{}
+				b.mu.Unlock()
+				return response, nil
+			}
+			b.mu.Unlock()
+		case <-ctxDone:
+			b.mu.Lock()
+			if b.responseInFlight {
+				b.mu.Unlock()
+				ctxDone = nil
+				continue
+			}
+			if b.closed {
+				b.mu.Unlock()
+				return KeyringResponse{}, ErrSessionClosed
+			}
+			err := b.terminateResponseWaitLocked(bridgeContextError(ctx))
+			b.mu.Unlock()
+			return KeyringResponse{}, err
+		case <-timerDone:
+			b.mu.Lock()
+			if b.responseInFlight {
+				b.mu.Unlock()
+				timerDone = nil
+				continue
+			}
+			if b.closed {
+				b.mu.Unlock()
+				return KeyringResponse{}, ErrSessionClosed
+			}
+			err := b.terminateResponseWaitLocked(ErrTimeout)
+			b.mu.Unlock()
+			return KeyringResponse{}, err
+		case <-bridgeDone:
+			b.mu.Lock()
+			if b.responseInFlight {
+				b.mu.Unlock()
+				bridgeDone = nil
+				continue
+			}
+			b.mu.Unlock()
 			return KeyringResponse{}, ErrSessionClosed
 		}
-		if err := bridgeContextError(ctx); err != nil {
-			b.acceptResponse = false
-			return KeyringResponse{}, b.terminateResponseWaitLocked(err)
-		}
-		if !time.Now().Before(deadline) {
-			b.acceptResponse = false
-			return KeyringResponse{}, b.terminateResponseWaitLocked(ErrTimeout)
-		}
-		return response, nil
-	case <-ctx.Done():
-		if b.isClosed() {
-			return KeyringResponse{}, ErrSessionClosed
-		}
-		return KeyringResponse{}, b.terminateResponseWait(bridgeContextError(ctx))
-	case <-timer.C:
-		if b.isClosed() {
-			return KeyringResponse{}, ErrSessionClosed
-		}
-		if err := bridgeContextError(ctx); err != nil {
-			return KeyringResponse{}, b.terminateResponseWait(err)
-		}
-		return KeyringResponse{}, b.terminateResponseWait(ErrTimeout)
-	case <-b.done:
-		return KeyringResponse{}, ErrSessionClosed
 	}
-}
-
-func (b *promptBridge) terminateResponseWait(err error) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.terminateResponseWaitLocked(err)
 }
 
 func (b *promptBridge) terminateResponseWaitLocked(err error) error {
@@ -585,7 +617,14 @@ func (b *promptBridge) terminateResponseWaitLocked(err error) error {
 		return ErrSessionClosed
 	}
 	b.acceptResponse = false
-	return err
+	b.responseTerminal = err
+	for {
+		select {
+		case <-b.responses:
+		default:
+			return err
+		}
+	}
 }
 
 func bridgeContextError(ctx context.Context) error {
