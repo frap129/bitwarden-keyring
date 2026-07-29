@@ -3,9 +3,11 @@
 local auth = nil
 local password = ""
 local inputKey = 0
+local inputAccepting = false
 local suppressCloseCancel = false
 
 local function clearPassword()
+  inputAccepting = false
   password = ""
   inputKey = inputKey + 1
 end
@@ -47,6 +49,7 @@ local function requestProgrammaticDismiss()
 end
 
 function render()
+  inputAccepting = false
   local title = noctalia.tr("panel.title")
   local prompt = ""
   local errorText = ""
@@ -75,6 +78,7 @@ function render()
     ui.text({ text = prompt }),
   }
   if auth ~= nil and not confirmOnly then
+    if ready then inputAccepting = true end
     table.insert(children, ui.textInput({
       key = "password-" .. inputKey,
       value = "",
@@ -108,6 +112,7 @@ local function rerender()
 end
 
 function onPasswordChange(value)
+  if not inputAccepting or auth == nil or auth.phase ~= "ready" or auth.confirm_only then return end
   if type(value) ~= "string" then return end
   password = value
   rerender()
@@ -115,9 +120,9 @@ end
 
 function onUnlock()
   if auth == nil or auth.phase ~= "ready" or auth.confirm_only or password == "" then return end
-  auth.phase = "busy"
   local submitted = password
   clearPassword()
+  auth.phase = "busy"
   noctalia.state.set("command", { action = "submit", id = auth.id, password = submitted })
   submitted = nil
   rerender()
@@ -125,22 +130,23 @@ end
 
 function onConfirm()
   if auth == nil or auth.phase ~= "ready" or not auth.confirm_only then return end
-  auth.phase = "busy"
   clearPassword()
+  auth.phase = "busy"
   noctalia.state.set("command", { action = "confirm", id = auth.id })
   rerender()
 end
 
 function onCancel()
   if auth == nil or auth.phase ~= "ready" then return end
-  auth.phase = "cancelling"
   clearPassword()
+  auth.phase = "cancelling"
   noctalia.state.set("command", { action = "cancel", id = auth.id })
   rerender()
   if noctalia.getConfig("auto_close_on_cancel") == true then requestProgrammaticDismiss() end
 end
 
 function onDismiss()
+  if auth == nil or auth.phase ~= "failed" then return end
   clearPassword()
   requestProgrammaticDismiss()
 end
@@ -148,8 +154,8 @@ end
 function onOpen()
   suppressCloseCancel = false
   noctalia.state.set("panel_open", true)
-  auth = sanitizeAuth(noctalia.state.get("auth"))
   clearPassword()
+  auth = sanitizeAuth(noctalia.state.get("auth"))
   rerender()
 end
 
@@ -163,25 +169,26 @@ function onClose()
 end
 
 function onAuthChanged(value)
+  inputAccepting = false
   local previousId = auth ~= nil and auth.id or nil
   local previousPhase = auth ~= nil and auth.phase or nil
   if value == false then
-    auth = nil
     clearPassword()
+    auth = nil
     rerender()
     return
   end
   local nextAuth = sanitizeAuth(value)
   if nextAuth == nil then
-    auth = nil
     clearPassword()
+    auth = nil
     rerender()
     return
   end
-  auth = nextAuth
-  if auth.id ~= previousId or auth.phase ~= previousPhase then
+  if nextAuth.id ~= previousId or nextAuth.phase ~= previousPhase then
     clearPassword()
   end
+  auth = nextAuth
   rerender()
   if auth.phase == "cancelled" then
     if noctalia.getConfig("auto_close_on_cancel") == true then requestProgrammaticDismiss() end

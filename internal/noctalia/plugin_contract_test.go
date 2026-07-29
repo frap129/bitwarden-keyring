@@ -147,7 +147,7 @@ func assertTranslationReferences(t *testing.T, source string, contents []byte) {
 func assertPanelSource(t *testing.T, source string) {
 	t.Helper()
 	for _, required := range []string{
-		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local suppressCloseCancel`,
+		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local inputAccepting`, `local suppressCloseCancel`,
 		`function render()`, `ui.column`, `assets/bitwarden.svg`, `noctalia.getConfig("show_bitwarden_icon")`,
 		`key = "password-" .. inputKey`, `value = ""`, `password = true`, `focus = true`, `enabled = auth.phase == "ready"`,
 		`onChange = "onPasswordChange"`, `onSubmit = "onUnlock"`, `panel.render(render())`,
@@ -157,6 +157,8 @@ func assertPanelSource(t *testing.T, source string) {
 		`submitted = nil`, `password = ""`, `inputKey = inputKey + 1`,
 		`noctalia.getConfig("auto_close_on_cancel")`, `noctalia.getConfig("auto_close_on_success")`,
 		`noctalia.state.watch("auth", onAuthChanged)`,
+		`if not inputAccepting or auth == nil or auth.phase ~= "ready" or auth.confirm_only then return end`,
+		`if auth == nil or auth.phase ~= "failed" then return end`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("panel.luau does not contain required literal %q", required)
@@ -183,6 +185,62 @@ func assertPanelSource(t *testing.T, source string) {
 	}
 	if regexp.MustCompile(`(?s)noctalia\.state\.set\("auth"[^\n]*(password)|auth\s*=\s*\{[^}]*password`).MatchString(source) {
 		t.Error("panel.luau places a password in shared auth state")
+	}
+	if !regexp.MustCompile(`(?s)local function clearPassword\(\)\s+inputAccepting = false\s+password = ""\s+inputKey = inputKey \+ 1`).MatchString(source) {
+		t.Error("panel.luau must stop accepting input before clearing and incrementing its key")
+	}
+	if !regexp.MustCompile(`(?s)function onAuthChanged\(value\)\s+inputAccepting = false`).MatchString(source) {
+		t.Error("panel.luau auth watch must synchronously stop accepting stale input")
+	}
+	if !regexp.MustCompile(`(?s)function onDismiss\(\)\s+if auth == nil or auth\.phase ~= "failed" then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
+		t.Error("panel.luau dismiss must validate the current failed auth before suppressing close")
+	}
+}
+
+type panelCallbackModel struct {
+	authComplete, inputAccepting, confirmOnly bool
+	phase                                     string
+	password                                  string
+	closed, suppressed                        bool
+}
+
+func (m *panelCallbackModel) passwordChange(value any) {
+	text, ok := value.(string)
+	if !ok || !m.inputAccepting || !m.authComplete || m.phase != "ready" || m.confirmOnly {
+		return
+	}
+	m.password = text
+}
+
+func (m *panelCallbackModel) dismiss() {
+	if !m.authComplete || m.phase != "failed" {
+		return
+	}
+	m.suppressed = true
+	m.closed = true
+}
+
+func TestPanelModelRejectsStalePasswordChanges(t *testing.T) {
+	for _, model := range []panelCallbackModel{
+		{inputAccepting: true, phase: "ready"},
+		{authComplete: true, phase: "ready"},
+		{authComplete: true, inputAccepting: true, phase: "busy"},
+		{authComplete: true, inputAccepting: true, phase: "ready", confirmOnly: true},
+	} {
+		model.passwordChange("stale")
+		if model.password != "" {
+			t.Fatalf("stale password callback restored password: %#v", model)
+		}
+	}
+}
+
+func TestPanelModelDismissesOnlyCurrentFailure(t *testing.T) {
+	for _, phase := range []string{"ready", "busy"} {
+		model := panelCallbackModel{authComplete: true, phase: phase}
+		model.dismiss()
+		if model.closed || model.suppressed {
+			t.Fatalf("stale dismiss changed %s state: %#v", phase, model)
+		}
 	}
 }
 
