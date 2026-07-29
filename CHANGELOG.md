@@ -1,3 +1,10 @@
+## Unreleased
+
+- Migrated the Noctalia integration to the v5 plugin API 16 catalog, service, and panel model.
+- Replaced plugin transport with short-lived authenticated loopback HTTP and request-ID-only CLI IPC.
+- Fixed backend timeout handling while retaining `--noctalia-timeout`.
+- Breaking: removed v4 metadata and installation support, the legacy socket flag, and the old plugin timeout, panel display, reveal, and animation settings.
+
 ## 0.6.0 (2026-02-07)
 
 - chore: Bump package and plugin versions ([b655ee4](https://github.com/frap129/bitwarden-keyring/commit/b655ee4))

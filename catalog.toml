@@ -1,0 +1,12 @@
+[[plugin]]
+id = "frap129/noctalia-bitwarden-keyring"
+name = "Bitwarden Keyring"
+version = "0.5.0"
+author = "frap129"
+license = "MIT"
+icon = "brand-bitwarden"
+description = "Secure prompts for the Bitwarden-backed Secret Service and SSH agent."
+deprecated = false
+plugin_api = 16
+tags = ["bitwarden", "password", "security"]
+dependencies = ["bitwarden-keyring"]

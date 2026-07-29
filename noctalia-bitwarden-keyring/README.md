@@ -1,76 +1,67 @@
 # Bitwarden Keyring Noctalia Plugin
 
-A Noctalia plugin that provides a native UI for Bitwarden Keyring password prompts.
+This plugin provides Noctalia's service and panel for secure Bitwarden Keyring prompts.
 
-## Overview
+## Prerequisites
 
-This plugin integrates with [bitwarden-keyring](https://github.com/frap129/bitwarden-keyring) to display password prompts through Noctalia's panel system when unlocking the Bitwarden vault.
+- Noctalia v5 prerelease with plugin API 16
+- The `noctalia` CLI
+- This repository's `bitwarden-keyring` executable on `PATH`
+- A valid, private `XDG_RUNTIME_DIR`
 
-## Requirements
+## Remove a legacy installation first
 
-- [Noctalia](https://noctalia.org) >= 4.0.0
-- bitwarden-keyring running with `--noctalia` flag
+This fail-closed cleanup is the first installation step. It deletes only the matching legacy shape: an absolute `HOME` is required; the legacy directory and its required metadata and entry files must be nonsymlinks; Python must validate plugin ID `noctalia-bitwarden-keyring` and version `4.0.0` in the legacy minimum-version field; and the directory's real path must equal the expected path. Otherwise it performs no deletion.
 
-## Installation
+```bash
+case ${HOME-} in /*) ;; *) printf '%s\n' 'HOME must be absolute' >&2; exit 1 ;; esac
+legacy="$HOME/.config/noctalia/plugins/bitwarden-keyring"
+metadata_name='manifest.'"json"
+entry_name='Main.'"qml"
+if [ ! -L "$legacy" ] && [ -d "$legacy" ] &&
+   [ ! -L "$legacy/$metadata_name" ] && [ -f "$legacy/$metadata_name" ] &&
+   [ ! -L "$legacy/$entry_name" ] && [ -f "$legacy/$entry_name" ] &&
+   python3 - "$legacy/$metadata_name" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+raise SystemExit(0 if value.get("id") == "noctalia-bitwarden-keyring" and value.get("min" + "NoctaliaVersion") == "4.0.0" else 1)
+PY
+then
+  [ "$(realpath -- "$legacy")" = "$legacy" ] && rm -rf -- "$legacy"
+fi
+```
 
-1. **Install this plugin**:
+## Register and run
 
-   ```bash
-   # Copy to Noctalia plugins directory
-   mkdir -p ~/.config/noctalia/plugins
-   cp -r noctalia-bitwarden-keyring ~/.config/noctalia/plugins/bitwarden-keyring
-   ```
+Run these repeatable commands from the repository root:
 
-2. **Enable the plugin in Noctalia settings**
+```bash
+cd "$(git rev-parse --show-toplevel)" || exit 1
+noctalia msg plugins source list
+sources=$(noctalia msg plugins source list) || exit 1
+if printf '%s\n' "$sources" | grep -Fqx "bitwarden-keyring $PWD"; then
+  :
+elif printf '%s\n' "$sources" | grep -Eq '^bitwarden-keyring([[:space:]]|$)'; then
+  printf '%s\n' 'Source bitwarden-keyring points elsewhere; repoint it in Noctalia settings.' >&2
+  exit 1
+else
+  noctalia msg plugins source add bitwarden-keyring path "$PWD"
+fi
+noctalia msg plugins enable frap129/noctalia-bitwarden-keyring
+bitwarden-keyring --noctalia --noctalia-timeout=2m
+```
 
-3. **Start bitwarden-keyring with Noctalia support**:
+## Security and lifecycle
 
-   ```bash
-   bitwarden-keyring --noctalia
-   ```
+The service reads a mode `0600` descriptor from `XDG_RUNTIME_DIR` and uses its short-lived authenticated loopback HTTP endpoint. Noctalia CLI IPC carries only a request ID. The service polls for the request and result, then both sides clean up request state and the descriptor. Passwords are never placed in process arguments, logged, or persisted.
 
-   Or enable via environment variable:
+The backend `--noctalia-timeout` still bounds the prompt (default `2m`), but the v4 plugin timeout was removed. The former panel display, password-reveal, and animation settings were also removed.
 
-   ```bash
-   export BITWARDEN_KEYRING_NOCTALIA=1
-   bitwarden-keyring
-   ```
-
-## Configuration
-
-The plugin can be configured through Noctalia's plugin settings:
-
-| Setting              | Default    | Description                                   |
-| -------------------- | ---------- | --------------------------------------------- |
-| `timeout`            | 120        | Request timeout in seconds                    |
-| `showBitwardenIcon`  | true       | Show Bitwarden icon in the dialog             |
-| `autoCloseOnSuccess` | true       | Auto-close panel after successful auth        |
-| `autoCloseOnCancel`  | true       | Auto-close panel on cancel                    |
-| `panelMode`          | "attached" | Panel display mode (attached/centered/window) |
-
-## How It Works
-
-1. The plugin creates a socket server at `$XDG_RUNTIME_DIR/noctalia-keyring.sock`
-2. When bitwarden-keyring needs a password, it connects directly to this socket
-3. The plugin receives the request and displays a password dialog
-4. The user enters their password (or cancels)
-5. The plugin sends the response back on the same connection
-6. bitwarden-keyring receives the password and proceeds
-
-This is a push-based architecture - the plugin responds instantly to incoming requests without any polling.
-
-## Troubleshooting
-
-### Plugin doesn't show password dialog
-
-- Check that the socket exists: `ls $XDG_RUNTIME_DIR/noctalia-keyring.sock`
-- Ensure bitwarden-keyring is started with `--noctalia` flag
-- Check Noctalia logs for any plugin errors
-
-### Password dialog appears but authentication fails
-
-- Check bitwarden-keyring logs for errors
-- Ensure your Bitwarden CLI is properly configured
+| Setting | Default |
+| --- | --- |
+| `show_bitwarden_icon` | `true` |
+| `auto_close_on_success` | `true` |
+| `auto_close_on_cancel` | `true` |
 
 ## License
 

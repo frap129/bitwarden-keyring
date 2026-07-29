@@ -2,6 +2,7 @@ package noctalia
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,12 +21,101 @@ type pluginManifest struct {
 	settings []map[string]any
 }
 
-func TestV5PluginSourceContract(t *testing.T) {
+func repositoryRoot(t *testing.T) string {
+	t.Helper()
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve test source path")
 	}
-	pluginDir := filepath.Join(filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", "..")), "noctalia-bitwarden-keyring")
+	return filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
+}
+
+func TestV5PluginCatalogContract(t *testing.T) {
+	root := repositoryRoot(t)
+	contents, err := os.ReadFile(filepath.Join(root, "catalog.toml"))
+	if err != nil {
+		t.Fatalf("read catalog.toml: %v", err)
+	}
+	plugins, err := parsePluginCatalog(string(contents))
+	if err != nil {
+		t.Fatalf("parse catalog.toml: %v", err)
+	}
+	want := map[string]any{
+		"id": "frap129/noctalia-bitwarden-keyring", "name": "Bitwarden Keyring", "version": "0.5.0",
+		"author": "frap129", "license": "MIT", "icon": "brand-bitwarden",
+		"description": "Secure prompts for the Bitwarden-backed Secret Service and SSH agent.",
+		"deprecated":  false, "plugin_api": 16, "tags": []string{"bitwarden", "password", "security"},
+		"dependencies": []string{"bitwarden-keyring"},
+	}
+	if len(plugins) != 1 || !reflect.DeepEqual(plugins[0], want) {
+		t.Fatalf("catalog plugins = %#v, want one plugin %#v", plugins, want)
+	}
+
+	manifestContents, err := os.ReadFile(filepath.Join(root, "noctalia-bitwarden-keyring", "plugin.toml"))
+	if err != nil {
+		t.Fatalf("read plugin.toml: %v", err)
+	}
+	manifest, err := parsePluginManifest(string(manifestContents))
+	if err != nil {
+		t.Fatalf("parse plugin.toml: %v", err)
+	}
+	for _, key := range []string{"id", "name", "version", "author", "license", "icon", "description", "plugin_api", "tags", "dependencies"} {
+		if !reflect.DeepEqual(plugins[0][key], manifest.root[key]) {
+			t.Errorf("catalog %s = %#v, manifest = %#v", key, plugins[0][key], manifest.root[key])
+		}
+	}
+
+	if _, err := os.Lstat(filepath.Join(root, "registry.json")); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			t.Error("registry.json still exists")
+		} else {
+			t.Errorf("registry.json absence: %v", err)
+		}
+	}
+}
+
+func parsePluginCatalog(source string) ([]map[string]any, error) {
+	allowed := keySet("id", "name", "version", "author", "license", "icon", "description", "deprecated", "plugin_api", "tags", "dependencies")
+	var plugins []map[string]any
+	var current map[string]any
+	for lineNumber, rawLine := range strings.Split(source, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			if line != "[[plugin]]" {
+				return nil, fmt.Errorf("line %d: invalid table header %q", lineNumber+1, line)
+			}
+			current = make(map[string]any)
+			plugins = append(plugins, current)
+			continue
+		}
+		if current == nil {
+			return nil, fmt.Errorf("line %d: content before plugin table", lineNumber+1)
+		}
+		key, rawValue, found := strings.Cut(line, "=")
+		key, rawValue = strings.TrimSpace(key), strings.TrimSpace(rawValue)
+		if !found || key == "" || rawValue == "" {
+			return nil, fmt.Errorf("line %d: malformed assignment", lineNumber+1)
+		}
+		if !allowed[key] {
+			return nil, fmt.Errorf("line %d: unknown plugin key %q", lineNumber+1, key)
+		}
+		if _, duplicate := current[key]; duplicate {
+			return nil, fmt.Errorf("line %d: duplicate plugin key %q", lineNumber+1, key)
+		}
+		value, err := parseManifestValue(rawValue)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", lineNumber+1, err)
+		}
+		current[key] = value
+	}
+	return plugins, nil
+}
+
+func TestV5PluginSourceContract(t *testing.T) {
+	pluginDir := filepath.Join(repositoryRoot(t), "noctalia-bitwarden-keyring")
 
 	available := make(map[string]bool)
 	for _, name := range []string{"plugin.toml", "service.luau", "panel.luau", filepath.Join("translations", "en.json")} {
