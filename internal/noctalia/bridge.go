@@ -66,7 +66,6 @@ type promptBridge struct {
 	responseSlot            KeyringResponse
 	responseError           error
 	responseReservationHook func()
-	waiterStartHook         func()
 	waiterActive            bool
 	pendingResult           *resultDelivery
 	pendingReady            chan struct{}
@@ -541,12 +540,6 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 		return KeyringResponse{}, ErrProtocolError
 	}
 	b.waiterActive = true
-	hook := b.waiterStartHook
-	b.mu.Unlock()
-	if hook != nil {
-		hook()
-	}
-	b.mu.Lock()
 	defer func() {
 		b.mu.Lock()
 		b.waiterActive = false
