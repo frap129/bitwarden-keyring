@@ -117,6 +117,57 @@ type gatedRequestBody struct {
 	once    sync.Once
 }
 
+type manualBridgeTimer struct {
+	channel  chan time.Time
+	created  chan struct{}
+	stopped  chan struct{}
+	stopOnce sync.Once
+}
+
+func newManualBridgeTimer() *manualBridgeTimer {
+	return &manualBridgeTimer{channel: make(chan time.Time, 1), created: make(chan struct{}), stopped: make(chan struct{})}
+}
+
+func (timer *manualBridgeTimer) fire() {
+	timer.channel <- time.Time{}
+}
+
+func (timer *manualBridgeTimer) stop() bool {
+	timer.stopOnce.Do(func() { close(timer.stopped) })
+	return true
+}
+
+func installManualBridgeTimer(bridge *promptBridge) *manualBridgeTimer {
+	timer := newManualBridgeTimer()
+	bridge.timerFactory = func(time.Duration) bridgeTimer {
+		close(timer.created)
+		return bridgeTimer{channel: timer.channel, stop: timer.stop}
+	}
+	return timer
+}
+
+func waitForResponseWaiter(t *testing.T, bridge *promptBridge) {
+	t.Helper()
+	bridge.mu.Lock()
+	if bridge.waiterActive {
+		bridge.mu.Unlock()
+		return
+	}
+	ready := bridge.waiterReady
+	bridge.mu.Unlock()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response waiter")
+	}
+}
+
+type errorBridgeFile struct {
+	err error
+}
+
+func (file errorBridgeFile) Close() error { return file.err }
+
 func newGatedRequestBody(contents []byte) *gatedRequestBody {
 	return &gatedRequestBody{
 		reader:  bytes.NewReader(contents),
@@ -566,9 +617,11 @@ func TestPromptBridgeReservationWinsCancellationWithHook(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	reserved := make(chan struct{})
 	release := make(chan struct{})
-	bridge.responseReservationHook = func() {
-		close(reserved)
-		<-release
+	bridge.responseReservationHook = func(phase responseReservationPhase) {
+		if phase == responseReservationAfter {
+			close(reserved)
+			<-release
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	waitDone := make(chan KeyringResponse, 1)
@@ -634,10 +687,20 @@ func TestPromptBridgeReservationWinsCloseWithHook(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	reserved := make(chan struct{})
 	release := make(chan struct{})
-	bridge.responseReservationHook = func() {
-		close(reserved)
-		<-release
+	bridge.responseReservationHook = func(phase responseReservationPhase) {
+		if phase == responseReservationAfter {
+			close(reserved)
+			<-release
+		}
 	}
+	waitDone := make(chan KeyringResponse, 1)
+	waitErr := make(chan error, 1)
+	go func() {
+		response, err := bridge.waitResponse(context.Background(), time.Second)
+		waitDone <- response
+		waitErr <- err
+	}()
+	waitForResponseWaiter(t, bridge)
 	response := testKeyringResponse(bridge, ResultOK, "password")
 	contents, err := json.Marshal(response)
 	if err != nil {
@@ -668,8 +731,129 @@ func TestPromptBridgeReservationWinsCloseWithHook(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for response handler")
 	}
-	if got, err := bridge.waitResponse(context.Background(), time.Second); err != nil || got != response {
-		t.Errorf("waitResponse() = %#v, %v, want reserved response", got, err)
+	if got := <-waitDone; got != response {
+		t.Errorf("waitResponse() = %#v, want %#v", got, response)
+	}
+	if err := <-waitErr; err != nil {
+		t.Errorf("waitResponse() error = %v, want nil", err)
+	}
+}
+
+func TestPromptBridgeTimeoutBeforeResponseReservationRejectsResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	timer := installManualBridgeTimer(bridge)
+	beforeReservation := make(chan struct{})
+	releaseReservation := make(chan struct{})
+	bridge.responseReservationHook = func(phase responseReservationPhase) {
+		if phase == responseReservationBefore {
+			close(beforeReservation)
+			<-releaseReservation
+		}
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := bridge.waitResponse(context.Background(), time.Hour)
+		waitDone <- err
+	}()
+	waitForResponseWaiter(t, bridge)
+	select {
+	case <-timer.created:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response timer")
+	}
+
+	handlerDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", encodeBridgeResponse(t, testKeyringResponse(bridge, ResultOK, "password")))
+		request.Header.Set("Content-Type", "application/json")
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		handlerDone <- recorder.Code
+	}()
+	select {
+	case <-beforeReservation:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting before response reservation")
+	}
+	timer.fire()
+	if err := <-waitDone; !errors.Is(err, ErrTimeout) {
+		t.Fatalf("waitResponse() error = %v, want ErrTimeout", err)
+	}
+	select {
+	case <-timer.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("response timer was not stopped")
+	}
+	close(releaseReservation)
+	if status := <-handlerDone; status == http.StatusAccepted {
+		t.Errorf("response status = %d, want non-202", status)
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.responseState != responseStateTerminal || bridge.responseSlot != (KeyringResponse{}) {
+		t.Errorf("timed out response state = %v slot=%#v", bridge.responseState, bridge.responseSlot)
+	}
+}
+
+func TestPromptBridgeResponseReservationBeforeTimeoutDeliversResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	timer := installManualBridgeTimer(bridge)
+	afterReservation := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	bridge.responseReservationHook = func(phase responseReservationPhase) {
+		if phase == responseReservationAfter {
+			close(afterReservation)
+			<-releaseHandler
+		}
+	}
+	want := testKeyringResponse(bridge, ResultOK, "password")
+	waitDone := make(chan KeyringResponse, 1)
+	waitErr := make(chan error, 1)
+	go func() {
+		response, err := bridge.waitResponse(context.Background(), time.Hour)
+		waitDone <- response
+		waitErr <- err
+	}()
+	waitForResponseWaiter(t, bridge)
+	select {
+	case <-timer.created:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response timer")
+	}
+
+	handlerDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", encodeBridgeResponse(t, want))
+		request.Header.Set("Content-Type", "application/json")
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		handlerDone <- recorder.Code
+	}()
+	select {
+	case <-afterReservation:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting after response reservation")
+	}
+	timer.fire()
+	if got := <-waitDone; got != want {
+		t.Errorf("waitResponse() = %#v, want %#v", got, want)
+	}
+	if err := <-waitErr; err != nil {
+		t.Errorf("waitResponse() error = %v, want nil", err)
+	}
+	select {
+	case <-timer.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("response timer was not stopped")
+	}
+	close(releaseHandler)
+	if status := <-handlerDone; status != http.StatusAccepted {
+		t.Errorf("response status = %d, want %d", status, http.StatusAccepted)
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.responseState != responseStateConsumed || bridge.responseSlot != (KeyringResponse{}) {
+		t.Errorf("delivered response state = %v slot=%#v", bridge.responseState, bridge.responseSlot)
 	}
 }
 
@@ -885,6 +1069,29 @@ func TestPromptBridgeCloseReportsFirstCleanupError(t *testing.T) {
 	secondErr := bridge.Close()
 	if secondErr == nil || secondErr.Error() != firstErr.Error() {
 		t.Errorf("second Close() error = %v, want first error %v", secondErr, firstErr)
+	}
+}
+
+func TestPromptBridgeCleanupErrorsPreserveAllCauses(t *testing.T) {
+	firstSentinel := errors.New("first injected cleanup failure")
+	secondSentinel := errors.New("second injected cleanup failure")
+	closeErr := firstBridgeCloseError(nil, closeBridgeFile(errorBridgeFile{err: firstSentinel}))
+	closeErr = firstBridgeCloseError(closeErr, secondSentinel)
+	if !errors.Is(closeErr, errBridgeCleanup) {
+		t.Errorf("cleanup error = %v, want errBridgeCleanup", closeErr)
+	}
+	for _, sentinel := range []error{firstSentinel, secondSentinel} {
+		if !errors.Is(closeErr, sentinel) {
+			t.Errorf("cleanup error = %v, want sentinel %v", closeErr, sentinel)
+		}
+	}
+
+	descriptorSentinel := errors.New("injected descriptor cleanup failure")
+	descriptorErr := cleanupBridgeDescriptorWithStat(-1, nil, "descriptor", func(int, string) (os.FileInfo, error) {
+		return nil, descriptorSentinel
+	})
+	if !errors.Is(descriptorErr, errBridgeCleanup) || !errors.Is(descriptorErr, descriptorSentinel) {
+		t.Errorf("descriptor cleanup error = %v, want cleanup and sentinel causes", descriptorErr)
 	}
 }
 
@@ -1186,7 +1393,7 @@ func TestPromptBridgeWaitResponseCancellationTimeoutAndClose(t *testing.T) {
 	}
 }
 
-func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToCancellation(t *testing.T) {
+func TestPromptBridgeWaitResponseCancelledContextReturnsCancelled(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1195,7 +1402,7 @@ func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToCancellation(t *tes
 	}
 }
 
-func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToClose(t *testing.T) {
+func TestPromptBridgeWaitResponseAfterCloseReturnsSessionClosed(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -1218,13 +1425,23 @@ func TestPromptBridgeTerminalWaitDoesNotConsumeLateResponse(t *testing.T) {
 	}
 }
 
-func TestPromptBridgeResponseReservationWinsClose(t *testing.T) {
+func TestPromptBridgeCloseDiscardsReservedResponseWithoutWaiter(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	response := testKeyringResponse(bridge, ResultOK, "password")
-	reply := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, response))
-	reply.Body.Close()
-	if reply.StatusCode != http.StatusAccepted {
-		t.Fatalf("response status = %d, want %d", reply.StatusCode, http.StatusAccepted)
+	contents, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replyDone := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		request := newAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", bytes.NewReader(contents))
+		request.Header.Set("Content-Type", "application/json")
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		replyDone <- recorder.Code
+	}()
+	if status := <-replyDone; status != http.StatusAccepted {
+		t.Fatalf("response status = %d, want 202", status)
 	}
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -1233,12 +1450,39 @@ func TestPromptBridgeResponseReservationWinsClose(t *testing.T) {
 	stateBeforeWait := bridge.responseState
 	slotBeforeWait := bridge.responseSlot
 	bridge.mu.Unlock()
-	got, err := bridge.waitResponse(context.Background(), time.Second)
-	if err != nil {
-		t.Fatalf("waitResponse() error = %v, want response (state=%v slot=%#v)", err, stateBeforeWait, slotBeforeWait)
+	if _, err := bridge.waitResponse(context.Background(), time.Second); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("waitResponse() error = %v, want ErrSessionClosed (state=%v slot=%#v)", err, stateBeforeWait, slotBeforeWait)
 	}
-	if got != response {
-		t.Errorf("waitResponse() = %#v, want %#v", got, response)
+	bridge.mu.Lock()
+	if bridge.responseSlot != (KeyringResponse{}) || bridge.responseState != responseStateTerminal {
+		t.Errorf("closed reserved response state = %v slot=%#v", bridge.responseState, bridge.responseSlot)
+	}
+	bridge.mu.Unlock()
+}
+
+func TestPromptBridgeTerminalResultCanOnlyBeDeliveredOnce(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	consumeResponseForResult(t, bridge)
+	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
+	resultDone := make(chan error, 1)
+	go func() { resultDone <- bridge.sendResult(context.Background(), result) }()
+	waitForPendingResult(t, bridge)
+
+	response := doAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, "", nil)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("terminal result status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if err := <-resultDone; err != nil {
+		t.Fatalf("sendResult() error = %v", err)
+	}
+	if err := bridge.sendResult(context.Background(), result); !errors.Is(err, ErrProtocolError) {
+		t.Errorf("second sendResult() error = %v, want ErrProtocolError", err)
+	}
+	response = doAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, "", nil)
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Errorf("result after terminal delivery status = %d, want %d", response.StatusCode, http.StatusNoContent)
 	}
 }
 

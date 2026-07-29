@@ -26,11 +26,18 @@ const bridgeBodyLimit = 64 << 10
 
 type responseState uint8
 
+type responseReservationPhase uint8
+
 const (
 	responseStateAccepting responseState = iota
 	responseStateReserved
 	responseStateConsumed
 	responseStateTerminal
+)
+
+const (
+	responseReservationBefore responseReservationPhase = iota
+	responseReservationAfter
 )
 
 type bridgeTimer struct {
@@ -75,8 +82,9 @@ type promptBridge struct {
 	responseState           responseState
 	responseSlot            KeyringResponse
 	responseError           error
-	responseReservationHook func()
+	responseReservationHook func(responseReservationPhase)
 	waiterActive            bool
+	waiterReady             chan struct{}
 	pendingResult           *resultDelivery
 	pendingReady            chan struct{}
 	timerFactory            func(time.Duration) bridgeTimer
@@ -184,7 +192,7 @@ func newPromptBridgeWithDescriptorWriter(request KeyringRequest, descriptorWrite
 	// returns to the caller that invokes the plugin CLI.
 	if err := descriptorWriter(descriptorFile, descriptor); err != nil {
 		cleanupErr := cleanupBridgeDescriptor(directoryFile, descriptorFile, descriptorName)
-		cleanupErr = errors.Join(cleanupErr, closeBridgeFile(descriptorFile), listener.Close(), closeBridgeFile(directoryFile))
+		cleanupErr = errors.Join(cleanupErr, closeBridgeFile(descriptorFile), bridgeCleanupError(listener.Close()), closeBridgeFile(directoryFile))
 		return nil, fmt.Errorf("write prompt bridge descriptor: %w", errors.Join(err, cleanupErr))
 	}
 
@@ -198,6 +206,7 @@ func newPromptBridgeWithDescriptorWriter(request KeyringRequest, descriptorWrite
 		responseNotify: make(chan struct{}),
 		done:           make(chan struct{}),
 		responseState:  responseStateAccepting,
+		waiterReady:    make(chan struct{}),
 		pendingReady:   make(chan struct{}),
 		timerFactory:   newBridgeTimer,
 	}
@@ -397,6 +406,9 @@ func (b *promptBridge) handleResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if hook := b.responseReservationHook; hook != nil {
+		hook(responseReservationBefore)
+	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
@@ -419,7 +431,7 @@ func (b *promptBridge) handleResponse(w http.ResponseWriter, r *http.Request) {
 	close(b.responseNotify)
 	b.mu.Unlock()
 	if hook != nil {
-		hook()
+		hook(responseReservationAfter)
 	}
 	writeBridgeStatus(w, http.StatusAccepted)
 }
@@ -553,6 +565,9 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 		return KeyringResponse{}, ErrProtocolError
 	}
 	b.waiterActive = true
+	waiterReady := b.waiterReady
+	b.waiterReady = make(chan struct{})
+	close(waiterReady)
 	defer func() {
 		b.mu.Lock()
 		b.waiterActive = false
@@ -759,7 +774,7 @@ func (b *promptBridge) finishDelivery(delivery *resultDelivery, err error, allow
 	b.pendingResult = nil
 	delivery.completed = true
 	delivery.err = err
-	if err != nil {
+	if err != nil || !allowRetry {
 		b.resultTerminal = true
 	}
 	if allowRetry && err == nil && !b.closed && b.responseState == responseStateConsumed {
@@ -781,8 +796,12 @@ func (b *promptBridge) Close() error {
 			b.pendingResult = nil
 			b.resultTerminal = true
 		}
-		if b.responseState == responseStateReserved {
+		if b.responseState == responseStateReserved && b.waiterActive {
 			// The active waiter owns this reserved response and may consume it.
+		} else if b.responseState == responseStateReserved {
+			b.responseState = responseStateTerminal
+			b.responseError = ErrSessionClosed
+			b.responseSlot = KeyringResponse{}
 		} else if b.responseState == responseStateAccepting {
 			b.responseState = responseStateTerminal
 			b.responseError = ErrSessionClosed
@@ -818,15 +837,26 @@ func firstBridgeCloseError(first, err error) error {
 	return errors.Join(first, wrapped)
 }
 
-func closeBridgeFile(file *os.File) error {
+func closeBridgeFile(file io.Closer) error {
 	if err := file.Close(); err != nil {
 		return errors.Join(errBridgeCleanup, err)
 	}
 	return nil
 }
 
+func bridgeCleanupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.Join(errBridgeCleanup, err)
+}
+
 func cleanupBridgeDescriptor(directoryFile, descriptorFile *os.File, name string) error {
-	pathInfo, err := fstatatInfo(int(directoryFile.Fd()), name)
+	return cleanupBridgeDescriptorWithStat(int(directoryFile.Fd()), descriptorFile, name, fstatatInfo)
+}
+
+func cleanupBridgeDescriptorWithStat(directoryFD int, descriptorFile *os.File, name string, statDescriptor func(int, string) (os.FileInfo, error)) error {
+	pathInfo, err := statDescriptor(directoryFD, name)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
 			return nil
@@ -840,7 +870,7 @@ func cleanupBridgeDescriptor(directoryFile, descriptorFile *os.File, name string
 	if !os.SameFile(pathInfo, fileInfo) {
 		return nil
 	}
-	if err := unix.Unlinkat(int(directoryFile.Fd()), name, 0); err != nil {
+	if err := unix.Unlinkat(directoryFD, name, 0); err != nil {
 		return errors.Join(errBridgeCleanup, err)
 	}
 	return nil
