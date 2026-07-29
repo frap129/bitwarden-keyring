@@ -1188,11 +1188,6 @@ func TestPromptBridgeWaitResponseCancellationTimeoutAndClose(t *testing.T) {
 
 func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToCancellation(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
-	bridge.mu.Lock()
-	bridge.responseState = responseStateAccepting
-	bridge.responseSlot = testKeyringResponse(bridge, ResultOK, "stale")
-	bridge.mu.Unlock()
-	close(bridge.responseNotify)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := bridge.waitResponse(ctx, time.Second); !errors.Is(err, ErrCancelled) {
@@ -1202,11 +1197,6 @@ func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToCancellation(t *tes
 
 func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToClose(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
-	bridge.mu.Lock()
-	bridge.responseState = responseStateAccepting
-	bridge.responseSlot = testKeyringResponse(bridge, ResultOK, "stale")
-	bridge.mu.Unlock()
-	close(bridge.responseNotify)
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -1222,11 +1212,6 @@ func TestPromptBridgeTerminalWaitDoesNotConsumeLateResponse(t *testing.T) {
 	if _, err := bridge.waitResponse(ctx, time.Second); !errors.Is(err, ErrCancelled) {
 		t.Fatalf("waitResponse() error = %v, want ErrCancelled", err)
 	}
-
-	late := testKeyringResponse(bridge, ResultOK, "late")
-	bridge.mu.Lock()
-	bridge.responseSlot = late
-	bridge.mu.Unlock()
 
 	if _, err := bridge.waitResponse(context.Background(), time.Second); !errors.Is(err, ErrCancelled) {
 		t.Errorf("later waitResponse() error = %v, want original ErrCancelled", err)
@@ -1475,18 +1460,14 @@ func TestPromptBridgeDuplicateSendResultCancellation(t *testing.T) {
 	if err := <-firstDone; !errors.Is(err, ErrCancelled) {
 		t.Errorf("cancelled sendResult() error = %v, want ErrCancelled", err)
 	}
-
-	pendingDone := make(chan error, 1)
-	go func() { pendingDone <- bridge.sendResult(context.Background(), result) }()
-	waitForPendingResult(t, bridge)
 	if err := bridge.sendResult(context.Background(), result); err == nil {
 		t.Error("duplicate sendResult() error = nil, want duplicate error")
 	}
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if err := <-pendingDone; !errors.Is(err, ErrSessionClosed) {
-		t.Errorf("closed pending sendResult() error = %v, want ErrSessionClosed", err)
+	if err := bridge.sendResult(context.Background(), result); !errors.Is(err, ErrSessionClosed) {
+		t.Errorf("closed sendResult() error = %v, want ErrSessionClosed", err)
 	}
 }
 

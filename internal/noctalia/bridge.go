@@ -33,6 +33,16 @@ const (
 	responseStateTerminal
 )
 
+type bridgeTimer struct {
+	channel <-chan time.Time
+	stop    func() bool
+}
+
+func newBridgeTimer(timeout time.Duration) bridgeTimer {
+	timer := time.NewTimer(timeout)
+	return bridgeTimer{channel: timer.C, stop: timer.Stop}
+}
+
 type bridgeDescriptor struct {
 	Version   int    `json:"version"`
 	RequestID string `json:"request_id"`
@@ -69,6 +79,8 @@ type promptBridge struct {
 	waiterActive            bool
 	pendingResult           *resultDelivery
 	pendingReady            chan struct{}
+	timerFactory            func(time.Duration) bridgeTimer
+	resultTerminal          bool
 	closeErr                error
 }
 
@@ -187,6 +199,7 @@ func newPromptBridgeWithDescriptorWriter(request KeyringRequest, descriptorWrite
 		done:           make(chan struct{}),
 		responseState:  responseStateAccepting,
 		pendingReady:   make(chan struct{}),
+		timerFactory:   newBridgeTimer,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/request", bridge.handleRequest)
@@ -575,10 +588,10 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 	notify := b.responseNotify
 	b.mu.Unlock()
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	timer := b.timerFactory(timeout)
+	defer timer.stop()
 	ctxDone := ctx.Done()
-	timerDone := timer.C
+	timerDone := timer.channel
 	bridgeDone := b.done
 	for {
 		select {
@@ -694,7 +707,7 @@ func (b *promptBridge) sendResult(ctx context.Context, result KeyringResult) err
 		b.mu.Unlock()
 		return ErrSessionClosed
 	}
-	if b.responseState != responseStateConsumed {
+	if b.responseState != responseStateConsumed || b.resultTerminal {
 		b.mu.Unlock()
 		return ErrProtocolError
 	}
@@ -725,6 +738,7 @@ func (b *promptBridge) abandonDelivery(delivery *resultDelivery, err error) erro
 		b.pendingResult = nil
 		delivery.completed = true
 		delivery.err = err
+		b.resultTerminal = true
 		b.mu.Unlock()
 		return err
 	}
@@ -745,6 +759,9 @@ func (b *promptBridge) finishDelivery(delivery *resultDelivery, err error, allow
 	b.pendingResult = nil
 	delivery.completed = true
 	delivery.err = err
+	if err != nil {
+		b.resultTerminal = true
+	}
 	if allowRetry && err == nil && !b.closed && b.responseState == responseStateConsumed {
 		b.responseState = responseStateAccepting
 		b.responseNotify = make(chan struct{})
@@ -762,6 +779,7 @@ func (b *promptBridge) Close() error {
 			delivery.completed = true
 			delivery.err = ErrSessionClosed
 			b.pendingResult = nil
+			b.resultTerminal = true
 		}
 		if b.responseState == responseStateReserved {
 			// The active waiter owns this reserved response and may consume it.
