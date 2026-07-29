@@ -224,6 +224,21 @@ func ensureBridgeDirectory(path string) (os.FileInfo, bool, error) {
 		return nil, false, errors.New("path is not a directory")
 	}
 	if created {
+		if err := os.Chmod(path, 0700); err != nil {
+			return nil, false, err
+		}
+		info, err = os.Lstat(path)
+		if err != nil {
+			return nil, false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return nil, false, errors.New("child directory changed during setup")
+		}
+	}
+	if info.Mode().Perm() != 0700 {
+		return nil, false, errors.New("directory mode is not 0700")
+	}
+	if created {
 		if err := validateBridgeOwnership(info); err != nil {
 			return nil, false, err
 		}
@@ -575,6 +590,7 @@ func (b *promptBridge) abandonDelivery(delivery *resultDelivery, err error) erro
 	if b.pendingResult == delivery && !delivery.abandoned {
 		delivery.abandoned = true
 		b.pendingResult = nil
+		b.acceptResponse = false
 		b.mu.Unlock()
 		return err
 	}
@@ -632,17 +648,34 @@ func (b *promptBridge) Close() error {
 }
 
 func cleanupBridgeDescriptor(directoryFile, descriptorFile *os.File, name string) {
-	var pathStat unix.Stat_t
-	if err := unix.Fstatat(int(directoryFile.Fd()), name, &pathStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	pathInfo, err := fstatatInfo(int(directoryFile.Fd()), name)
+	if err != nil {
 		return
 	}
 	fileInfo, err := descriptorFile.Stat()
 	if err != nil {
 		return
 	}
-	fileStat, ok := fileInfo.Sys().(*syscall.Stat_t)
-	if !ok || fileStat.Dev != pathStat.Dev || fileStat.Ino != pathStat.Ino {
+	if !os.SameFile(pathInfo, fileInfo) {
 		return
 	}
 	_ = unix.Unlinkat(int(directoryFile.Fd()), name, 0)
+}
+
+func fstatatInfo(directoryFD int, name string) (os.FileInfo, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(directoryFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return nil, err
+	}
+	fd, err := unix.Openat(directoryFD, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("open descriptor for identity comparison: failed to wrap file")
+	}
+	defer file.Close()
+	return file.Stat()
 }

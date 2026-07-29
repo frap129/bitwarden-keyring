@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -235,6 +236,95 @@ func TestPromptBridgeDescriptorRejectsInvalidRuntimeDirectory(t *testing.T) {
 	}
 }
 
+func TestPromptBridgeDescriptorCreatesChildWithExactMode(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	childInfo, err := os.Stat(filepath.Dir(bridge.descriptor))
+	if err != nil {
+		t.Fatalf("stat child directory: %v", err)
+	}
+	if childInfo.Mode().Perm() != 0700 {
+		t.Errorf("child directory mode = %04o, want 0700", childInfo.Mode().Perm())
+	}
+}
+
+func TestPromptBridgeDescriptorRejectsInvalidChildPaths(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, child string)
+	}{
+		{
+			name: "non-directory",
+			setup: func(t *testing.T, child string) {
+				if err := os.WriteFile(child, []byte("not a directory"), 0600); err != nil {
+					t.Fatalf("write child path: %v", err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			setup: func(t *testing.T, child string) {
+				realChild := child + "-real"
+				if err := os.Mkdir(realChild, 0700); err != nil {
+					t.Fatalf("mkdir real child: %v", err)
+				}
+				if err := os.Symlink(realChild, child); err != nil {
+					t.Fatalf("symlink child: %v", err)
+				}
+			},
+		},
+		{
+			name: "wrong-mode",
+			setup: func(t *testing.T, child string) {
+				if err := os.Mkdir(child, 0755); err != nil {
+					t.Fatalf("mkdir child: %v", err)
+				}
+				if err := os.Chmod(child, 0755); err != nil {
+					t.Fatalf("chmod child: %v", err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtimeDir := t.TempDir()
+			if err := os.Chmod(runtimeDir, 0700); err != nil {
+				t.Fatalf("chmod runtime directory: %v", err)
+			}
+			child := filepath.Join(runtimeDir, "bitwarden-keyring")
+			test.setup(t, child)
+			t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+			if _, err := newPromptBridge(testPromptRequest()); err == nil {
+				t.Error("newPromptBridge() error = nil, want invalid child path error")
+			}
+		})
+	}
+}
+
+func TestPromptBridgeDescriptorRejectsWrongOwnerChild(t *testing.T) {
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(runtimeDir, 0700); err != nil {
+		t.Fatalf("chmod runtime directory: %v", err)
+	}
+	child := filepath.Join(runtimeDir, "bitwarden-keyring")
+	if err := os.Mkdir(child, 0700); err != nil {
+		t.Fatalf("mkdir child: %v", err)
+	}
+	otherUID := os.Getuid() + 1
+	if otherUID == os.Getuid() {
+		otherUID = os.Getuid() - 1
+	}
+	if err := os.Chown(child, otherUID, -1); err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+			t.Skipf("changing child owner requires unavailable privilege or platform support: %v", err)
+		}
+		t.Fatalf("chown child: %v", err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	if _, err := newPromptBridge(testPromptRequest()); err == nil {
+		t.Error("newPromptBridge() error = nil, want wrong owner error")
+	}
+}
+
 func TestPromptBridgeDescriptorRejectsSymlinkedRuntime(t *testing.T) {
 	root := t.TempDir()
 	realRuntime := filepath.Join(root, "real-runtime")
@@ -403,6 +493,17 @@ func TestPromptBridgeRequestReturnsRequestOnlyWithBearerToken(t *testing.T) {
 func TestPromptBridgeCloseIsIdempotentAndRemovesDescriptor(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	descriptor := bridge.descriptor
+	pathInfo, err := fstatatInfo(int(bridge.directoryFile.Fd()), filepath.Base(descriptor))
+	if err != nil {
+		t.Fatalf("fstatat descriptor: %v", err)
+	}
+	descriptorInfo, err := bridge.descriptorFile.Stat()
+	if err != nil {
+		t.Fatalf("stat retained descriptor: %v", err)
+	}
+	if !os.SameFile(pathInfo, descriptorInfo) {
+		t.Error("nofollow descriptor info does not match retained descriptor")
+	}
 
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("first Close() error = %v", err)
@@ -705,6 +806,118 @@ func TestPromptBridgeWaitResponseCancellationTimeoutAndClose(t *testing.T) {
 	bridge.server.Handler.ServeHTTP(recorder, unauthorized)
 	if recorder.Code != http.StatusNotFound {
 		t.Errorf("closed unauthorized request status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+}
+
+func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToCancellation(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	bridge.responses <- testKeyringResponse(bridge, ResultOK, "stale")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := bridge.waitResponse(ctx, time.Second); !errors.Is(err, ErrCancelled) {
+		t.Errorf("stale response wait error = %v, want ErrCancelled", err)
+	}
+}
+
+func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToClose(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	bridge.responses <- testKeyringResponse(bridge, ResultOK, "stale")
+	if err := bridge.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := bridge.waitResponse(context.Background(), time.Second); !errors.Is(err, ErrSessionClosed) {
+		t.Errorf("stale response after close error = %v, want ErrSessionClosed", err)
+	}
+}
+
+func TestPromptBridgeResultFinalizationOrdering(t *testing.T) {
+	t.Run("finalize first", func(t *testing.T) {
+		bridge := newTestPromptBridge(t, testPromptRequest())
+		result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
+		resultDone := make(chan error, 1)
+		go func() { resultDone <- bridge.sendResult(context.Background(), result) }()
+		waitForPendingResult(t, bridge)
+
+		request := newAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, nil)
+		recorder := httptest.NewRecorder()
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		if err := <-resultDone; err != nil {
+			t.Errorf("finalized sendResult() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("abandon first", func(t *testing.T) {
+		bridge := newTestPromptBridge(t, testPromptRequest())
+		result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
+		ctx, cancel := context.WithCancel(context.Background())
+		resultDone := make(chan error, 1)
+		go func() { resultDone <- bridge.sendResult(ctx, result) }()
+		waitForPendingResult(t, bridge)
+		cancel()
+		if err := <-resultDone; !errors.Is(err, ErrCancelled) {
+			t.Fatalf("abandoned sendResult() error = %v, want ErrCancelled", err)
+		}
+
+		request := newAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, nil)
+		recorder := httptest.NewRecorder()
+		bridge.server.Handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusNoContent {
+			t.Errorf("late result status = %d, want %d", recorder.Code, http.StatusNoContent)
+		}
+	})
+}
+
+func TestPromptBridgeLateResultWriterCannotMutateAbandonedState(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Success: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	resultDone := make(chan error, 1)
+	go func() { resultDone <- bridge.sendResult(ctx, result) }()
+	waitForPendingResult(t, bridge)
+	cancel()
+	if err := <-resultDone; !errors.Is(err, ErrCancelled) {
+		t.Fatalf("abandoned sendResult() error = %v, want ErrCancelled", err)
+	}
+
+	request := newAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, nil)
+	response := httptest.NewRecorder()
+	bridge.server.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Errorf("late result status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.pendingResult != nil || bridge.acceptResponse {
+		t.Errorf("late writer mutated bridge state: pending=%v accept=%v", bridge.pendingResult, bridge.acceptResponse)
+	}
+}
+
+func TestPromptBridgeRetryEnablesExactlyOneResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	result := KeyringResult{Type: MessageTypeResult, ID: bridge.request.Cookie, Retry: true}
+	resultDone := make(chan error, 1)
+	go func() { resultDone <- bridge.sendResult(context.Background(), result) }()
+	waitForPendingResult(t, bridge)
+	request := newAuthorizedBridgeRequest(t, bridge, http.MethodGet, "/v1/result?id="+bridge.request.Cookie, nil)
+	recorder := httptest.NewRecorder()
+	bridge.server.Handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("retry result status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if err := <-resultDone; err != nil {
+		t.Fatalf("retry sendResult() error = %v", err)
+	}
+
+	response := testKeyringResponse(bridge, ResultOK, "retry")
+	first := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, response))
+	first.Body.Close()
+	second := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, response))
+	second.Body.Close()
+	if first.StatusCode != http.StatusAccepted || second.StatusCode != http.StatusConflict {
+		t.Errorf("retry response statuses = %d, %d, want 202, 409", first.StatusCode, second.StatusCode)
+	}
+	if _, err := bridge.waitResponse(context.Background(), time.Second); err != nil {
+		t.Fatalf("wait retry response: %v", err)
 	}
 }
 
