@@ -1,182 +1,99 @@
 package noctalia
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"os"
-	"path/filepath"
+	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 )
 
 const (
-	// DefaultSocketName is the default socket filename for the Noctalia Quickshell plugin
-	DefaultSocketName = "noctalia-keyring.sock"
-
-	// DefaultTimeout is the default timeout for password prompts (2 minutes)
+	// DefaultExecutable is the Noctalia v5 command-line executable.
+	DefaultExecutable = "noctalia"
+	// DefaultPluginEntry is the Noctalia v5 plugin entry point.
+	DefaultPluginEntry = "frap129/noctalia-bitwarden-keyring:service"
+	// DefaultTimeout is the default timeout for Noctalia v5 password prompts.
 	DefaultTimeout = 120 * time.Second
-
-	// connectTimeout is the timeout for establishing the socket connection
-	connectTimeout = 5 * time.Second
+	commandTimeout = 5 * time.Second
 )
 
-// Client provides IPC communication with the Noctalia Quickshell plugin
+// CommandRunner runs a Noctalia v5 command.
+type CommandRunner func(context.Context, string, ...string) error
+
+// Client provides Noctalia v5 prompt communication.
 type Client struct {
-	socketPath string
-	timeout    time.Duration
+	executable  string
+	pluginEntry string
+	timeout     time.Duration
+	run         CommandRunner
 }
 
-// Option configures a Client
+// Option configures a Client.
 type Option func(*Client)
 
-// WithSocketPath sets a custom socket path
-func WithSocketPath(path string) Option {
-	return func(c *Client) {
-		c.socketPath = path
-	}
-}
-
-// WithTimeout sets a custom timeout for password prompts
-func WithTimeout(timeout time.Duration) Option {
-	return func(c *Client) {
-		c.timeout = timeout
-	}
-}
-
-// NewClient creates a new Noctalia IPC client
-func NewClient(opts ...Option) *Client {
-	c := &Client{
-		socketPath: defaultSocketPath(),
-		timeout:    DefaultTimeout,
-	}
-
-	for _, opt := range opts {
-		opt(c)
-	}
-
-	return c
-}
-
-// defaultSocketPath returns the default socket path based on XDG_RUNTIME_DIR
-func defaultSocketPath() string {
-	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runtimeDir == "" {
-		// Fallback to /run/user/<uid>
-		runtimeDir = filepath.Join("/run/user", fmt.Sprintf("%d", os.Getuid()))
-	}
-	return filepath.Join(runtimeDir, DefaultSocketName)
-}
-
-// IsAvailable checks if the Noctalia agent socket exists and is accessible
-func (c *Client) IsAvailable() bool {
-	return c.ValidateSocket() == nil
-}
-
-// ValidateSocket validates that the socket exists and has secure permissions.
-// It checks:
-// - Socket is not a symbolic link
-// - Path is actually a socket
-// - Socket is owned by the current user
-// - Socket is not group or world writable
-// - Parent directory is owned by current user and not group/world writable
-func (c *Client) ValidateSocket() error {
-	// Use Lstat to detect symlinks (doesn't follow them)
-	info, err := os.Lstat(c.socketPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ErrSocketNotFound
+// WithCommandRunner replaces the command runner, primarily for testing.
+func WithCommandRunner(run CommandRunner) Option {
+	return func(client *Client) {
+		if run != nil {
+			client.run = run
 		}
-		return fmt.Errorf("failed to stat socket: %w", err)
 	}
-
-	// Reject symbolic links
-	if info.Mode()&os.ModeSymlink != 0 {
-		return ErrSocketSymlink
-	}
-
-	// Verify it's actually a socket
-	if info.Mode()&os.ModeSocket == 0 {
-		return ErrSocketNotSocket
-	}
-
-	// Get the underlying syscall stat to check UID
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("failed to get socket stat info")
-	}
-
-	// Verify socket is owned by current user
-	currentUID := uint32(os.Getuid())
-	if stat.Uid != currentUID {
-		return ErrSocketOwner
-	}
-
-	// Check socket permissions - reject group or world writable
-	mode := info.Mode().Perm()
-	if mode&0022 != 0 { // Check group-write (020) and world-write (002) bits
-		return ErrSocketPermissions
-	}
-
-	// Validate parent directory
-	parentDir := filepath.Dir(c.socketPath)
-	parentInfo, err := os.Lstat(parentDir)
-	if err != nil {
-		return fmt.Errorf("failed to stat parent directory: %w", err)
-	}
-
-	// Get parent directory stat
-	parentStat, ok := parentInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("failed to get parent directory stat info")
-	}
-
-	// Verify parent directory is owned by current user
-	if parentStat.Uid != currentUID {
-		return ErrSocketParentOwner
-	}
-
-	// Check parent directory permissions - reject group or world writable
-	parentMode := parentInfo.Mode().Perm()
-	if parentMode&0022 != 0 {
-		return ErrSocketParentPerms
-	}
-
-	return nil
 }
 
-// SocketPath returns the configured socket path
-func (c *Client) SocketPath() string {
-	return c.socketPath
+// WithSocketPath is retained temporarily for internal/bitwarden compatibility.
+func WithSocketPath(string) Option {
+	return func(*Client) {}
 }
 
-// PasswordSession represents an active password prompt session with the Noctalia plugin.
-// It keeps the connection open to enable two-phase communication for password retry support.
+// WithTimeout sets the timeout for Noctalia v5 password prompts.
+func WithTimeout(timeout time.Duration) Option {
+	return func(client *Client) {
+		client.timeout = timeout
+	}
+}
+
+// NewClient creates a Noctalia v5 client.
+func NewClient(opts ...Option) *Client {
+	client := &Client{
+		executable:  DefaultExecutable,
+		pluginEntry: DefaultPluginEntry,
+		timeout:     DefaultTimeout,
+		run: func(ctx context.Context, name string, args ...string) error {
+			return exec.CommandContext(ctx, name, args...).Run()
+		},
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(client)
+		}
+	}
+	if client.timeout <= 0 {
+		client.timeout = DefaultTimeout
+	}
+	return client
+}
+
+// IsAvailable is retained temporarily for internal/bitwarden compatibility.
+func (c *Client) IsAvailable() bool {
+	return true
+}
+
+// PasswordSession represents an authenticated Noctalia v5 prompt bridge.
 type PasswordSession struct {
-	conn   net.Conn
-	cookie string
-	closed bool
-	mu     sync.Mutex
+	bridge    *promptBridge
+	cookie    string
+	timeout   time.Duration
+	closeOnce sync.Once
 }
 
-// SendResult sends the unlock result back to the plugin.
-// This should be called after attempting to unlock the vault with the password.
-// If success is true, the plugin will close the dialog.
-// If success is false and retry is true, the plugin will show the error and allow retry.
-// The session is automatically closed after sending the result.
+// SendResult sends the unlock result to the Noctalia v5 plugin.
 func (s *PasswordSession) SendResult(success bool, errMsg string, retry bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		return errors.New("session already closed")
+	if s == nil || s.bridge == nil {
+		return ErrSessionClosed
 	}
 
 	result := KeyringResult{
@@ -186,295 +103,166 @@ func (s *PasswordSession) SendResult(success bool, errMsg string, retry bool) er
 		Error:   errMsg,
 		Retry:   retry,
 	}
-
-	resultBytes, err := json.Marshal(result)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	err := s.bridge.sendResult(ctx, result)
+	cancel()
 	if err != nil {
-		s.close()
-		return fmt.Errorf("failed to marshal result: %w", err)
+		_ = s.Close()
+		return err
 	}
-	resultBytes = append(resultBytes, '\n')
-
-	// Set a write deadline to avoid blocking forever
-	if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		s.close()
-		return fmt.Errorf("failed to set write deadline: %w", err)
-	}
-
-	if _, err := s.conn.Write(resultBytes); err != nil {
-		s.close()
-		return fmt.Errorf("failed to send result: %w", err)
-	}
-
-	// Close after sending success result, keep open for retry
 	if success || !retry {
-		s.close()
+		_ = s.Close()
 	}
-
 	return nil
 }
 
-// WaitForRetry waits for the user to submit a new password after a failed attempt.
-// This should only be called after SendResult(false, errMsg, true).
-// Returns the new password or an error if the user cancels or times out.
+// WaitForRetry waits for the next password from the current Noctalia v5 prompt.
 func (s *PasswordSession) WaitForRetry(ctx context.Context, timeout time.Duration) (string, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return "", errors.New("session already closed")
+	if s == nil || s.bridge == nil {
+		return "", ErrSessionClosed
 	}
-	conn := s.conn
-	cookie := s.cookie
-	s.mu.Unlock()
-
-	// Set read deadline
-	deadline := time.Now().Add(timeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
+	if timeout <= 0 {
+		timeout = s.timeout
 	}
-	if err := conn.SetReadDeadline(deadline); err != nil {
-		return "", fmt.Errorf("failed to set read deadline: %w", err)
+	if timeout <= 0 {
+		timeout = DefaultTimeout
 	}
 
-	// Wait for response with context cancellation support
-	reader := bufio.NewReader(conn)
-	respLine, err := readWithContext(ctx, conn, reader)
+	response, err := s.bridge.waitResponse(ctx, timeout)
 	if err != nil {
-		s.Close()
-		if errors.Is(err, context.Canceled) {
-			return "", ErrCancelled
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", ErrTimeout
-		}
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return "", ErrTimeout
-		}
-		if errors.Is(err, io.EOF) {
-			return "", ErrCancelled
-		}
-		return "", fmt.Errorf("failed to read response: %w", err)
+		_ = s.Close()
+		return "", err
 	}
-
-	// Parse response
-	var resp KeyringResponse
-	if err := json.Unmarshal(respLine, &resp); err != nil {
-		s.Close()
-		return "", fmt.Errorf("%w: invalid JSON response: %v", ErrProtocolError, err)
+	if err := validateResponse(response, s.cookie); err != nil {
+		_ = s.Close()
+		return "", err
 	}
-
-	// Validate response
-	if resp.Type != MessageTypeResponse {
-		s.Close()
-		return "", fmt.Errorf("%w: unexpected response type: %s", ErrProtocolError, resp.Type)
-	}
-
-	if resp.ID != cookie {
-		s.Close()
-		return "", fmt.Errorf("%w: expected %s, got %s", ErrCookieMismatch, cookie, resp.ID)
-	}
-
-	switch resp.Result {
+	switch response.Result {
 	case ResultOK:
-		return resp.Password, nil
+		return response.Password, nil
 	case ResultCancelled:
-		s.Close()
+		_ = s.Close()
 		return "", ErrCancelled
 	default:
-		s.Close()
-		return "", fmt.Errorf("%w: unknown result: %s", ErrProtocolError, resp.Result)
+		_ = s.Close()
+		return "", fmt.Errorf("%w: unexpected result", ErrProtocolError)
 	}
 }
 
-// Close closes the session connection.
+// Close closes the authenticated Noctalia v5 prompt bridge.
 func (s *PasswordSession) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.close()
-}
-
-// close closes the connection (must be called with lock held)
-func (s *PasswordSession) close() error {
-	if s.closed {
+	if s == nil || s.bridge == nil {
 		return nil
 	}
-	s.closed = true
-	return s.conn.Close()
+	var err error
+	s.closeOnce.Do(func() { err = s.bridge.Close() })
+	return err
 }
 
-// RequestPasswordWithSession sends a password request to the Noctalia agent and returns
-// a session that can be used to send unlock results and handle retries.
-// The caller must close the session when done.
+// RequestPasswordWithSession requests a password and returns a live retry session.
 func (c *Client) RequestPasswordWithSession(ctx context.Context, title, message string) (string, *PasswordSession, error) {
-	// Validate socket security before attempting connection
-	if err := c.ValidateSocket(); err != nil {
+	if err := bridgeContextError(ctx); err != nil {
+		return "", nil, err
+	}
+	cookie, err := generateCookie()
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: generate request cookie", ErrPluginUnavailable)
+	}
+	request := KeyringRequest{
+		Type:    MessageTypeRequest,
+		Cookie:  cookie,
+		Title:   title,
+		Message: message,
+	}
+	bridge, err := newPromptBridge(request)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: create prompt bridge", ErrPluginUnavailable)
+	}
+	if err := bridgeContextError(ctx); err != nil {
+		_ = bridge.Close()
 		return "", nil, err
 	}
 
-	// Generate unique cookie for this request
-	cookie, err := generateCookie()
+	commandCtx, cancel := context.WithTimeout(ctx, commandTimeout)
+	runErr := c.run(commandCtx, c.executable, "msg", "plugin", c.pluginEntry, "all", MessageTypeRequest, cookie)
+	commandErr := commandCtx.Err()
+	cancel()
+	if runErr != nil || commandErr != nil {
+		_ = bridge.Close()
+		return "", nil, commandError(ctx, runErr, commandErr)
+	}
+
+	response, err := bridge.waitResponse(ctx, c.timeout)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to generate cookie: %w", err)
+		_ = bridge.Close()
+		return "", nil, err
+	}
+	if err := validateResponse(response, cookie); err != nil {
+		_ = bridge.Close()
+		return "", nil, err
 	}
 
-	// Create request
-	req := KeyringRequest{
-		Type:        MessageTypeRequest,
-		Cookie:      cookie,
-		Title:       title,
-		Message:     message,
-		Description: "",
-		PasswordNew: false,
-		ConfirmOnly: false,
-	}
-
-	// Connect to socket with timeout
-	dialer := net.Dialer{Timeout: connectTimeout}
-	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return "", nil, ErrCancelled
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", nil, ErrTimeout
-		}
-		return "", nil, fmt.Errorf("%w: %w", ErrConnectionFailed, err)
-	}
-
-	// Set read deadline based on timeout
-	deadline := time.Now().Add(c.timeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
-	if err := conn.SetReadDeadline(deadline); err != nil {
-		conn.Close()
-		return "", nil, fmt.Errorf("failed to set read deadline: %w", err)
-	}
-
-	// Send request as newline-delimited JSON
-	reqBytes, err := json.Marshal(req)
-	if err != nil {
-		conn.Close()
-		return "", nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-	reqBytes = append(reqBytes, '\n')
-
-	if _, err := conn.Write(reqBytes); err != nil {
-		conn.Close()
-		return "", nil, fmt.Errorf("failed to send request: %w", err)
-	}
-
-	// Wait for response with context cancellation support
-	reader := bufio.NewReader(conn)
-	respLine, err := readWithContext(ctx, conn, reader)
-	if err != nil {
-		conn.Close()
-		if errors.Is(err, context.Canceled) {
-			return "", nil, ErrCancelled
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", nil, ErrTimeout
-		}
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return "", nil, ErrTimeout
-		}
-		// Connection closed without response = user cancelled (closed the window)
-		if errors.Is(err, io.EOF) {
-			return "", nil, ErrCancelled
-		}
-		return "", nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	// Parse response
-	var resp KeyringResponse
-	if err := json.Unmarshal(respLine, &resp); err != nil {
-		conn.Close()
-		return "", nil, fmt.Errorf("%w: invalid JSON response: %v", ErrProtocolError, err)
-	}
-
-	// Validate response type
-	if resp.Type != MessageTypeResponse {
-		conn.Close()
-		return "", nil, fmt.Errorf("%w: unexpected response type: %s", ErrProtocolError, resp.Type)
-	}
-
-	// Validate cookie matches
-	if resp.ID != cookie {
-		conn.Close()
-		return "", nil, fmt.Errorf("%w: expected %s, got %s", ErrCookieMismatch, cookie, resp.ID)
-	}
-
-	// Create session to keep connection open
-	session := &PasswordSession{
-		conn:   conn,
-		cookie: cookie,
-	}
-
-	// Handle result
-	switch resp.Result {
+	switch response.Result {
 	case ResultOK:
-		return resp.Password, session, nil
+		return response.Password, &PasswordSession{bridge: bridge, cookie: cookie, timeout: c.timeout}, nil
 	case ResultCancelled:
-		session.Close()
+		_ = bridge.Close()
 		return "", nil, ErrCancelled
 	case ResultConfirmed:
-		session.Close()
+		_ = bridge.Close()
 		return "", nil, ErrConfirmOnly
 	default:
-		session.Close()
-		return "", nil, fmt.Errorf("%w: unknown result: %s", ErrProtocolError, resp.Result)
+		_ = bridge.Close()
+		return "", nil, fmt.Errorf("%w: unexpected result", ErrProtocolError)
 	}
 }
 
-// readWithContext reads from the connection with context cancellation support.
-// It uses a goroutine to read and monitors the context's Done channel.
-func readWithContext(ctx context.Context, conn net.Conn, reader *bufio.Reader) ([]byte, error) {
-	type result struct {
-		data []byte
-		err  error
+func validateResponse(response KeyringResponse, cookie string) error {
+	if response.Type != MessageTypeResponse {
+		return fmt.Errorf("%w: unexpected response type", ErrProtocolError)
 	}
-
-	resultChan := make(chan result, 1)
-
-	// Start reading in a goroutine
-	go func() {
-		data, err := reader.ReadBytes('\n')
-		resultChan <- result{data: data, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		// Context was cancelled - close connection to unblock read
-		_ = conn.SetReadDeadline(time.Now()) // best-effort unblock
-		_ = conn.Close()
-		select {
-		case <-resultChan:
-		case <-time.After(1 * time.Second):
-			// give up joining; avoid deadlock
+	if response.ID != cookie {
+		return ErrCookieMismatch
+	}
+	switch response.Result {
+	case ResultOK:
+		if response.Password == "" {
+			return fmt.Errorf("%w: empty password", ErrProtocolError)
 		}
-		return nil, ctx.Err()
-	case res := <-resultChan:
-		return res.data, res.err
+	case ResultCancelled, ResultConfirmed:
+		if response.Password != "" {
+			return fmt.Errorf("%w: unexpected password", ErrProtocolError)
+		}
+	default:
+		return fmt.Errorf("%w: unexpected result", ErrProtocolError)
 	}
+	return nil
 }
 
-// generateCookie generates a unique request ID using 16 random bytes
-// encoded as a 32-character hex string
+func commandError(parent context.Context, runErr, commandErr error) error {
+	if errors.Is(parent.Err(), context.DeadlineExceeded) || errors.Is(commandErr, context.DeadlineExceeded) || errors.Is(runErr, context.DeadlineExceeded) {
+		return ErrTimeout
+	}
+	if errors.Is(parent.Err(), context.Canceled) {
+		return ErrCancelled
+	}
+	return fmt.Errorf("%w: plugin command failed", ErrPluginUnavailable)
+}
+
 func generateCookie() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(b), nil
+	return hex.EncodeToString(bytes), nil
 }
 
-// RequestPassword is a convenience wrapper that requests a password without session support.
-// For retry support, use RequestPasswordWithSession instead.
+// RequestPassword requests a password and closes its session before returning.
 func (c *Client) RequestPassword(ctx context.Context, title, message string) (string, error) {
 	password, session, err := c.RequestPasswordWithSession(ctx, title, message)
 	if err != nil {
 		return "", err
 	}
-	// Close session immediately since caller doesn't need it
-	session.Close()
+	_ = session.Close()
 	return password, nil
 }

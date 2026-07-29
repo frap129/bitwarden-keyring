@@ -1,1040 +1,688 @@
-// Package noctalia provides an IPC client for the Noctalia Quickshell plugin
-// to enable Noctalia UI integration for password prompts.
 package noctalia
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"net"
+	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 )
 
-// MockServer simulates the noctalia-polkit-agent for testing
-type MockServer struct {
-	listener     net.Listener
-	socketPath   string
-	responseChan chan KeyringResponse
-	requestChan  chan KeyringRequest
+const (
+	testPollInterval = 5 * time.Millisecond
+	testPollDeadline = time.Second
+)
+
+type commandCall struct {
+	name string
+	args []string
 }
 
-// NewMockServer creates a new mock server at the given socket path
-func NewMockServer(t *testing.T, socketPath string) *MockServer {
+type testBridge struct {
+	cookie     string
+	descriptor bridgeDescriptor
+	client     *http.Client
+}
+
+func newTestRuntime(t *testing.T) string {
 	t.Helper()
-
-	// Remove any existing socket
-	os.Remove(socketPath)
-
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatalf("Failed to create mock server: %v", err)
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(runtimeDir, 0700); err != nil {
+		t.Fatalf("chmod runtime directory: %v", err)
 	}
-
-	m := &MockServer{
-		listener:     listener,
-		socketPath:   socketPath,
-		responseChan: make(chan KeyringResponse, 1),
-		requestChan:  make(chan KeyringRequest, 1),
-	}
-
-	// Start accepting connections
-	go m.acceptLoop(t)
-
-	return m
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	return runtimeDir
 }
 
-func (m *MockServer) acceptLoop(t *testing.T) {
-	for {
-		conn, err := m.listener.Accept()
-		if err != nil {
-			// Listener closed
-			return
-		}
-		go m.handleConnection(t, conn)
-	}
-}
-
-func (m *MockServer) handleConnection(t *testing.T, conn net.Conn) {
-	defer conn.Close()
-
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadBytes('\n')
-	if err != nil {
-		t.Logf("Mock server: failed to read request: %v", err)
-		return
-	}
-
-	var req KeyringRequest
-	if err := json.Unmarshal(line, &req); err != nil {
-		t.Logf("Mock server: failed to parse request: %v", err)
-		return
-	}
-
-	// Send request to channel for test inspection
-	select {
-	case m.requestChan <- req:
-	default:
-	}
-
-	// Wait for response to send
-	resp := <-m.responseChan
-
-	// Ensure the ID matches the request cookie
-	if resp.ID == "" {
-		resp.ID = req.Cookie
-	}
-
-	respBytes, _ := json.Marshal(resp)
-	respBytes = append(respBytes, '\n')
-	conn.Write(respBytes)
-}
-
-// RespondWith queues a response to be sent for the next request
-func (m *MockServer) RespondWith(resp KeyringResponse) {
-	m.responseChan <- resp
-}
-
-// GetRequest returns the last received request (blocks until one is received)
-func (m *MockServer) GetRequest(t *testing.T, timeout time.Duration) KeyringRequest {
+func newTestClient(t *testing.T, timeout time.Duration) (*Client, <-chan commandCall) {
 	t.Helper()
-	select {
-	case req := <-m.requestChan:
-		return req
-	case <-time.After(timeout):
-		t.Fatal("Timeout waiting for request")
-		return KeyringRequest{}
-	}
-}
-
-// Close shuts down the mock server
-func (m *MockServer) Close() {
-	m.listener.Close()
-	os.Remove(m.socketPath)
-}
-
-// MultiPhaseSession tracks a multi-phase authentication session
-// for testing retry flows
-type MultiPhaseSession struct {
-	mu      sync.Mutex
-	cookie  string
-	phase   int
-	results []KeyringResult
-}
-
-func (s *MultiPhaseSession) GetResults() []KeyringResult {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	resultCopy := make([]KeyringResult, len(s.results))
-	copy(resultCopy, s.results)
-	return resultCopy
-}
-
-// MultiPhaseMockServer is a mock server that supports multi-phase authentication
-// sessions for testing retry flows
-type MultiPhaseMockServer struct {
-	listener   net.Listener
-	socketPath string
-	sessions   map[string]*MultiPhaseSession
-	sessionsMu sync.RWMutex
-	script     []MockServerAction
-	scriptMu   sync.RWMutex
-	done       chan struct{}
-	closeOnce  sync.Once
-	wg         sync.WaitGroup
-	connsMu    sync.Mutex
-	conns      map[net.Conn]struct{}
-}
-
-// MockServerAction represents an action the mock server should take
-type MockServerAction struct {
-	Phase       int
-	Response    *KeyringResponse
-	Delay       time.Duration
-	CloseConn   bool
-	WrongCookie bool
-}
-
-// NewMultiPhaseMockServer creates a mock server that supports multi-phase sessions
-func NewMultiPhaseMockServer(t *testing.T, socketPath string) *MultiPhaseMockServer {
-	t.Helper()
-
-	os.Remove(socketPath)
-
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatalf("Failed to create multi-phase mock server: %v", err)
-	}
-
-	m := &MultiPhaseMockServer{
-		listener:   listener,
-		socketPath: socketPath,
-		sessions:   make(map[string]*MultiPhaseSession),
-		done:       make(chan struct{}),
-		conns:      make(map[net.Conn]struct{}),
-	}
-
-	m.wg.Add(1)
-	go m.acceptLoop(t)
-
-	t.Cleanup(m.Close)
-
-	return m
-}
-
-func (m *MultiPhaseMockServer) acceptLoop(t *testing.T) {
-	defer m.wg.Done()
-	for {
-		conn, err := m.listener.Accept()
-		if err != nil {
-			select {
-			case <-m.done:
-				return
-			default:
-				return
-			}
-		}
-
-		m.connsMu.Lock()
-		m.conns[conn] = struct{}{}
-		m.connsMu.Unlock()
-
-		m.wg.Add(1)
-		go func(c net.Conn) {
-			defer m.wg.Done()
-			m.handleConnection(t, c)
-			m.connsMu.Lock()
-			delete(m.conns, c)
-			m.connsMu.Unlock()
-		}(conn)
-	}
-}
-
-func (m *MultiPhaseMockServer) handleConnection(t *testing.T, conn net.Conn) {
-	defer conn.Close()
-
-	reader := bufio.NewReader(conn)
-
-	for {
-		// Set read deadline for the connection
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err != io.EOF {
-				select {
-				case <-m.done:
-					return
-				default:
-					t.Logf("Multi-phase mock server: failed to read: %v", err)
-				}
-			}
-			return
-		}
-
-		// Try to parse as KeyringRequest (initial request)
-		var req KeyringRequest
-		if err := json.Unmarshal(line, &req); err == nil && req.Type == MessageTypeRequest {
-			m.handleRequest(t, conn, &req)
-			continue
-		}
-
-		// Try to parse as KeyringResult (subsequent results)
-		var result KeyringResult
-		if err := json.Unmarshal(line, &result); err == nil && result.Type == MessageTypeResult {
-			m.handleResult(t, conn, &result)
-			continue
-		}
-
-		select {
-		case <-m.done:
-			return
-		default:
-			t.Logf("Multi-phase mock server: unknown message: %s", string(line))
-		}
-	}
-}
-
-func (m *MultiPhaseMockServer) handleRequest(t *testing.T, conn net.Conn, req *KeyringRequest) {
-	m.sessionsMu.Lock()
-
-	// Create or get session
-	session, exists := m.sessions[req.Cookie]
-	if !exists {
-		session = &MultiPhaseSession{
-			cookie: req.Cookie,
-			phase:  0,
-		}
-		m.sessions[req.Cookie] = session
-	}
-
-	phase := session.phase
-	session.phase++
-
-	// Get action from script if available
-	action := m.getActionForPhase(phase)
-	m.sessionsMu.Unlock()
-
-	// Apply delay if specified
-	if action.Delay > 0 {
-		time.Sleep(action.Delay)
-	}
-
-	// Send response
-	var resp KeyringResponse
-	if action.Response != nil {
-		resp = *action.Response
-		if action.WrongCookie {
-			resp.ID = "wrong-cookie-12345"
-		} else if resp.ID == "" {
-			resp.ID = req.Cookie
-		}
-	} else {
-		resp = KeyringResponse{
-			Type:   MessageTypeResponse,
-			ID:     req.Cookie,
-			Result: ResultOK,
-		}
-	}
-
-	respBytes, _ := json.Marshal(resp)
-	respBytes = append(respBytes, '\n')
-	conn.Write(respBytes)
-
-	if action.CloseConn {
-		conn.Close()
-	}
-}
-
-func (m *MultiPhaseMockServer) handleResult(t *testing.T, conn net.Conn, result *KeyringResult) {
-	m.sessionsMu.Lock()
-	defer m.sessionsMu.Unlock()
-
-	session, exists := m.sessions[result.ID]
-	if !exists {
-		select {
-		case <-m.done:
-			return
-		default:
-			t.Logf("Multi-phase mock server: received result for unknown session: %s", result.ID)
-			return
-		}
-	}
-
-	session.mu.Lock()
-	session.results = append(session.results, *result)
-	phase := session.phase
-	session.phase++
-	session.mu.Unlock()
-
-	// Check if we should send a retry response
-	action := m.getActionForPhase(phase)
-	if action.Response != nil {
-		// Apply delay if specified
-		if action.Delay > 0 {
-			time.Sleep(action.Delay)
-		}
-
-		resp := *action.Response
-		if action.WrongCookie {
-			resp.ID = "wrong-cookie-12345"
-		} else if resp.ID == "" {
-			resp.ID = result.ID
-		}
-
-		respBytes, _ := json.Marshal(resp)
-		respBytes = append(respBytes, '\n')
-		conn.Write(respBytes)
-
-		if action.CloseConn {
-			conn.Close()
-		}
-	} else if !result.Success {
-		// Default behavior: if not successful and no action defined, delete session
-		delete(m.sessions, result.ID)
-	} else {
-		// Success - delete session
-		delete(m.sessions, result.ID)
-	}
-}
-
-func (m *MultiPhaseMockServer) getActionForPhase(phase int) MockServerAction {
-	m.scriptMu.RLock()
-	defer m.scriptMu.RUnlock()
-
-	for _, action := range m.script {
-		if action.Phase == phase {
-			return action
-		}
-	}
-	return MockServerAction{Phase: phase}
-}
-
-// SetScript configures the sequence of actions for multi-phase sessions
-func (m *MultiPhaseMockServer) SetScript(actions []MockServerAction) {
-	m.scriptMu.Lock()
-	defer m.scriptMu.Unlock()
-	m.script = actions
-}
-
-// GetSession returns a session by cookie
-func (m *MultiPhaseMockServer) GetSession(cookie string) (*MultiPhaseSession, bool) {
-	m.sessionsMu.RLock()
-	defer m.sessionsMu.RUnlock()
-	session, ok := m.sessions[cookie]
-	return session, ok
-}
-
-// Close shuts down the multi-phase mock server
-func (m *MultiPhaseMockServer) Close() {
-	m.closeOnce.Do(func() {
-		close(m.done)
-		m.listener.Close()
-
-		// Close all tracked connections
-		m.connsMu.Lock()
-		for conn := range m.conns {
-			conn.Close()
-		}
-		m.connsMu.Unlock()
-
-		// Wait for all goroutines to finish
-		m.wg.Wait()
-
-		os.Remove(m.socketPath)
-	})
-}
-
-// GetResults returns the results received for a session
-func (m *MultiPhaseMockServer) GetResults(cookie string) []KeyringResult {
-	m.sessionsMu.RLock()
-	session, exists := m.sessions[cookie]
-	m.sessionsMu.RUnlock()
-	if !exists {
+	calls := make(chan commandCall, 1)
+	runner := func(_ context.Context, name string, args ...string) error {
+		calls <- commandCall{name: name, args: append([]string(nil), args...)}
 		return nil
 	}
-	return session.GetResults()
+	return NewClient(WithCommandRunner(runner), WithTimeout(timeout)), calls
 }
 
-func TestClient_IsAvailable_SocketExists(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	// Create mock server (creates socket)
-	server := NewMockServer(t, socketPath)
-	defer server.Close()
-
-	client := NewClient(WithSocketPath(socketPath))
-
-	if !client.IsAvailable() {
-		t.Error("IsAvailable() = false, want true when socket exists")
-	}
-}
-
-func TestClient_IsAvailable_SocketMissing(t *testing.T) {
-	client := NewClient(WithSocketPath("/nonexistent/path/test.sock"))
-
-	if client.IsAvailable() {
-		t.Error("IsAvailable() = true, want false when socket doesn't exist")
-	}
-}
-
-func TestClient_RequestPassword_Success(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMockServer(t, socketPath)
-	defer server.Close()
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(5*time.Second),
-	)
-
-	// Queue response
-	go func() {
-		req := server.GetRequest(t, 2*time.Second)
-		if req.Type != "keyring_request" {
-			t.Errorf("Expected type keyring_request, got %s", req.Type)
+func waitForCommand(t *testing.T, calls <-chan commandCall) commandCall {
+	t.Helper()
+	var call commandCall
+	eventually(t, func() bool {
+		select {
+		case call = <-calls:
+			return true
+		default:
+			return false
 		}
-		if req.Title != "Test Title" {
-			t.Errorf("Expected title 'Test Title', got %s", req.Title)
-		}
-		server.RespondWith(KeyringResponse{
-			Type:     "keyring_response",
-			ID:       req.Cookie,
-			Result:   ResultOK,
-			Password: "secret123",
-		})
-	}()
-
-	ctx := context.Background()
-	password, err := client.RequestPassword(ctx, "Test Title", "Enter password")
-
-	if err != nil {
-		t.Fatalf("RequestPassword() error = %v", err)
-	}
-	if password != "secret123" {
-		t.Errorf("RequestPassword() = %q, want %q", password, "secret123")
-	}
-}
-
-func TestClient_RequestPassword_Cancelled(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMockServer(t, socketPath)
-	defer server.Close()
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(5*time.Second),
-	)
-
-	// Queue cancellation response
-	go func() {
-		req := server.GetRequest(t, 2*time.Second)
-		server.RespondWith(KeyringResponse{
-			Type:   "keyring_response",
-			ID:     req.Cookie,
-			Result: ResultCancelled,
-		})
-	}()
-
-	ctx := context.Background()
-	_, err := client.RequestPassword(ctx, "Test", "Enter password")
-
-	if err != ErrCancelled {
-		t.Errorf("RequestPassword() error = %v, want ErrCancelled", err)
-	}
-}
-
-func TestClient_RequestPassword_Timeout(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMockServer(t, socketPath)
-	defer server.Close()
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(100*time.Millisecond),
-	)
-
-	// Don't respond - let it timeout
-	ctx := context.Background()
-	_, err := client.RequestPassword(ctx, "Test", "Enter password")
-
-	if err != ErrTimeout {
-		t.Errorf("RequestPassword() error = %v, want ErrTimeout", err)
-	}
-}
-
-func TestClient_RequestPassword_SocketNotFound(t *testing.T) {
-	client := NewClient(WithSocketPath("/nonexistent/path/test.sock"))
-
-	ctx := context.Background()
-	_, err := client.RequestPassword(ctx, "Test", "Enter password")
-
-	if err != ErrSocketNotFound {
-		t.Errorf("RequestPassword() error = %v, want ErrSocketNotFound", err)
-	}
-}
-
-func TestClient_RequestPassword_InvalidJSON(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	// Create a simple listener that sends invalid JSON
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	go func() {
-		conn, _ := listener.Accept()
-		defer conn.Close()
-		// Read request
-		reader := bufio.NewReader(conn)
-		reader.ReadBytes('\n')
-		// Send invalid JSON
-		conn.Write([]byte("not valid json\n"))
-	}()
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(5*time.Second),
-	)
-
-	ctx := context.Background()
-	_, err = client.RequestPassword(ctx, "Test", "Enter password")
-
-	if err == nil {
-		t.Error("RequestPassword() expected error for invalid JSON, got nil")
-	}
-}
-
-func TestGenerateCookie(t *testing.T) {
-	cookie1, err := generateCookie()
-	if err != nil {
-		t.Fatalf("generateCookie() error = %v", err)
-	}
-
-	// Should be 32 hex characters (16 bytes)
-	if len(cookie1) != 32 {
-		t.Errorf("generateCookie() length = %d, want 32", len(cookie1))
-	}
-
-	// Each cookie should be unique
-	cookie2, _ := generateCookie()
-	if cookie1 == cookie2 {
-		t.Error("generateCookie() produced duplicate cookies")
-	}
-}
-
-func TestClient_ValidateSocket_RejectsSymlink(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "real.sock")
-	symlinkPath := filepath.Join(tmpDir, "link.sock")
-
-	// Create real socket
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	// Create symlink pointing to the socket
-	if err := os.Symlink(socketPath, symlinkPath); err != nil {
-		t.Fatal(err)
-	}
-
-	client := NewClient(WithSocketPath(symlinkPath))
-	err = client.ValidateSocket()
-
-	if !errors.Is(err, ErrSocketSymlink) {
-		t.Errorf("ValidateSocket() error = %v, want ErrSocketSymlink", err)
-	}
-}
-
-func TestClient_ValidateSocket_RejectsWorldWritable(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	// Create socket
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	// Make socket world-writable
-	if err := os.Chmod(socketPath, 0777); err != nil {
-		t.Fatal(err)
-	}
-
-	client := NewClient(WithSocketPath(socketPath))
-	err = client.ValidateSocket()
-
-	if !errors.Is(err, ErrSocketPermissions) {
-		t.Errorf("ValidateSocket() error = %v, want ErrSocketPermissions", err)
-	}
-}
-
-func TestClient_ValidateSocket_RejectsGroupWritable(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	// Create socket
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	// Make socket group-writable
-	if err := os.Chmod(socketPath, 0770); err != nil {
-		t.Fatal(err)
-	}
-
-	client := NewClient(WithSocketPath(socketPath))
-	err = client.ValidateSocket()
-
-	if !errors.Is(err, ErrSocketPermissions) {
-		t.Errorf("ValidateSocket() error = %v, want ErrSocketPermissions", err)
-	}
-}
-
-func TestClient_ValidateSocket_RejectsBadParentDir(t *testing.T) {
-	tmpDir := t.TempDir()
-	subDir := filepath.Join(tmpDir, "subdir")
-	if err := os.Mkdir(subDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-
-	socketPath := filepath.Join(subDir, "test.sock")
-
-	// Create socket
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	// Make parent directory world-writable
-	if err := os.Chmod(subDir, 0777); err != nil {
-		t.Fatal(err)
-	}
-
-	client := NewClient(WithSocketPath(socketPath))
-	err = client.ValidateSocket()
-
-	if !errors.Is(err, ErrSocketParentPerms) {
-		t.Errorf("ValidateSocket() error = %v, want ErrSocketParentPerms", err)
-	}
-}
-
-func TestClient_ValidateSocket_AcceptsValid(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	// Create socket with safe permissions (user only)
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	// Ensure socket has safe permissions
-	if err := os.Chmod(socketPath, 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	client := NewClient(WithSocketPath(socketPath))
-	err = client.ValidateSocket()
-
-	if err != nil {
-		t.Errorf("ValidateSocket() unexpected error for valid socket: %v", err)
-	}
-}
-
-// TestClient_FullRetryCycle tests the complete retry flow:
-// prompt → wrong password → retry → correct password → dismiss
-func TestClient_FullRetryCycle(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMultiPhaseMockServer(t, socketPath)
-	defer server.Close()
-
-	// Set up the script for the full retry cycle:
-	// Phase 0: Initial prompt → return wrong password
-	// Phase 1: After wrong password result → send retry with correct password
-	// Phase 2: After correct password result → close/dismiss
-	server.SetScript([]MockServerAction{
-		{
-			Phase: 0,
-			Response: &KeyringResponse{
-				Type:     MessageTypeResponse,
-				Result:   ResultOK,
-				Password: "wrong-password",
-			},
-		},
-		{
-			Phase: 1,
-			Response: &KeyringResponse{
-				Type:     MessageTypeResponse,
-				Result:   ResultOK,
-				Password: "correct-password",
-			},
-		},
 	})
+	return call
+}
 
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(5*time.Second),
-	)
+func eventually(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(testPollDeadline)
+	defer deadline.Stop()
+	ticker := time.NewTicker(testPollInterval)
+	defer ticker.Stop()
 
-	ctx := context.Background()
-
-	// Step 1: Request password with session
-	password, session, err := client.RequestPasswordWithSession(ctx, "Test Title", "Enter password")
-	if err != nil {
-		t.Fatalf("RequestPasswordWithSession() error = %v", err)
+	if condition() {
+		return
 	}
-	defer session.Close()
+	for {
+		select {
+		case <-deadline.C:
+			t.Fatal("condition was not satisfied before deadline")
+		case <-ticker.C:
+			if condition() {
+				return
+			}
+		}
+	}
+}
 
-	// Should get the wrong password first
-	if password != "wrong-password" {
-		t.Errorf("First password = %q, want %q", password, "wrong-password")
+func descriptorPath(runtimeDir, cookie string) string {
+	return filepath.Join(runtimeDir, "bitwarden-keyring", "noctalia-"+cookie+".json")
+}
+
+func readTestDescriptor(runtimeDir, cookie string) (bridgeDescriptor, error) {
+	contents, err := os.ReadFile(descriptorPath(runtimeDir, cookie))
+	if err != nil {
+		return bridgeDescriptor{}, err
+	}
+	var descriptor bridgeDescriptor
+	if err := json.Unmarshal(contents, &descriptor); err != nil {
+		return bridgeDescriptor{}, err
+	}
+	return descriptor, nil
+}
+
+func newTestBridge(t *testing.T, call commandCall) *testBridge {
+	t.Helper()
+	if len(call.args) == 0 {
+		t.Fatal("command has no cookie argument")
+	}
+	cookie := call.args[len(call.args)-1]
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	var descriptor bridgeDescriptor
+	eventually(t, func() bool {
+		var err error
+		descriptor, err = readTestDescriptor(runtimeDir, cookie)
+		return err == nil
+	})
+	return &testBridge{cookie: cookie, descriptor: descriptor, client: &http.Client{Timeout: 100 * time.Millisecond}}
+}
+
+func (b *testBridge) do(t *testing.T, method, path string, body io.Reader, contentType string) *http.Response {
+	t.Helper()
+	request, err := http.NewRequest(method, b.descriptor.BaseURL+path, body)
+	if err != nil {
+		t.Fatalf("new HTTP request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+b.descriptor.Token)
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
+	}
+	response, err := b.client.Do(request)
+	if err != nil {
+		t.Fatalf("HTTP request: %v", err)
+	}
+	return response
+}
+
+func (b *testBridge) getRequest(t *testing.T) KeyringRequest {
+	t.Helper()
+	var request KeyringRequest
+	eventually(t, func() bool {
+		response := b.do(t, http.MethodGet, "/v1/request", nil, "")
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return false
+		}
+		return json.NewDecoder(response.Body).Decode(&request) == nil
+	})
+	return request
+}
+
+func (b *testBridge) postResponse(t *testing.T, response KeyringResponse) {
+	t.Helper()
+	contents, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	reply := b.do(t, http.MethodPost, "/v1/response", strings.NewReader(string(contents)), "application/json")
+	defer reply.Body.Close()
+	if reply.StatusCode != http.StatusAccepted {
+		t.Fatalf("response status = %d, want %d", reply.StatusCode, http.StatusAccepted)
+	}
+}
+
+func reserveBridgeResponse(bridge *promptBridge, response KeyringResponse) {
+	bridge.mu.Lock()
+	bridge.responseSlot = response
+	bridge.responseState = responseStateReserved
+	bridge.responseNotify = make(chan struct{})
+	notify := bridge.responseNotify
+	bridge.mu.Unlock()
+	close(notify)
+}
+
+func (b *testBridge) pollResult(t *testing.T) KeyringResult {
+	t.Helper()
+	var result KeyringResult
+	eventually(t, func() bool {
+		response := b.do(t, http.MethodGet, "/v1/result?id="+b.cookie, nil, "")
+		defer response.Body.Close()
+		if response.StatusCode == http.StatusNoContent {
+			return false
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("result status = %d, want %d or %d", response.StatusCode, http.StatusOK, http.StatusNoContent)
+		}
+		return json.NewDecoder(response.Body).Decode(&result) == nil
+	})
+	return result
+}
+
+func waitForClientPendingResult(t *testing.T, bridge *promptBridge) {
+	t.Helper()
+	eventually(t, func() bool {
+		bridge.mu.Lock()
+		defer bridge.mu.Unlock()
+		return bridge.pendingResult != nil
+	})
+}
+
+func assertDescriptorRemoved(t *testing.T, runtimeDir, cookie string) {
+	t.Helper()
+	eventually(t, func() bool {
+		_, err := os.Stat(descriptorPath(runtimeDir, cookie))
+		return errors.Is(err, os.ErrNotExist)
+	})
+}
+
+func commandArgs(t *testing.T, call commandCall, cookie string) {
+	t.Helper()
+	if call.name != DefaultExecutable {
+		t.Errorf("command name = %q, want %q", call.name, DefaultExecutable)
+	}
+	want := []string{"msg", "plugin", DefaultPluginEntry, "all", MessageTypeRequest, cookie}
+	if len(call.args) != len(want) {
+		t.Fatalf("command args = %#v, want %#v", call.args, want)
+	}
+	for index := range want {
+		if call.args[index] != want[index] {
+			t.Errorf("command args[%d] = %q, want %q", index, call.args[index], want[index])
+		}
+	}
+}
+
+func TestNewClientDefaultsAndTimeoutOverride(t *testing.T) {
+	client := NewClient()
+	if client.executable != DefaultExecutable {
+		t.Errorf("executable = %q, want %q", client.executable, DefaultExecutable)
+	}
+	if client.pluginEntry != DefaultPluginEntry {
+		t.Errorf("plugin entry = %q, want %q", client.pluginEntry, DefaultPluginEntry)
+	}
+	if client.timeout != DefaultTimeout {
+		t.Errorf("timeout = %v, want %v", client.timeout, DefaultTimeout)
+	}
+	if client.run == nil {
+		t.Fatal("default command runner is nil")
 	}
 
-	// Step 2: Send result indicating failure but allowing retry
-	err = session.SendResult(false, "Invalid password", true)
-	if err != nil {
+	client = NewClient(WithTimeout(250 * time.Millisecond))
+	if client.timeout != 250*time.Millisecond {
+		t.Errorf("overridden timeout = %v, want 250ms", client.timeout)
+	}
+	if NewClient(WithTimeout(0)).timeout != DefaultTimeout {
+		t.Errorf("nonpositive timeout was not normalized")
+	}
+}
+
+func TestNewClientSocketPathCompatibilityIsNoOp(t *testing.T) {
+	client := NewClient(WithSocketPath("/not-used"))
+	if client.IsAvailable() != true {
+		t.Error("IsAvailable() = false, want true")
+	}
+}
+
+func TestClientCommandFailure(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	wantErr := errors.New("runner failed")
+	runner := func(_ context.Context, _ string, _ ...string) error { return wantErr }
+	client := NewClient(WithCommandRunner(runner), WithTimeout(time.Second))
+
+	_, session, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+	if session != nil {
+		t.Fatal("session is non-nil after command failure")
+	}
+	if !errors.Is(err, ErrPluginUnavailable) {
+		t.Fatalf("error = %v, want ErrPluginUnavailable", err)
+	}
+	if strings.Contains(err.Error(), runtimeDir) {
+		t.Errorf("error exposes runtime directory: %v", err)
+	}
+}
+
+func TestClientParentCancellation(t *testing.T) {
+	newTestRuntime(t)
+	calls := make(chan struct{}, 1)
+	runner := func(ctx context.Context, _ string, _ ...string) error {
+		calls <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	client := NewClient(WithCommandRunner(runner))
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := client.RequestPasswordWithSession(ctx, "title", "message")
+		result <- err
+	}()
+	eventually(t, func() bool {
+		select {
+		case <-calls:
+			cancel()
+			return true
+		default:
+			return false
+		}
+	})
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrCancelled) {
+			t.Fatalf("error = %v, want ErrCancelled", err)
+		}
+	case <-time.After(testPollDeadline):
+		t.Fatal("request did not return after cancellation")
+	}
+}
+
+func TestClientParentDeadline(t *testing.T) {
+	newTestRuntime(t)
+	runner := func(ctx context.Context, _ string, _ ...string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	client := NewClient(WithCommandRunner(runner))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, err := client.RequestPasswordWithSession(ctx, "title", "message")
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("error = %v, want ErrTimeout", err)
+	}
+}
+
+func TestClientRequestTimeout(t *testing.T) {
+	newTestRuntime(t)
+	client, calls := newTestClient(t, 30*time.Millisecond)
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+		result <- err
+	}()
+	call := waitForCommand(t, calls)
+	newTestBridge(t, call)
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("error = %v, want ErrTimeout", err)
+		}
+	case <-time.After(testPollDeadline):
+		t.Fatal("request did not time out")
+	}
+}
+
+func TestClientConfirmOnly(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+		result <- err
+	}()
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	commandArgs(t, call, request.Cookie)
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultConfirmed})
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrConfirmOnly) {
+			t.Fatalf("error = %v, want ErrConfirmOnly", err)
+		}
+	case <-time.After(testPollDeadline):
+		t.Fatal("confirm-only request did not return")
+	}
+	assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
+}
+
+func TestPasswordSessionSuccessfulPassword(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan struct {
+		password string
+		session  *PasswordSession
+		err      error
+	}, 1)
+	go func() {
+		password, session, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+		result <- struct {
+			password string
+			session  *PasswordSession
+			err      error
+		}{password, session, err}
+	}()
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	commandArgs(t, call, request.Cookie)
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "secret"})
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("request error = %v", got.err)
+	}
+	if got.password != "secret" {
+		t.Errorf("password = %q, want %q", got.password, "secret")
+	}
+	if got.session == nil {
+		t.Fatal("session is nil after successful password")
+	}
+
+	resultDone := make(chan error, 1)
+	go func() { resultDone <- got.session.SendResult(true, "", false) }()
+	waitForClientPendingResult(t, got.session.bridge)
+	finalResult := bridge.pollResult(t)
+	if finalResult != (KeyringResult{Type: MessageTypeResult, ID: bridge.cookie, Success: true}) {
+		t.Errorf("final result = %#v", finalResult)
+	}
+	if err := <-resultDone; err != nil {
 		t.Fatalf("SendResult() error = %v", err)
 	}
+	assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
+}
 
-	// Step 3: Wait for retry - should get the correct password
-	retryPassword, err := session.WaitForRetry(ctx, 5*time.Second)
+func TestClientRequestPasswordClosesSuccessfulSession(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan struct {
+		password string
+		err      error
+	}, 1)
+	go func() {
+		password, err := client.RequestPassword(context.Background(), "title", "message")
+		result <- struct {
+			password string
+			err      error
+		}{password, err}
+	}()
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "secret"})
+	got := <-result
+	if got.err != nil || got.password != "secret" {
+		t.Fatalf("RequestPassword() = %q, %v", got.password, got.err)
+	}
+	assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
+}
+
+func TestPasswordSessionRetryThenSuccess(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan struct {
+		password string
+		session  *PasswordSession
+		err      error
+	}, 1)
+	go func() {
+		password, session, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+		result <- struct {
+			password string
+			session  *PasswordSession
+			err      error
+		}{password, session, err}
+	}()
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "wrong"})
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("initial request error = %v", got.err)
+	}
+
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- got.session.SendResult(false, "invalid", true) }()
+	if result := bridge.pollResult(t); result.Error != "invalid" || result.Retry != true || result.Success {
+		t.Errorf("retry result = %#v", result)
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatalf("retry SendResult() error = %v", err)
+	}
+
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "correct"})
+	retryPassword, err := got.session.WaitForRetry(context.Background(), time.Second)
 	if err != nil {
 		t.Fatalf("WaitForRetry() error = %v", err)
 	}
-
-	if retryPassword != "correct-password" {
-		t.Errorf("Retry password = %q, want %q", retryPassword, "correct-password")
+	if retryPassword != "correct" {
+		t.Errorf("retry password = %q, want %q", retryPassword, "correct")
 	}
-
-	// Step 4: Send success result
-	err = session.SendResult(true, "", false)
-	if err != nil {
-		t.Fatalf("SendResult(success) error = %v", err)
+	finalDone := make(chan error, 1)
+	go func() { finalDone <- got.session.SendResult(true, "", false) }()
+	waitForClientPendingResult(t, got.session.bridge)
+	bridge.pollResult(t)
+	if err := <-finalDone; err != nil {
+		t.Fatalf("final SendResult() error = %v", err)
 	}
-
-	// Verify we got the results
-	// Note: We can't easily verify the results on the server side without
-	// additional synchronization, but we verified the flow works
+	assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
 }
 
-// TestClient_WaitForRetry_Timeout tests that WaitForRetry respects context deadline
-func TestClient_WaitForRetry_Timeout(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMultiPhaseMockServer(t, socketPath)
-	defer server.Close()
-
-	// Set up script: respond immediately to initial request, but delay retry response
-	server.SetScript([]MockServerAction{
-		{
-			Phase: 0,
-			Response: &KeyringResponse{
-				Type:     MessageTypeResponse,
-				Result:   ResultOK,
-				Password: "first-password",
-			},
-		},
-		{
-			Phase:    1,
-			Delay:    2 * time.Second, // Delay beyond context timeout
-			Response: nil,             // Don't send - let it timeout
-		},
-	})
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(5*time.Second),
-	)
-
-	ctx := context.Background()
-
-	// Get initial password
-	password, session, err := client.RequestPasswordWithSession(ctx, "Test", "Enter password")
-	if err != nil {
-		t.Fatalf("RequestPasswordWithSession() error = %v", err)
-	}
-	defer session.Close()
-
-	if password != "first-password" {
-		t.Errorf("Password = %q, want %q", password, "first-password")
-	}
-
-	// Send result with retry
-	err = session.SendResult(false, "Try again", true)
-	if err != nil {
-		t.Fatalf("SendResult() error = %v", err)
-	}
-
-	// Create context with short timeout for WaitForRetry
-	ctxTimeout, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	// WaitForRetry should timeout
-	_, err = session.WaitForRetry(ctxTimeout, 5*time.Second)
-	if err != ErrTimeout && !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("WaitForRetry() error = %v, want ErrTimeout or context.DeadlineExceeded", err)
-	}
-}
-
-// TestClient_CookieMismatch tests that cookie mismatch is detected
-func TestClient_CookieMismatch(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMultiPhaseMockServer(t, socketPath)
-	defer server.Close()
-
-	// Set up script: send wrong cookie in retry response
-	server.SetScript([]MockServerAction{
-		{
-			Phase: 0,
-			Response: &KeyringResponse{
-				Type:     MessageTypeResponse,
-				Result:   ResultOK,
-				Password: "first-password",
-			},
-		},
-		{
-			Phase:       1,
-			WrongCookie: true,
-			Response: &KeyringResponse{
-				Type:     MessageTypeResponse,
-				Result:   ResultOK,
-				Password: "retry-password",
-			},
-		},
-	})
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(5*time.Second),
-	)
-
-	ctx := context.Background()
-
-	// Get initial password
-	password, session, err := client.RequestPasswordWithSession(ctx, "Test", "Enter password")
-	if err != nil {
-		t.Fatalf("RequestPasswordWithSession() error = %v", err)
-	}
-	defer session.Close()
-
-	if password != "first-password" {
-		t.Errorf("Password = %q, want %q", password, "first-password")
-	}
-
-	// Send result with retry
-	err = session.SendResult(false, "Try again", true)
-	if err != nil {
-		t.Fatalf("SendResult() error = %v", err)
-	}
-
-	// WaitForRetry should detect cookie mismatch
-	_, err = session.WaitForRetry(ctx, 5*time.Second)
-	if !errors.Is(err, ErrCookieMismatch) {
-		t.Errorf("WaitForRetry() error = %v, want ErrCookieMismatch", err)
-	}
-}
-
-// TestClient_ContextCancelled tests that context cancellation works during PromptPassword
-func TestClient_ContextCancelled(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMultiPhaseMockServer(t, socketPath)
-	defer server.Close()
-
-	// Set up script: delay the response so we can cancel first
-	server.SetScript([]MockServerAction{
-		{
-			Phase: 0,
-			Delay: 2 * time.Second,
-			Response: &KeyringResponse{
-				Type:     MessageTypeResponse,
-				Result:   ResultOK,
-				Password: "password123",
-			},
-		},
-	})
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(5*time.Second),
-	)
-
-	// Create cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Cancel after a short delay
+func TestPasswordSessionRetryTimeoutClosesSession(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan struct {
+		session *PasswordSession
+		err     error
+	}, 1)
 	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
+		_, session, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+		result <- struct {
+			session *PasswordSession
+			err     error
+		}{session, err}
 	}()
-
-	// RequestPassword should return cancelled error when context is cancelled
-	_, err := client.RequestPassword(ctx, "Test", "Enter password")
-	if err == nil {
-		t.Fatal("RequestPassword() expected error, got nil")
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "wrong"})
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("initial request error = %v", got.err)
 	}
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- got.session.SendResult(false, "invalid", true) }()
+	bridge.pollResult(t)
+	if err := <-sendDone; err != nil {
+		t.Fatalf("SendResult() error = %v", err)
+	}
+	if _, err := got.session.WaitForRetry(context.Background(), 20*time.Millisecond); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("WaitForRetry() error = %v, want ErrTimeout", err)
+	}
+	if err := got.session.SendResult(true, "", false); !errors.Is(err, ErrSessionClosed) {
+		t.Errorf("SendResult() after timeout = %v, want ErrSessionClosed", err)
+	}
+	assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
+}
 
-	// The error should be ErrCancelled when context is cancelled
-	if !errors.Is(err, ErrCancelled) {
-		t.Errorf("RequestPassword() error = %v, want ErrCancelled", err)
+func TestPasswordSessionFinalFailureCleansUp(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan struct {
+		session *PasswordSession
+		err     error
+	}, 1)
+	go func() {
+		_, session, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+		result <- struct {
+			session *PasswordSession
+			err     error
+		}{session, err}
+	}()
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "wrong"})
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("initial request error = %v", got.err)
+	}
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- got.session.SendResult(false, "invalid", false) }()
+	waitForClientPendingResult(t, got.session.bridge)
+	finalResult := bridge.pollResult(t)
+	if finalResult.Success || finalResult.Retry || finalResult.Error != "invalid" {
+		t.Errorf("final failure result = %#v", finalResult)
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatalf("SendResult() error = %v", err)
+	}
+	assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
+}
+
+func TestClientCommandArgumentsDoNotExposeSecrets(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan struct {
+		password string
+		err      error
+	}, 1)
+	go func() {
+		password, err := client.RequestPassword(context.Background(), "title", "message")
+		result <- struct {
+			password string
+			err      error
+		}{password, err}
+	}()
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	password := "super-secret-password"
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: password})
+	got := <-result
+	if got.err != nil || got.password != password {
+		t.Fatalf("request result = %q, %v", got.password, got.err)
+	}
+	joined := strings.Join(append([]string{call.name}, call.args...), " ")
+	for _, secret := range []string{password, bridge.descriptor.Token, bridge.descriptor.BaseURL, descriptorPath(runtimeDir, bridge.cookie)} {
+		if strings.Contains(joined, secret) {
+			t.Errorf("command arguments contain secret %q: %s", secret, joined)
+		}
 	}
 }
 
-// TestClient_WaitForRetry_ContextCancelled tests context cancellation during WaitForRetry
-func TestClient_WaitForRetry_ContextCancelled(t *testing.T) {
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewMultiPhaseMockServer(t, socketPath)
-	defer server.Close()
-
-	// Set up script: respond to initial request, but don't respond to retry
-	server.SetScript([]MockServerAction{
-		{
-			Phase: 0,
-			Response: &KeyringResponse{
-				Type:     MessageTypeResponse,
-				Result:   ResultOK,
-				Password: "first-password",
-			},
-		},
-		{
-			Phase:    1,
-			Delay:    5 * time.Second, // Long delay
-			Response: nil,
-		},
-	})
-
-	client := NewClient(
-		WithSocketPath(socketPath),
-		WithTimeout(10*time.Second),
-	)
-
-	ctx := context.Background()
-
-	// Get initial password
-	password, session, err := client.RequestPasswordWithSession(ctx, "Test", "Enter password")
-	if err != nil {
-		t.Fatalf("RequestPasswordWithSession() error = %v", err)
-	}
-	defer session.Close()
-
-	if password != "first-password" {
-		t.Errorf("Password = %q, want %q", password, "first-password")
-	}
-
-	// Send result with retry
-	err = session.SendResult(false, "Try again", true)
-	if err != nil {
-		t.Fatalf("SendResult() error = %v", err)
-	}
-
-	// Create cancellable context for WaitForRetry
-	ctxRetry, cancel := context.WithCancel(context.Background())
-
-	// Cancel after a short delay
+func TestPasswordSessionCloseIsIdempotent(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client, calls := newTestClient(t, time.Second)
+	result := make(chan *PasswordSession, 1)
 	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
+		_, session, _ := client.RequestPasswordWithSession(context.Background(), "title", "message")
+		result <- session
 	}()
-
-	// WaitForRetry should return ErrCancelled when context is cancelled
-	_, err = session.WaitForRetry(ctxRetry, 10*time.Second)
-	if err == nil {
-		t.Fatal("WaitForRetry() expected error after context cancellation")
+	call := waitForCommand(t, calls)
+	bridge := newTestBridge(t, call)
+	request := bridge.getRequest(t)
+	bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "secret"})
+	session := <-result
+	if session == nil {
+		t.Fatal("session is nil")
 	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	if err := session.SendResult(true, "", false); !errors.Is(err, ErrSessionClosed) {
+		t.Errorf("SendResult() after Close() = %v, want ErrSessionClosed", err)
+	}
+	assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
+}
 
-	// Should return ErrCancelled when context is cancelled
-	if !errors.Is(err, ErrCancelled) {
-		t.Errorf("WaitForRetry() error = %v, want ErrCancelled", err)
+func TestPasswordSessionProtocolAndCookieErrorsClose(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response func(*testBridge) KeyringResponse
+		want     error
+	}{
+		{
+			name: "cookie",
+			response: func(b *testBridge) KeyringResponse {
+				return KeyringResponse{Type: MessageTypeResponse, ID: strings.Repeat("a", 32), Result: ResultOK, Password: "secret"}
+			},
+			want: ErrCookieMismatch,
+		},
+		{
+			name: "protocol",
+			response: func(b *testBridge) KeyringResponse {
+				return KeyringResponse{Type: MessageTypeRequest, ID: b.cookie, Result: ResultOK, Password: "secret"}
+			},
+			want: ErrProtocolError,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtimeDir := newTestRuntime(t)
+			client, calls := newTestClient(t, time.Second)
+			result := make(chan struct {
+				session *PasswordSession
+				err     error
+			}, 1)
+			go func() {
+				_, session, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+				result <- struct {
+					session *PasswordSession
+					err     error
+				}{session, err}
+			}()
+			call := waitForCommand(t, calls)
+			bridge := newTestBridge(t, call)
+			request := bridge.getRequest(t)
+			bridge.postResponse(t, KeyringResponse{Type: MessageTypeResponse, ID: request.Cookie, Result: ResultOK, Password: "secret"})
+			got := <-result
+			if got.err != nil || got.session == nil {
+				t.Fatalf("initial request = session %v, error %v", got.session, got.err)
+			}
+			response := test.response(bridge)
+			if test.name == "cookie" && response.ID == request.Cookie {
+				t.Fatal("test response accidentally matches request cookie")
+			}
+			reserveBridgeResponse(got.session.bridge, response)
+			if _, err := got.session.WaitForRetry(context.Background(), time.Second); !errors.Is(err, test.want) {
+				t.Fatalf("WaitForRetry() error = %v, want %v", err, test.want)
+			}
+			assertDescriptorRemoved(t, runtimeDir, bridge.cookie)
+		})
+	}
+}
+
+func TestClientErrorFormattingDoesNotExposeBridgeDetails(t *testing.T) {
+	runtimeDir := newTestRuntime(t)
+	client := NewClient(WithCommandRunner(func(context.Context, string, ...string) error {
+		return fmt.Errorf("runner error")
+	}))
+	_, _, err := client.RequestPasswordWithSession(context.Background(), "title", "message")
+	if err == nil || !errors.Is(err, ErrPluginUnavailable) {
+		t.Fatalf("error = %v, want wrapped ErrPluginUnavailable", err)
+	}
+	if strings.Contains(err.Error(), runtimeDir) || strings.Contains(err.Error(), "noctalia-") {
+		t.Errorf("error exposes bridge details: %v", err)
 	}
 }

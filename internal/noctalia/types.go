@@ -1,10 +1,9 @@
-// Package noctalia provides an IPC client for the Noctalia Quickshell plugin
-// to enable Noctalia UI integration for password prompts.
+// Package noctalia provides a Noctalia v5 client for password prompts.
 package noctalia
 
 import "errors"
 
-// KeyringRequest is sent to the Noctalia Quickshell plugin to request a password prompt.
+// KeyringRequest is sent to the Noctalia v5 plugin to request a password prompt.
 // The plugin will display a UI dialog and return the password via KeyringResponse.
 type KeyringRequest struct {
 	Type        string `json:"type"`         // Always "keyring_request"
@@ -16,7 +15,7 @@ type KeyringRequest struct {
 	ConfirmOnly bool   `json:"confirm_only"` // Whether to just confirm (no password input)
 }
 
-// KeyringResponse is received from the Noctalia Quickshell plugin after the user
+// KeyringResponse is received from the Noctalia v5 plugin after the user
 // interacts with the password dialog.
 type KeyringResponse struct {
 	Type     string `json:"type"`               // Always "keyring_response"
@@ -39,7 +38,7 @@ const (
 	MessageTypeResult   = "keyring_result"
 )
 
-// KeyringResult is sent from the Go client back to the plugin after an unlock attempt.
+// KeyringResult is sent from the Go client back to the Noctalia v5 plugin after an unlock attempt.
 // This enables two-phase communication for password retry support.
 type KeyringResult struct {
 	Type    string `json:"type"`            // Always "keyring_result"
@@ -49,47 +48,21 @@ type KeyringResult struct {
 	Retry   bool   `json:"retry,omitempty"` // Whether retry is allowed (only when !Success)
 }
 
-// Error types for Noctalia IPC operations
+// Error types for Noctalia v5 operations.
 var (
-	// ErrSocketNotFound indicates the Noctalia agent socket does not exist
-	ErrSocketNotFound = errors.New("noctalia socket not found")
+	ErrPluginUnavailable = errors.New("noctalia v5 plugin unavailable")
+	ErrSocketNotFound    = ErrPluginUnavailable
+	ErrConnectionFailed  = ErrPluginUnavailable
 
-	// ErrConnectionFailed indicates a failure to connect to the Noctalia plugin
-	ErrConnectionFailed = errors.New("failed to connect to noctalia plugin")
-
-	// ErrTimeout indicates the password request timed out
 	ErrTimeout = errors.New("noctalia request timed out")
 
-	// ErrCancelled indicates the user cancelled the password prompt
 	ErrCancelled = errors.New("user cancelled password prompt")
 
-	// ErrConfirmOnly indicates the request was a confirm-only request that was acknowledged
 	ErrConfirmOnly = errors.New("confirm-only request acknowledged")
 
-	// ErrProtocolError indicates an unexpected response from the agent
 	ErrProtocolError = errors.New("noctalia protocol error")
 
-	// ErrCookieMismatch indicates the response cookie doesn't match the request
 	ErrCookieMismatch = errors.New("response cookie does not match request")
 
-	// ErrSessionClosed indicates the authenticated prompt bridge has closed.
 	ErrSessionClosed = errors.New("noctalia session closed")
-
-	// ErrSocketSymlink indicates the socket path is a symbolic link
-	ErrSocketSymlink = errors.New("socket is a symbolic link")
-
-	// ErrSocketNotSocket indicates the path exists but is not a socket
-	ErrSocketNotSocket = errors.New("path is not a socket")
-
-	// ErrSocketPermissions indicates the socket has unsafe permissions
-	ErrSocketPermissions = errors.New("socket has unsafe permissions (group or world writable)")
-
-	// ErrSocketOwner indicates the socket is owned by a different user
-	ErrSocketOwner = errors.New("socket owned by different user")
-
-	// ErrSocketParentPerms indicates the parent directory has unsafe permissions
-	ErrSocketParentPerms = errors.New("parent directory has unsafe permissions (group or world writable)")
-
-	// ErrSocketParentOwner indicates the parent directory is owned by a different user
-	ErrSocketParentOwner = errors.New("socket parent directory owned by different user")
 )
