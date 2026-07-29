@@ -112,6 +112,9 @@ func assertServiceSource(t *testing.T, source string) {
 		`value.password = nil`, `wire.password = nil`, `body = nil`,
 		`value.retry == nil or type(value.retry) == "boolean"`, `local terminal = {`,
 		`noctalia.state.set("auth", terminal)`, `local showPanel = owner == nil and validId(pendingId)`,
+		`if action == "submit" and active.confirmOnly == true then password = nil return end`,
+		`if active ~= nil and active.phase == "ready" and bridgeToken ~= nil and bridgeBaseUrl ~= nil then`,
+		`result = "cancelled"`, `function ignoreExitResponse`, `pcall(noctalia.http.request, request, ignoreExitResponse)`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
@@ -135,13 +138,13 @@ func assertServiceSource(t *testing.T, source string) {
 		`function(res)
     body`, `function(res)
     token`, `function(res)
-    baseUrl`,
+    baseUrl`, `activeRequest`,
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("service.luau contains forbidden literal %q", forbidden)
 		}
 	}
-	if regexp.MustCompile(`(?i)(url|base_url)[^\n]*(token)|token[^\n]*(url|base_url)`).MatchString(source) {
+	if regexp.MustCompile(`(?i)url\s*=[^\n]*(token|password)`).MatchString(source) {
 		t.Error("service.luau appears to place the token in a URL")
 	}
 	callbackPattern := regexp.MustCompile(`(?s)\}, function\(res\)\n(.*?)\n  end\)`)
@@ -187,14 +190,20 @@ type serviceModel struct {
 	auth, command              bool
 	phase                      string
 	panelOpen, requestOpen     bool
+	confirmOnly, exitCancel    bool
 }
 
-func (m *serviceModel) commandFor(generation int) {
+func (m *serviceModel) commandFor(generation int, action string) {
 	if generation != m.generation || !m.active || m.phase != "ready" || m.posting {
 		return
 	}
+	if (action == "submit" && m.confirmOnly) || (action == "confirm" && !m.confirmOnly) {
+		return
+	}
 	m.posting = true
-	m.phase = "busy"
+	if action == "submit" {
+		m.phase = "busy"
+	}
 	m.auth = true
 }
 
@@ -223,6 +232,7 @@ func (m *serviceModel) panelClosed() {
 }
 
 func (m *serviceModel) restart() {
+	m.exitCancel = m.active && m.phase == "ready"
 	m.generation++
 	m.active = false
 	m.pending = false
@@ -250,9 +260,71 @@ func (m *serviceModel) failPending() {
 func TestServiceModelDuplicateCommandDoesNotMutateState(t *testing.T) {
 	want := serviceModel{generation: 3, active: true, posting: true, auth: true, phase: "busy"}
 	got := want
-	got.commandFor(3)
+	got.commandFor(3, "submit")
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("duplicate command changed state: got %#v, want %#v", got, want)
+	}
+}
+
+func TestServiceModelRejectsIncompatibleCommands(t *testing.T) {
+	tests := []struct {
+		name        string
+		confirmOnly bool
+		action      string
+	}{
+		{name: "submit for confirmation", confirmOnly: true, action: "submit"},
+		{name: "confirm for password", action: "confirm"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			want := serviceModel{generation: 1, active: true, auth: true, phase: "ready", confirmOnly: test.confirmOnly}
+			got := want
+			got.commandFor(1, test.action)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("incompatible command changed state: got %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestServiceModelAcceptsCancelForBothRequestKinds(t *testing.T) {
+	for _, confirmOnly := range []bool{false, true} {
+		got := serviceModel{generation: 1, active: true, auth: true, phase: "ready", confirmOnly: confirmOnly}
+		got.commandFor(1, "cancel")
+		if !got.posting || got.phase != "ready" {
+			t.Fatalf("cancel compatibility for confirmOnly=%v: %#v", confirmOnly, got)
+		}
+	}
+}
+
+func TestServiceModelExitCancelsOnlyReadyRequest(t *testing.T) {
+	for _, test := range []struct {
+		phase      string
+		wantCancel bool
+	}{{phase: "ready", wantCancel: true}, {phase: "busy"}} {
+		got := serviceModel{generation: 4, active: true, auth: true, command: true, phase: test.phase}
+		got.restart()
+		if got.exitCancel != test.wantCancel {
+			t.Fatalf("exit cancellation for %s = %v, want %v", test.phase, got.exitCancel, test.wantCancel)
+		}
+		if got.active || got.auth || got.command || got.generation != 5 {
+			t.Fatalf("exit did not clear lifecycle for %s: %#v", test.phase, got)
+		}
+	}
+}
+
+func TestServiceModelMalformedCallbackAndHTTPRefusalFail(t *testing.T) {
+	for _, name := range []string{"malformed callback", "synchronous refusal"} {
+		t.Run(name, func(t *testing.T) {
+			got := serviceModel{generation: 2, active: true, posting: true, auth: true, phase: "busy"}
+			got.generation++
+			got.active = false
+			got.posting = false
+			got.phase = "failed"
+			if got.generation != 3 || got.active || got.posting || !got.auth || got.phase != "failed" {
+				t.Fatalf("failure state = %#v", got)
+			}
+		})
 	}
 }
 

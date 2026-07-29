@@ -10,7 +10,6 @@ local posting = false
 local polling = false
 local bridgeToken = nil
 local bridgeBaseUrl = nil
-local activeRequest = nil
 local encodedBody = nil
 local postAction = nil
 
@@ -81,7 +80,6 @@ local function finish(phase, errorText)
   polling = false
   bridgeToken = nil
   bridgeBaseUrl = nil
-  activeRequest = nil
   encodedBody = nil
   postAction = nil
   if showPanel then openPanel() end
@@ -165,7 +163,6 @@ local function openRequest(id)
       confirmOnly = request.confirm_only == true,
       phase = "ready",
     }
-    activeRequest = request
     request = nil
     pendingId = nil
     publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
@@ -193,6 +190,7 @@ local function onCommand(value)
   noctalia.state.set("command", nil)
   if not validId(id) or not validAction(action) then password = nil return end
   if active == nil or id ~= active.id or active.phase ~= "ready" or posting then password = nil return end
+  if action == "submit" and active.confirmOnly == true then password = nil return end
   if action == "submit" and (type(password) ~= "string" or #password == 0) then password = nil return end
   if action == "confirm" and active.confirmOnly ~= true then password = nil return end
   if action ~= "submit" then password = nil end
@@ -294,7 +292,29 @@ function onIpc(event, payload)
   openRequest(payload)
 end
 
+local function ignoreExitResponse(_res)
+end
+
 function onExit()
+  if active ~= nil and active.phase == "ready" and bridgeToken ~= nil and bridgeBaseUrl ~= nil then
+    local wire = {type = "keyring_response", id = active.id, result = "cancelled"}
+    local encoded, body = pcall(noctalia.json.encode, wire)
+    wire = nil
+    if encoded and type(body) == "string" then
+      local request = {
+        method = "POST",
+        url = bridgeBaseUrl .. "/v1/response",
+        headers = responseHeaders(bridgeToken),
+        body = body,
+      }
+      pcall(noctalia.http.request, request, ignoreExitResponse)
+      request.body = nil
+      request.headers = nil
+      request.url = nil
+      request = nil
+    end
+    body = nil
+  end
   generation = generation + 1
   active = nil
   pendingId = nil
@@ -303,7 +323,6 @@ function onExit()
   polling = false
   bridgeToken = nil
   bridgeBaseUrl = nil
-  activeRequest = nil
   encodedBody = nil
   postAction = nil
   noctalia.state.set("command", nil)
