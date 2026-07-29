@@ -99,7 +99,9 @@ function render()
     }))
   end
   table.insert(children, ui.text({ text = errorText }))
-  if auth ~= nil and auth.phase == "failed" then
+  if auth == nil then
+    table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = true, onClick = "onInvalidDismiss" }))
+  elseif auth.phase == "failed" then
     table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = true, onClick = "onDismiss" }))
   end
   table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = ready, onClick = "onCancel" }))
@@ -166,6 +168,12 @@ function onDismiss()
   requestProgrammaticDismiss()
 end
 
+function onInvalidDismiss()
+  if auth ~= nil then return end
+  clearPassword()
+  requestProgrammaticDismiss()
+end
+
 function onOpen()
   suppressCloseCancel = false
   noctalia.state.set("panel_open", true)
@@ -176,17 +184,18 @@ end
 
 function onClose()
   noctalia.state.set("panel_open", false)
-  clearPassword()
   if not suppressCloseCancel and auth ~= nil and auth.phase == "ready" then
+    auth.phase = "cancelling"
+    clearPassword()
     noctalia.state.set("command", { action = "cancel", id = auth.id })
+  else
+    clearPassword()
   end
   suppressCloseCancel = false
 end
 
 function onAuthChanged(value)
   inputAccepting = false
-  local previousId = auth ~= nil and auth.id or nil
-  local previousPhase = auth ~= nil and auth.phase or nil
   if value == false then
     clearPassword()
     auth = nil
@@ -200,9 +209,7 @@ function onAuthChanged(value)
     rerender()
     return
   end
-  if nextAuth.id ~= previousId or nextAuth.phase ~= previousPhase then
-    clearPassword()
-  end
+  clearPassword()
   auth = nextAuth
   rerender()
   if auth.phase == "cancelled" then

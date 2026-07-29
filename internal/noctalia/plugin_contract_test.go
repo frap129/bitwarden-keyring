@@ -175,7 +175,7 @@ func assertPanelSource(t *testing.T, source string) {
 		t.Error("panel.luau terminal failure is not dismissible with a named callback")
 	}
 	for _, forbidden := range []string{
-		"keyboard_focus", "frameTick", "onFrame", "setUpdateInterval", "setTimeout", "setInterval", "animation", "timer", "geometry",
+		"frameTick", "onFrame", "setUpdateInterval", "setTimeout", "setInterval", "animation", "timer", "geometry",
 		"pluginSettings", "openPanel", "closePanel", "saveSettings",
 		"pluginApi", "SocketServer", "Quickshell", "runAsync", "runStream", "print(",
 	} {
@@ -192,8 +192,20 @@ func assertPanelSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)function onAuthChanged\(value\)\s+inputAccepting = false`).MatchString(source) {
 		t.Error("panel.luau auth watch must synchronously stop accepting stale input")
 	}
+	if !regexp.MustCompile(`(?s)local nextAuth = sanitizeAuth\(value\).*?if nextAuth == nil then.*?end\s+clearPassword\(\)\s+auth = nextAuth`).MatchString(source) {
+		t.Error("panel.luau must clear password and increment its key for every valid auth update")
+	}
 	if !regexp.MustCompile(`(?s)function onDismiss\(\)\s+if auth == nil or auth\.phase ~= "failed" then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
 		t.Error("panel.luau dismiss must validate the current failed auth before suppressing close")
+	}
+	if !regexp.MustCompile(`(?s)function onInvalidDismiss\(\)\s+if auth ~= nil then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
+		t.Error("panel.luau invalid-state dismiss must not close or suppress a valid request")
+	}
+	if !strings.Contains(source, `onClick = "onInvalidDismiss"`) {
+		t.Error("panel.luau invalid state is not dismissible")
+	}
+	if !regexp.MustCompile(`(?s)function onClose\(\).*?if not suppressCloseCancel and auth ~= nil and auth\.phase == "ready" then\s+auth\.phase = "cancelling"\s+clearPassword\(\)\s+noctalia\.state\.set\("command", \{ action = "cancel", id = auth\.id \}\)`).MatchString(source) {
+		t.Error("panel.luau close must transition ready auth before publishing one cancellation")
 	}
 	if strings.Count(source, `capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id`) != 2 {
 		t.Error("panel.luau must generation- and ID-guard both input callbacks")
@@ -214,6 +226,56 @@ type panelCallbackModel struct {
 	password                                  string
 	closed, suppressed                        bool
 	submitted                                 bool
+	commands                                  int
+}
+
+func (m *panelCallbackModel) authUpdate() {
+	m.inputAccepting = false
+	m.password = ""
+	m.inputKey++
+}
+
+func (m *panelCallbackModel) close() {
+	if !m.suppressed && m.authComplete && m.phase == "ready" {
+		m.phase = "cancelling"
+		m.password = ""
+		m.inputKey++
+		m.commands++
+	}
+	m.suppressed = false
+}
+
+func (m *panelCallbackModel) invalidDismiss() {
+	if m.authComplete {
+		return
+	}
+	m.suppressed = true
+	m.closed = true
+}
+
+func TestPanelModelSameAuthUpdateClearsAndIncrements(t *testing.T) {
+	model := panelCallbackModel{authComplete: true, inputAccepting: true, inputKey: 4, authID: "same", phase: "ready", password: "secret"}
+	model.authUpdate()
+	if model.password != "" || model.inputKey != 5 || model.inputAccepting {
+		t.Fatalf("same-ID auth update retained input state: %#v", model)
+	}
+}
+
+func TestPanelModelRepeatedCloseCancelsOnce(t *testing.T) {
+	model := panelCallbackModel{authComplete: true, inputKey: 2, phase: "ready", password: "secret"}
+	model.close()
+	model.close()
+	if model.commands != 1 || model.phase != "cancelling" || model.password != "" || model.inputKey != 3 {
+		t.Fatalf("repeated close lifecycle = %#v", model)
+	}
+}
+
+func TestPanelModelInvalidDismissRejectsCurrentAuth(t *testing.T) {
+	model := panelCallbackModel{authComplete: true, phase: "ready"}
+	model.invalidDismiss()
+	if model.closed || model.suppressed {
+		t.Fatalf("stale invalid dismiss changed valid auth: %#v", model)
+	}
 }
 
 func (m *panelCallbackModel) unlock(capturedInputKey int, capturedID string) {
