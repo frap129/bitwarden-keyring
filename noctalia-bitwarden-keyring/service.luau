@@ -140,7 +140,7 @@ local function openRequest(id)
   descriptor.token = nil
   descriptor.base_url = nil
   descriptor = nil
-  local started = noctalia.http.request({
+  local started = noctalia.http({
     method = "GET",
     url = bridgeBaseUrl .. "/v1/request",
     headers = requestHeaders(bridgeToken),
@@ -215,7 +215,7 @@ local function onCommand(value)
   if postAction == "submit" then
     publish(active.id, active.title, active.prompt, active.confirmOnly, "busy", "")
   end
-  local started = noctalia.http.request({
+  local started = noctalia.http({
     method = "POST",
     url = bridgeBaseUrl .. "/v1/response",
     headers = responseHeaders(bridgeToken),
@@ -254,7 +254,7 @@ function update()
   local capturedGeneration = generation
   local capturedId = active.id
   polling = true
-  local started = noctalia.http.request({
+  local started = noctalia.http({
     method = "GET",
     url = bridgeBaseUrl .. "/v1/result?id=" .. capturedId,
     headers = requestHeaders(bridgeToken),
@@ -307,7 +307,7 @@ function onExit()
         headers = responseHeaders(bridgeToken),
         body = body,
       }
-      pcall(noctalia.http.request, request, ignoreExitResponse)
+      pcall(noctalia.http, request, ignoreExitResponse)
       request.body = nil
       request.headers = nil
       request.url = nil

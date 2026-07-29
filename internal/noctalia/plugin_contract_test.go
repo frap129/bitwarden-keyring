@@ -466,7 +466,7 @@ func assertServiceSource(t *testing.T, source string) {
 		`noctalia.state.set("auth", terminal)`, `local showPanel = owner == nil and validId(pendingId)`,
 		`if action == "submit" and active.confirmOnly == true then password = nil return end`,
 		`if active ~= nil and active.phase == "ready" and bridgeToken ~= nil and bridgeBaseUrl ~= nil then`,
-		`result = "cancelled"`, `function ignoreExitResponse`, `pcall(noctalia.http.request, request, ignoreExitResponse)`,
+		`result = "cancelled"`, `function ignoreExitResponse`, `noctalia.http({`, `pcall(noctalia.http, request, ignoreExitResponse)`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
@@ -485,7 +485,7 @@ func assertServiceSource(t *testing.T, source string) {
 	}
 	for _, forbidden := range []string{
 		`panel_open", nil`, `panel_open", false`, `panel_open", true`,
-		"os.execute", "io.popen", "noctalia.exec", "noctalia.spawn", "console.log", "logger", "notify(",
+		"os.execute", "io.popen", "noctalia.exec", "noctalia.spawn", "console.log", "logger", "notify(", "noctalia.http.request",
 		`publish(active.id, active.title, active.prompt, active.confirmOnly, "cancelling"`, `result.error`,
 		`function(res)
     body`, `function(res)
