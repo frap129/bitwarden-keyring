@@ -168,6 +168,14 @@ func parseManifestValue(raw string) (any, error) {
 		}
 		return values, nil
 	}
+	if raw == "" || (raw != "0" && (raw[0] < '1' || raw[0] > '9')) {
+		return nil, fmt.Errorf("invalid value %q", raw)
+	}
+	for _, digit := range raw[1:] {
+		if digit < '0' || digit > '9' {
+			return nil, fmt.Errorf("invalid value %q", raw)
+		}
+	}
 	value, err := strconv.Atoi(raw)
 	if err != nil {
 		return nil, fmt.Errorf("invalid value %q", raw)
@@ -222,6 +230,45 @@ func TestParseManifestValueQuotedStrings(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, test.want) {
 				t.Errorf("parseManifestValue(%q) = %#v, want %#v", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseManifestValueIntegers(t *testing.T) {
+	tests := []struct {
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		{raw: "0", want: 0},
+		{raw: "8", want: 8},
+		{raw: "400", want: 400},
+		{raw: "300", want: 300},
+		{raw: "08", wantErr: true},
+		{raw: "0400", wantErr: true},
+		{raw: "+8", wantErr: true},
+		{raw: "-1", wantErr: true},
+		{raw: " 8", wantErr: true},
+		{raw: "8 ", wantErr: true},
+		{raw: "1_0", wantErr: true},
+		{raw: "0x8", wantErr: true},
+		{raw: "8.0", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.raw, func(t *testing.T) {
+			got, err := parseManifestValue(test.raw)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("parseManifestValue(%q) = %#v, want error", test.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseManifestValue(%q) error = %v", test.raw, err)
+			}
+			if got != test.want {
+				t.Errorf("parseManifestValue(%q) = %#v, want %d", test.raw, got, test.want)
 			}
 		})
 	}
