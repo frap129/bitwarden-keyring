@@ -144,11 +144,7 @@ func parsePluginManifest(source string) (pluginManifest, error) {
 
 func parseManifestValue(raw string) (any, error) {
 	if strings.HasPrefix(raw, `"`) {
-		value, err := strconv.Unquote(raw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid quoted string: %w", err)
-		}
-		return value, nil
+		return parseManifestString(raw)
 	}
 	if raw == "true" || raw == "false" {
 		return raw == "true", nil
@@ -164,7 +160,7 @@ func parseManifestValue(raw string) (any, error) {
 		parts := strings.Split(inner, ",")
 		values := make([]string, 0, len(parts))
 		for _, part := range parts {
-			value, err := strconv.Unquote(strings.TrimSpace(part))
+			value, err := parseManifestString(strings.TrimSpace(part))
 			if err != nil {
 				return nil, fmt.Errorf("invalid string array %q", raw)
 			}
@@ -177,6 +173,58 @@ func parseManifestValue(raw string) (any, error) {
 		return nil, fmt.Errorf("invalid value %q", raw)
 	}
 	return value, nil
+}
+
+func parseManifestString(raw string) (string, error) {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' || strings.Contains(raw, `\`) {
+		return "", fmt.Errorf("invalid quoted string %q", raw)
+	}
+	for _, character := range raw[1 : len(raw)-1] {
+		if character < ' ' || character == 0x7f {
+			return "", fmt.Errorf("invalid quoted string %q", raw)
+		}
+	}
+	value, err := strconv.Unquote(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid quoted string: %w", err)
+	}
+	return value, nil
+}
+
+func TestParseManifestValueQuotedStrings(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    any
+		wantErr bool
+	}{
+		{name: "scalar", raw: `"Bitwarden Keyring"`, want: "Bitwarden Keyring"},
+		{name: "array", raw: `["bitwarden", "password", "security"]`, want: []string{"bitwarden", "password", "security"}},
+		{name: "scalar Go hex escape", raw: `"Bitwarden\x20Keyring"`, wantErr: true},
+		{name: "scalar Go octal escape", raw: `"Bitwarden\040Keyring"`, wantErr: true},
+		{name: "array Go hex escape", raw: `["bitwarden", "pass\x77ord"]`, wantErr: true},
+		{name: "array Go octal escape", raw: `["bitwarden", "pass\167ord"]`, wantErr: true},
+		{name: "array unquoted element", raw: `["bitwarden", password]`, wantErr: true},
+		{name: "scalar control character", raw: "\"Bitwarden\nKeyring\"", wantErr: true},
+		{name: "array control character", raw: "[\"bitwarden\", \"pass\nword\"]", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseManifestValue(test.raw)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("parseManifestValue(%q) = %#v, want error", test.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseManifestValue(%q) error = %v", test.raw, err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Errorf("parseManifestValue(%q) = %#v, want %#v", test.raw, got, test.want)
+			}
+		})
+	}
 }
 
 func assertPluginManifest(t *testing.T, got pluginManifest) {
