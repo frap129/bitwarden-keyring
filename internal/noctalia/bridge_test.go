@@ -1024,6 +1024,46 @@ func TestPromptBridgeWaitResponseStaleBufferedResponseLosesToClose(t *testing.T)
 	}
 }
 
+func TestPromptBridgeTerminalWaitDoesNotConsumeLateResponse(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := bridge.waitResponse(ctx, time.Second); !errors.Is(err, ErrCancelled) {
+		t.Fatalf("waitResponse() error = %v, want ErrCancelled", err)
+	}
+
+	late := testKeyringResponse(bridge, ResultOK, "late")
+	bridge.mu.Lock()
+	bridge.responseInFlight = true
+	bridge.pendingResponse = late
+	bridge.mu.Unlock()
+	bridge.responses <- late
+
+	if _, err := bridge.waitResponse(context.Background(), time.Second); !errors.Is(err, ErrCancelled) {
+		t.Errorf("later waitResponse() error = %v, want original ErrCancelled", err)
+	}
+}
+
+func TestPromptBridgeResponseReservationWinsClose(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	response := testKeyringResponse(bridge, ResultOK, "password")
+	reply := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, response))
+	reply.Body.Close()
+	if reply.StatusCode != http.StatusAccepted {
+		t.Fatalf("response status = %d, want %d", reply.StatusCode, http.StatusAccepted)
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	got, err := bridge.waitResponse(context.Background(), time.Second)
+	if err != nil {
+		t.Fatalf("waitResponse() error = %v, want response", err)
+	}
+	if got != response {
+		t.Errorf("waitResponse() = %#v, want %#v", got, response)
+	}
+}
+
 func TestPromptBridgeResultFinalizationOrdering(t *testing.T) {
 	t.Run("finalize first", func(t *testing.T) {
 		bridge := newTestPromptBridge(t, testPromptRequest())

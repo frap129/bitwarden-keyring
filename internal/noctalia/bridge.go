@@ -548,6 +548,9 @@ func (b *promptBridge) waitResponse(ctx context.Context, timeout time.Duration) 
 	if terminal != nil && !responseInFlight {
 		return KeyringResponse{}, terminal
 	}
+	if terminal != nil {
+		return KeyringResponse{}, terminal
+	}
 	if timeout <= 0 {
 		b.mu.Lock()
 		err := b.terminateResponseWaitLocked(ErrTimeout)
