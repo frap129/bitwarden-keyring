@@ -78,6 +78,15 @@ func TestV5PluginSourceContract(t *testing.T) {
 		}
 	}
 
+	if available["panel.luau"] {
+		contents, err := os.ReadFile(filepath.Join(pluginDir, "panel.luau"))
+		if err != nil {
+			t.Errorf("read required plugin file panel.luau: %v", err)
+		} else {
+			assertPanelSource(t, string(contents))
+		}
+	}
+
 	if available["plugin.toml"] {
 		contents, err := os.ReadFile(filepath.Join(pluginDir, "plugin.toml"))
 		if err != nil {
@@ -97,6 +106,83 @@ func TestV5PluginSourceContract(t *testing.T) {
 		} else {
 			assertTranslations(t, contents)
 		}
+	}
+	if available["service.luau"] && available["panel.luau"] && available[translationName] {
+		serviceContents, serviceErr := os.ReadFile(filepath.Join(pluginDir, "service.luau"))
+		panelContents, panelErr := os.ReadFile(filepath.Join(pluginDir, "panel.luau"))
+		translationContents, translationErr := os.ReadFile(filepath.Join(pluginDir, translationName))
+		if serviceErr == nil && panelErr == nil && translationErr == nil {
+			assertTranslationReferences(t, string(serviceContents)+"\n"+string(panelContents), translationContents)
+		}
+	}
+}
+
+func assertTranslationReferences(t *testing.T, source string, contents []byte) {
+	t.Helper()
+	var document map[string]any
+	if err := json.Unmarshal(contents, &document); err != nil {
+		return
+	}
+	references := regexp.MustCompile(`noctalia\.tr\("([^"]+)"\)`).FindAllStringSubmatch(source, -1)
+	for _, reference := range references {
+		var current any = document
+		for _, segment := range strings.Split(reference[1], ".") {
+			object, ok := current.(map[string]any)
+			if !ok {
+				t.Errorf("source translation %q does not resolve to a nested string", reference[1])
+				break
+			}
+			current, ok = object[segment]
+			if !ok {
+				t.Errorf("source translation %q does not resolve", reference[1])
+				break
+			}
+		}
+		if _, ok := current.(string); !ok {
+			t.Errorf("source translation %q does not resolve to a string", reference[1])
+		}
+	}
+}
+
+func assertPanelSource(t *testing.T, source string) {
+	t.Helper()
+	for _, required := range []string{
+		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local suppressCloseCancel`,
+		`function render()`, `ui.column`, `assets/bitwarden.svg`, `noctalia.getConfig("show_bitwarden_icon")`,
+		`key = "password-" .. inputKey`, `value = ""`, `password = true`, `focus = true`, `enabled = auth.phase == "ready"`,
+		`onChange = "onPasswordChange"`, `onSubmit = "onUnlock"`, `panel.render(render())`,
+		`function onOpen()`, `function onClose()`, `panel.close()`, `noctalia.state.set("panel_open", true)`, `noctalia.state.set("panel_open", false)`,
+		`value.id`, `value.title`, `value.prompt`, `value.confirm_only`, `value.phase`, `value.error`,
+		`action = "submit"`, `action = "cancel"`, `action = "confirm"`,
+		`submitted = nil`, `password = ""`, `inputKey = inputKey + 1`,
+		`noctalia.getConfig("auto_close_on_cancel")`, `noctalia.getConfig("auto_close_on_success")`,
+		`noctalia.state.watch("auth", onAuthChanged)`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Errorf("panel.luau does not contain required literal %q", required)
+		}
+	}
+	for _, action := range []string{`onClick = "onCancel"`, `onClick = "onUnlock"`, `onClick = "onConfirm"`} {
+		if !strings.Contains(source, action) {
+			t.Errorf("panel.luau does not contain named command callback %q", action)
+		}
+	}
+	if !strings.Contains(source, `onClick = "onDismiss"`) {
+		t.Error("panel.luau terminal failure is not dismissible with a named callback")
+	}
+	for _, forbidden := range []string{
+		"keyboard_focus", "frameTick", "onFrame", "setUpdateInterval", "pluginSettings", "openPanel", "closePanel", "saveSettings",
+		"pluginApi", "SocketServer", "Quickshell", "runAsync", "runStream", "print(",
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Errorf("panel.luau contains forbidden literal %q", forbidden)
+		}
+	}
+	if regexp.MustCompile(`(?s)on(?:Change|Submit|Click)\s*=\s*function\s*\(`).MatchString(source) {
+		t.Error("panel.luau contains an inline UI callback")
+	}
+	if regexp.MustCompile(`(?s)noctalia\.state\.set\("auth"[^\n]*(password)|auth\s*=\s*\{[^}]*password`).MatchString(source) {
+		t.Error("panel.luau places a password in shared auth state")
 	}
 }
 

@@ -44,7 +44,7 @@ local function publish(id, title, prompt, confirmOnly, phase, errorText)
   })
 end
 
-local function openPanel()
+local function requestPanelOpen()
   if noctalia.state.get("panel_open") ~= true then
     noctalia.togglePanel(PANEL_ID)
   end
@@ -82,7 +82,7 @@ local function finish(phase, errorText)
   bridgeBaseUrl = nil
   encodedBody = nil
   postAction = nil
-  if showPanel then openPanel() end
+  if showPanel then requestPanelOpen() end
 end
 
 local function bridgeFailure()
@@ -166,7 +166,7 @@ local function openRequest(id)
     request = nil
     pendingId = nil
     publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
-    openPanel()
+    requestPanelOpen()
   end)
   if started == false then
     fetching = false
@@ -275,7 +275,7 @@ function update()
       posting = false
       polling = false
       publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", translated("panel.incorrect_password"))
-      openPanel()
+      requestPanelOpen()
     else
       finish("failed", translated("panel.unlock_failed"))
     end
