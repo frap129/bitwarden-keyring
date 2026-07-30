@@ -244,6 +244,7 @@ end
 function onAuthChanged(value)
   inputAccepting = false
   if value == false then
+    if noctalia.state.get("auth") ~= false then return end
     local ownedRequestId = panelRequestId
     clearPassword()
     auth = nil
@@ -252,6 +253,10 @@ function onAuthChanged(value)
       clearOwnedPanelMarker(ownedRequestId, panelInstanceId)
     end
     rerender()
+    if panelOpen then
+      panelOpen = false
+      requestProgrammaticDismiss()
+    end
     return
   end
   local ownedRequestId = panelRequestId
