@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	cryptossh "golang.org/x/crypto/ssh"
@@ -21,6 +22,37 @@ type mockBitwardenClient struct {
 	createCalls   int
 	deleteCalls   int
 	deleteItemIDs []string
+}
+
+type refreshErrorBitwardenClient struct {
+	t         *testing.T
+	listErr   error
+	listCalls atomic.Int64
+}
+
+func (c *refreshErrorBitwardenClient) ListItems(context.Context) ([]bitwarden.Item, error) {
+	c.listCalls.Add(1)
+	return nil, c.listErr
+}
+
+func (c *refreshErrorBitwardenClient) CreateItem(context.Context, bitwarden.CreateItemRequest) (*bitwarden.Item, error) {
+	c.t.Error("unexpected CreateItem call")
+	return nil, errors.New("unexpected CreateItem call")
+}
+
+func (c *refreshErrorBitwardenClient) DeleteItem(context.Context, string) error {
+	c.t.Error("unexpected DeleteItem call")
+	return errors.New("unexpected DeleteItem call")
+}
+
+func (c *refreshErrorBitwardenClient) Lock(context.Context) error {
+	c.t.Error("unexpected Lock call")
+	return errors.New("unexpected Lock call")
+}
+
+func (c *refreshErrorBitwardenClient) Unlock(context.Context, string) (string, error) {
+	c.t.Error("unexpected Unlock call")
+	return "", errors.New("unexpected Unlock call")
 }
 
 func (m *mockBitwardenClient) ListItems(ctx context.Context) ([]bitwarden.Item, error) {
@@ -385,5 +417,56 @@ func TestKeyring_Extension(t *testing.T) {
 	_, err := tk.Extension("test", nil)
 	if err != agent.ErrExtensionUnsupported {
 		t.Errorf("Extension() error = %v, want %v", err, agent.ErrExtensionUnsupported)
+	}
+}
+
+func TestKeyring_RefreshConsumersPreserveUnlockErrorIdentity(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	signer, err := cryptossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("NewSignerFromKey() error = %v", err)
+	}
+
+	consumers := []struct {
+		name string
+		call func(*Keyring) error
+	}{
+		{name: "List", call: func(k *Keyring) error { _, err := k.List(); return err }},
+		{name: "Signers", call: func(k *Keyring) error { _, err := k.Signers(); return err }},
+		{name: "Sign", call: func(k *Keyring) error { _, err := k.Sign(signer.PublicKey(), []byte("data")); return err }},
+		{name: "Add", call: func(k *Keyring) error {
+			return k.Add(agent.AddedKey{PrivateKey: privateKey, Comment: "test-key"})
+		}},
+		{name: "Remove", call: func(k *Keyring) error { return k.Remove(signer.PublicKey()) }},
+		{name: "Unlock", call: func(k *Keyring) error { return k.Unlock(nil) }},
+	}
+	errorsToPreserve := []struct {
+		name string
+		err  error
+	}{
+		{name: "user_cancelled", err: bitwarden.ErrUserCancelled},
+		{name: "max_retries_exceeded", err: bitwarden.ErrMaxRetriesExceeded},
+	}
+
+	for _, consumer := range consumers {
+		t.Run(consumer.name, func(t *testing.T) {
+			for _, sentinel := range errorsToPreserve {
+				t.Run(sentinel.name, func(t *testing.T) {
+					client := &refreshErrorBitwardenClient{t: t, listErr: sentinel.err}
+					keyring := NewKeyring(client)
+
+					err := consumer.call(keyring)
+					if !errors.Is(err, sentinel.err) {
+						t.Fatalf("error = %v, want errors.Is(_, %v)", err, sentinel.err)
+					}
+					if calls := client.listCalls.Load(); calls != 1 {
+						t.Errorf("ListItems calls = %d, want 1", calls)
+					}
+				})
+			}
+		})
 	}
 }
