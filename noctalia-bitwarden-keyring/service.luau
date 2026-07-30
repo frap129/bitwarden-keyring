@@ -71,8 +71,7 @@ local function publish(id, title, prompt, confirmOnly, phase, errorText)
   })
 end
 
-local function freshPanelMarker(id, now)
-  local marker = noctalia.state.get("panel_open")
+local function freshPanelMarker(marker, id, now)
   local heartbeat = type(marker) == "table" and marker.heartbeat or nil
   return type(marker) == "table" and marker.id == id and validId(marker.instance)
     and type(heartbeat) == "number" and heartbeat == heartbeat and heartbeat ~= math.huge and heartbeat ~= -math.huge
@@ -87,11 +86,13 @@ end
 local function requestPanelOpen(id)
   if not validId(id) then return end
   local now = os.time()
-  if freshPanelMarker(id, now) then
+  local marker = noctalia.state.get("panel_open")
+  if freshPanelMarker(marker, id, now) then
     panelOpeningFor = nil
     panelVisibleFor = id
     return
   end
+  if panelVisibleFor == id and marker ~= false then return end
   if panelVisibleFor == id then
     panelVisibleFor = nil
   end

@@ -508,6 +508,8 @@ func assertServiceSource(t *testing.T, source string) {
 		`enqueueRequest(payload)`, `startNextRequest()`, `noctalia.state.get("service_lifecycle")`,
 		`local panelOpeningFor = nil`, `heartbeat >= now - 3`, `heartbeat <= now + 1`, `heartbeat % 1 == 0`,
 		`local panelVisibleFor = nil`, `panelOpeningFor = nil`, `panelVisibleFor = id`,
+		`local function freshPanelMarker(marker, id, now)`, `local marker = noctalia.state.get("panel_open")`,
+		`if panelVisibleFor == id and marker ~= false then return end`,
 		`local function requestPanelOpen(id)`, `requestPanelOpen(id)`,
 	} {
 		if !strings.Contains(source, required) {
@@ -1266,6 +1268,9 @@ func (m *servicePanelOpeningModel) requestOpen(id string, now int64) {
 		return
 	}
 	if m.visibleFor == id {
+		if m.marker != false {
+			return
+		}
 		m.visibleFor = ""
 	}
 	if m.openingFor == id {
@@ -1273,6 +1278,25 @@ func (m *servicePanelOpeningModel) requestOpen(id string, now int64) {
 	}
 	m.openingFor = id
 	m.toggles++
+}
+
+func TestServiceAcknowledgedVisibilityIgnoresStaleOrMalformedTableUntilExplicitClose(t *testing.T) {
+	model := servicePanelOpeningModel{marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 10}}
+	model.requestOpen(requestIDA, 10)
+	model.marker = panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 10}
+	model.requestOpen(requestIDA, 20)
+	model.marker = map[string]any{"id": requestIDA}
+	model.requestOpen(requestIDA, 21)
+	if model.toggles != 0 || model.visibleFor != requestIDA || model.openingFor != "" {
+		t.Fatalf("stale/malformed acknowledged marker toggled panel: %#v", model)
+	}
+	model.marker = false
+	model.requestOpen(requestIDA, 22)
+	model.requestOpen(requestIDA, 23)
+	model.requestOpen(requestIDA, 100)
+	if model.toggles != 1 || model.openingFor != requestIDA || model.visibleFor != "" {
+		t.Fatalf("explicit close reopen lifecycle = %#v", model)
+	}
 }
 
 func TestServiceModelDelayedOnOpenNeverRetoggles(t *testing.T) {
