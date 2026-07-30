@@ -85,7 +85,7 @@ type passwordPrompter interface {
 	// Returns the password and an optional ResultNotifier.
 	// The ResultNotifier should be called after the unlock attempt to inform the prompter of the result.
 	// If the notifier is nil, the prompter doesn't support result notifications.
-	PromptForPassword(errMsg string) (password string, notifier ResultNotifier, err error)
+	PromptForPassword(ctx context.Context, errMsg string) (password string, notifier ResultNotifier, err error)
 }
 
 // logHTTPBodySnippet returns a truncated and redacted snippet of an HTTP body for debug logging.
@@ -498,6 +498,11 @@ func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (res
 
 	var errMsg string
 	var notifier ResultNotifier
+	defer func() {
+		if notifier != nil {
+			notifier(false, "Password prompt closed", false)
+		}
+	}()
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Check context before prompting
@@ -512,17 +517,21 @@ func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (res
 		// For subsequent attempts with a notifier, wait for retry via the session
 		if attempt == 1 || notifier == nil {
 			// Prompt for password with optional error message for retries
-			password, notifier, err = c.prompter.PromptForPassword(errMsg)
+			var nextNotifier ResultNotifier
+			password, nextNotifier, err = c.prompter.PromptForPassword(ctx, errMsg)
 			if err != nil {
 				return err // Preserves ErrUserCancelled
 			}
+			notifier = nextNotifier
 		} else {
 			// Notifier was already set and supports retry - password comes from WaitForRetry
 			// The session manager handles this internally
-			password, notifier, err = c.prompter.PromptForPassword(errMsg)
+			var nextNotifier ResultNotifier
+			password, nextNotifier, err = c.prompter.PromptForPassword(ctx, errMsg)
 			if err != nil {
 				return err
 			}
+			notifier = nextNotifier
 		}
 
 		// Unlock the vault
@@ -531,6 +540,7 @@ func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (res
 			// Success! Notify the prompter
 			if notifier != nil {
 				notifier(true, "", false)
+				notifier = nil
 			}
 			return nil
 		}
@@ -540,6 +550,7 @@ func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (res
 			// Non-password error (network, API, etc.) - don't retry
 			if notifier != nil {
 				notifier(false, "Failed to unlock vault", false)
+				notifier = nil
 			}
 			return fmt.Errorf("failed to unlock vault: %w", err)
 		}
@@ -556,6 +567,7 @@ func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (res
 			// No more retries
 			if notifier != nil {
 				notifier(false, "Maximum password attempts exceeded", false)
+				notifier = nil
 			}
 		}
 	}

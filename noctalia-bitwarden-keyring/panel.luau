@@ -151,7 +151,7 @@ function render()
     else
       table.insert(actions, ui.button({
         text = busy and noctalia.tr("panel.unlocking") or noctalia.tr("panel.unlock"),
-        enabled = ready and password ~= "",
+        enabled = ready,
         onClick = "onUnlock",
       }))
     end

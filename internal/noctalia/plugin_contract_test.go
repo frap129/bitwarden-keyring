@@ -321,6 +321,12 @@ func assertPanelSource(t *testing.T, source string) {
 	if !strings.Contains(source, `onClick = "onInvalidDismiss"`) {
 		t.Error("panel.luau invalid state is not dismissible")
 	}
+	if !regexp.MustCompile(`(?s)text = busy and noctalia\.tr\("panel\.unlocking"\) or noctalia\.tr\("panel\.unlock"\),\s+enabled = ready,\s+onClick = "onUnlock"`).MatchString(source) {
+		t.Error("panel.luau must keep the ready unlock action rendered independently of local password state")
+	}
+	if strings.Contains(source, `enabled = ready and password ~= ""`) {
+		t.Error("panel.luau must not hide the ready unlock action for an empty local password")
+	}
 	for _, callback := range []string{`onClick = "onInvalidDismiss"`, `onClick = "onDismiss"`, `onClick = "onCancel"`, `onClick = "onUnlock"`, `onClick = "onConfirm"`} {
 		if strings.Count(source, callback) != 1 {
 			t.Errorf("panel.luau action callback %q must have exactly one render path", callback)
@@ -425,6 +431,10 @@ func (m *panelCallbackModel) unlock(capturedInputKey int, capturedID string) {
 		return
 	}
 	m.submitted = true
+	m.commands++
+	m.password = ""
+	m.inputAccepting = false
+	m.phase = "busy"
 }
 
 func (m *panelCallbackModel) passwordChange(value any, capturedInputKey int, capturedID string) {
@@ -448,6 +458,23 @@ func TestPanelModelRejectsStaleUnlocks(t *testing.T) {
 		if model.submitted {
 			t.Fatalf("stale input submitted current request: %#v", model)
 		}
+	}
+}
+
+func TestPanelRetryReadyEmptyUnlockThenReplacementSubmitsOnce(t *testing.T) {
+	model := panelCallbackModel{authComplete: true, inputAccepting: true, inputKey: 7, authID: requestIDA, phase: "ready"}
+	model.unlock(7, requestIDA)
+	if model.submitted {
+		t.Fatal("empty retry-ready unlock submitted")
+	}
+	model.passwordChange("replacement", 7, requestIDA)
+	model.unlock(7, requestIDA)
+	if !model.submitted {
+		t.Fatal("replacement password was not submitted")
+	}
+	model.unlock(7, requestIDA)
+	if model.commands != 1 {
+		t.Fatalf("replacement password commands = %d, want 1", model.commands)
 	}
 }
 

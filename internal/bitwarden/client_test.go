@@ -28,7 +28,7 @@ type mockPrompter struct {
 	lastErrMsg string // Records the last error message passed to prompt
 }
 
-func (m *mockPrompter) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
+func (m *mockPrompter) PromptForPassword(_ context.Context, errMsg string) (string, ResultNotifier, error) {
 	m.callCount.Add(1)
 	m.lastErrMsg = errMsg
 	if m.onlyOnce {
@@ -49,7 +49,7 @@ type blockingPrompter struct {
 	once      atomic.Bool
 }
 
-func (p *blockingPrompter) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
+func (p *blockingPrompter) PromptForPassword(_ context.Context, errMsg string) (string, ResultNotifier, error) {
 	p.callCount.Add(1)
 	if p.once.Load() {
 		return "", nil, errors.New("prompt called more than once")
@@ -81,14 +81,14 @@ type panicPrompter struct {
 	callCount atomic.Int32
 }
 
-func (p *panicPrompter) PromptForPassword(string) (string, ResultNotifier, error) {
+func (p *panicPrompter) PromptForPassword(context.Context, string) (string, ResultNotifier, error) {
 	p.callCount.Add(1)
 	close(p.entered)
 	<-p.release
 	panic(p.panicWith)
 }
 
-func (p *flightPrompter) PromptForPassword(string) (string, ResultNotifier, error) {
+func (p *flightPrompter) PromptForPassword(context.Context, string) (string, ResultNotifier, error) {
 	index := int(p.callCount.Add(1)) - 1
 	p.enterOnce.Do(func() { close(p.entered) })
 	<-p.release
@@ -207,7 +207,7 @@ type retryPrompter struct {
 	mu        sync.Mutex
 }
 
-func (p *retryPrompter) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
+func (p *retryPrompter) PromptForPassword(_ context.Context, errMsg string) (string, ResultNotifier, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -2007,6 +2007,70 @@ func TestEnsureUnlocked_ContextCancelledDuringRetryLoop(t *testing.T) {
 	// The key is that it doesn't hang
 	if err == nil {
 		t.Fatal("ensureUnlocked() should fail when context is cancelled")
+	}
+}
+
+type retryCancellationPrompter struct {
+	callCount     atomic.Int32
+	retryResults  atomic.Int32
+	terminalCalls atomic.Int32
+	retryReady    chan struct{}
+}
+
+func (p *retryCancellationPrompter) PromptForPassword(ctx context.Context, _ string) (string, ResultNotifier, error) {
+	if p.callCount.Add(1) == 1 {
+		return "wrong", func(_ bool, _ string, retry bool) {
+			if retry {
+				p.retryResults.Add(1)
+				close(p.retryReady)
+				return
+			}
+			p.terminalCalls.Add(1)
+		}, nil
+	}
+	<-ctx.Done()
+	return "", nil, ctx.Err()
+}
+
+func TestEnsureUnlocked_OwnerCancellationAfterRetryTerminatesPrompt(t *testing.T) {
+	var unlockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/unlock" {
+			unlockCalls.Add(1)
+			_, _ = w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	prompter := &retryCancellationPrompter{retryReady: make(chan struct{})}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.ensureUnlocked(ctx) }()
+	waitForTestSignal(t, context.Background(), prompter.retryReady, "retry publication")
+	cancel()
+
+	resultCtx, resultCancel := context.WithTimeout(context.Background(), time.Second)
+	defer resultCancel()
+	if err := waitForTestError(t, resultCtx, done, "cancelled owner"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ensureUnlocked() error = %v, want context.Canceled", err)
+	}
+	if got := prompter.callCount.Load(); got != 2 {
+		t.Fatalf("prompt calls = %d, want 2", got)
+	}
+	if got := unlockCalls.Load(); got != 1 {
+		t.Fatalf("unlock calls = %d, want 1", got)
+	}
+	if got := prompter.retryResults.Load(); got != 1 {
+		t.Fatalf("retry results = %d, want 1", got)
+	}
+	if got := prompter.terminalCalls.Load(); got != 1 {
+		t.Fatalf("terminal cleanup calls = %d, want 1", got)
 	}
 }
 

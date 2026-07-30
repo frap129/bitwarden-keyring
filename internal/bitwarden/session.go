@@ -363,7 +363,16 @@ func getPromptOrder(cfg SessionConfig) []promptMethod {
 // If errMsg is non-empty, it's displayed as part of the prompt (for retry feedback).
 // It tries various GUI methods, falling back through the chain in order of security.
 // Returns the password, an optional ResultNotifier for two-phase communication, and an error.
-func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifier, error) {
+func (sm *SessionManager) PromptForPassword(ctx context.Context, errMsg string) (password string, notifier ResultNotifier, resultErr error) {
+	sm.noctaliaMu.Lock()
+	ownedNoctaliaSession := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	defer func() {
+		if ctx.Err() != nil && ownedNoctaliaSession != nil {
+			_ = ownedNoctaliaSession.Close()
+			sm.clearNoctaliaSession(ownedNoctaliaSession)
+		}
+	}()
 	// Build minimal config from session manager fields
 	cfg := SessionConfig{
 		NoctaliaEnabled:      sm.noctaliaEnabled,
@@ -381,14 +390,20 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 
 	// Try each prompt method in order
 	for _, method := range prompts {
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
 		switch method.name {
 		case "noctalia":
 			if sm.noctaliaClient == nil {
 				continue
 			}
-			password, notifier, err := sm.promptNoctalia(errMsg)
+			password, notifier, err := sm.promptNoctalia(ctx, errMsg)
 			if err == nil {
 				return password, notifier, nil
+			}
+			if ctx.Err() != nil {
+				return "", nil, ctx.Err()
 			}
 			if errors.Is(err, noctalia.ErrCancelled) {
 				// User explicitly cancelled - don't try fallback methods
@@ -403,7 +418,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 			if !commandExists("zenity") {
 				continue
 			}
-			password, err := sm.promptZenity(errMsg)
+			password, err := sm.promptZenity(ctx, errMsg)
 			if err == nil {
 				return password, nil, nil
 			}
@@ -415,7 +430,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 			if !commandExists("kdialog") {
 				continue
 			}
-			password, err := sm.promptKDialog(errMsg)
+			password, err := sm.promptKDialog(ctx, errMsg)
 			if err == nil {
 				return password, nil, nil
 			}
@@ -427,7 +442,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 			if !commandExists("rofi") {
 				continue
 			}
-			password, err := sm.promptRofi(errMsg)
+			password, err := sm.promptRofi(ctx, errMsg)
 			if err == nil {
 				return password, nil, nil
 			}
@@ -439,7 +454,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 			if !commandExists("systemd-ask-password") {
 				continue
 			}
-			password, err := sm.promptSystemd(errMsg)
+			password, err := sm.promptSystemd(ctx, errMsg)
 			if err == nil {
 				return password, nil, nil
 			}
@@ -451,7 +466,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 			if !commandExists("dmenu") {
 				continue
 			}
-			password, err := sm.promptDmenu(errMsg)
+			password, err := sm.promptDmenu(ctx, errMsg)
 			if err == nil {
 				return password, nil, nil
 			}
@@ -461,6 +476,9 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 
 		default:
 			logging.L.Debug("unknown prompt method, skipping", "method", method.name)
+		}
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
 		}
 	}
 
@@ -474,7 +492,7 @@ func (sm *SessionManager) PromptForPassword(errMsg string) (string, ResultNotifi
 
 // promptNoctalia uses the Noctalia agent for a password dialog with two-phase retry support.
 // Returns the password, a notifier function for sending results, and an error.
-func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier, error) {
+func (sm *SessionManager) promptNoctalia(ctx context.Context, errMsg string) (string, ResultNotifier, error) {
 	if sm.noctaliaClient == nil {
 		return "", nil, noctalia.ErrPluginUnavailable
 	}
@@ -485,7 +503,7 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 	sm.noctaliaMu.Unlock()
 	if session != nil && errMsg != "" {
 		// Wait for the user to enter a new password on the existing session
-		password, err := session.WaitForRetry(context.Background(), sm.noctaliaTimeout)
+		password, err := session.WaitForRetry(ctx, sm.noctaliaTimeout)
 		if err != nil {
 			sm.clearNoctaliaSession(session)
 			if errors.Is(err, noctalia.ErrCancelled) {
@@ -499,7 +517,7 @@ func (sm *SessionManager) promptNoctalia(errMsg string) (string, ResultNotifier,
 	}
 
 	// Create a new session
-	ctx, cancel := context.WithTimeout(context.Background(), sm.noctaliaTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sm.noctaliaTimeout)
 	defer cancel()
 
 	message := "Enter your Bitwarden Master Password:"
@@ -543,12 +561,12 @@ func (sm *SessionManager) clearNoctaliaSession(session *noctalia.PasswordSession
 }
 
 // promptZenity uses zenity for a GTK password dialog
-func (sm *SessionManager) promptZenity(errMsg string) (string, error) {
+func (sm *SessionManager) promptZenity(ctx context.Context, errMsg string) (string, error) {
 	text := "Enter your Bitwarden Master Password:"
 	if errMsg != "" {
 		text = errMsg + "\n" + text
 	}
-	return runPromptCommand(exec.Command("zenity",
+	return runPromptCommand(exec.CommandContext(ctx, "zenity",
 		"--password",
 		"--title=Bitwarden Keyring",
 		"--text="+text,
@@ -557,12 +575,12 @@ func (sm *SessionManager) promptZenity(errMsg string) (string, error) {
 }
 
 // promptKDialog uses kdialog for a KDE password dialog
-func (sm *SessionManager) promptKDialog(errMsg string) (string, error) {
+func (sm *SessionManager) promptKDialog(ctx context.Context, errMsg string) (string, error) {
 	message := "Enter your Bitwarden Master Password:"
 	if errMsg != "" {
 		message = errMsg + "\n" + message
 	}
-	return runPromptCommand(exec.Command("kdialog",
+	return runPromptCommand(exec.CommandContext(ctx, "kdialog",
 		"--password",
 		message,
 		"--title", "Bitwarden Keyring",
@@ -570,7 +588,7 @@ func (sm *SessionManager) promptKDialog(errMsg string) (string, error) {
 }
 
 // promptRofi uses rofi in dmenu mode for password input
-func (sm *SessionManager) promptRofi(errMsg string) (string, error) {
+func (sm *SessionManager) promptRofi(ctx context.Context, errMsg string) (string, error) {
 	args := []string{
 		"-dmenu",
 		"-password",
@@ -580,16 +598,16 @@ func (sm *SessionManager) promptRofi(errMsg string) (string, error) {
 	if errMsg != "" {
 		args = append(args, "-mesg", errMsg)
 	}
-	return runPromptCommand(exec.Command("rofi", args...))
+	return runPromptCommand(exec.CommandContext(ctx, "rofi", args...))
 }
 
 // promptDmenu uses dmenu for password input (no masking, less secure)
-func (sm *SessionManager) promptDmenu(errMsg string) (string, error) {
+func (sm *SessionManager) promptDmenu(ctx context.Context, errMsg string) (string, error) {
 	prompt := "Bitwarden Master Password:"
 	if errMsg != "" {
 		prompt = errMsg + " - " + prompt
 	}
-	cmd := exec.Command("dmenu",
+	cmd := exec.CommandContext(ctx, "dmenu",
 		"-p", prompt,
 		"-nf", "#000000",
 		"-nb", "#000000", // Black on black to "hide" input
@@ -606,7 +624,7 @@ func (sm *SessionManager) promptDmenu(errMsg string) (string, error) {
 }
 
 // promptSystemd uses systemd-ask-password for password input
-func (sm *SessionManager) promptSystemd(errMsg string) (string, error) {
+func (sm *SessionManager) promptSystemd(ctx context.Context, errMsg string) (string, error) {
 	cmdPath := "systemd-ask-password"
 	if sm.systemdAskPasswordPath != "" {
 		cmdPath = sm.systemdAskPasswordPath
@@ -615,7 +633,7 @@ func (sm *SessionManager) promptSystemd(errMsg string) (string, error) {
 	if errMsg != "" {
 		prompt = errMsg + " - " + prompt
 	}
-	return runPromptCommand(exec.Command(cmdPath,
+	return runPromptCommand(exec.CommandContext(ctx, cmdPath,
 		"--timeout=120",
 		"--icon=dialog-password",
 		prompt,

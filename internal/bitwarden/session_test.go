@@ -544,7 +544,7 @@ func TestNoctaliaTimeoutNormalizesNonpositiveValues(t *testing.T) {
 
 func TestNoctaliaUnavailableNilClient(t *testing.T) {
 	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, nil)
-	_, _, err := sm.promptNoctalia("")
+	_, _, err := sm.promptNoctalia(context.Background(), "")
 	if !errors.Is(err, noctalia.ErrPluginUnavailable) {
 		t.Fatalf("promptNoctalia() error = %v, want ErrPluginUnavailable", err)
 	}
@@ -556,7 +556,7 @@ func TestNoctaliaTimeoutInitialPromptUsesConfiguredTimeout(t *testing.T) {
 	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true, NoctaliaTimeout: 25 * time.Millisecond}, client)
 
 	started := time.Now()
-	_, _, err := sm.promptNoctalia("")
+	_, _, err := sm.promptNoctalia(context.Background(), "")
 	assertNoctaliaTimeout(t, err, time.Since(started))
 }
 
@@ -571,7 +571,7 @@ func TestNoctaliaTimeoutRetryUsesConfiguredTimeout(t *testing.T) {
 	client := noctalia.NewClient(noctalia.WithCommandRunner(runner))
 	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true, NoctaliaTimeout: 25 * time.Millisecond}, client)
 
-	password, notify, err := sm.promptNoctalia("")
+	password, notify, err := sm.promptNoctalia(context.Background(), "")
 	if err != nil || password != "password" {
 		t.Fatalf("promptNoctalia() = %q, %v, want password", password, err)
 	}
@@ -581,8 +581,69 @@ func TestNoctaliaTimeoutRetryUsesConfiguredTimeout(t *testing.T) {
 	}
 
 	started := time.Now()
-	_, _, err = sm.promptNoctalia("invalid password")
+	_, _, err = sm.promptNoctalia(context.Background(), "invalid password")
 	assertNoctaliaTimeout(t, err, time.Since(started))
+}
+
+func TestPromptForPassword_CancellationAfterRetryClosesNoctaliaSession(t *testing.T) {
+	runtimeDir := setNoctaliaTestRuntime(t)
+	descriptors := make(chan noctaliaTestDescriptor, 1)
+	helperErr := make(chan error, 1)
+	var commandCalls int
+	runner := func(_ context.Context, _ string, args ...string) error {
+		commandCalls++
+		cookie := args[len(args)-1]
+		go func() {
+			helperErr <- serveNoctaliaPasswordAndResultWithDescriptor(runtimeDir, cookie, nil, descriptors)
+		}()
+		return nil
+	}
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, noctalia.NewClient(noctalia.WithCommandRunner(runner)))
+
+	password, notify, err := sm.PromptForPassword(context.Background(), "")
+	if err != nil || password != "password" {
+		t.Fatalf("PromptForPassword() = %q, %v, want password", password, err)
+	}
+	descriptor := <-descriptors
+	notify(false, "invalid password", true)
+	if err := <-helperErr; err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := sm.PromptForPassword(ctx, "invalid password")
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("retry prompt error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry prompt did not return promptly")
+	}
+	if commandCalls != 1 {
+		t.Fatalf("Noctalia command calls = %d, want 1", commandCalls)
+	}
+	sm.noctaliaMu.Lock()
+	retained := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	if retained != nil {
+		t.Fatal("cancelled retry retained Noctalia session")
+	}
+	if _, err := os.Stat(descriptor.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("descriptor stat after cancellation = %v, want not exists", err)
+	}
+	requestCtx, requestCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer requestCancel()
+	body := fmt.Sprintf(`{"type":"keyring_response","id":%q,"result":"ok","password":"replacement"}`, descriptor.RequestID)
+	if response, err := doNoctaliaTestRequest(requestCtx, &http.Client{}, descriptor, http.MethodPost, "/v1/response", body); err == nil {
+		response.Body.Close()
+		t.Fatalf("response accepted after cancellation with status %d", response.StatusCode)
+	}
 }
 
 func TestNoctaliaSessionStaleNotifierDoesNotAffectNewerSession(t *testing.T) {
@@ -598,7 +659,7 @@ func TestNoctaliaSessionStaleNotifierDoesNotAffectNewerSession(t *testing.T) {
 	}
 	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, noctalia.NewClient(noctalia.WithCommandRunner(runner)))
 
-	_, staleNotifier, err := sm.promptNoctalia("")
+	_, staleNotifier, err := sm.promptNoctalia(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +667,7 @@ func TestNoctaliaSessionStaleNotifierDoesNotAffectNewerSession(t *testing.T) {
 	firstSession := sm.noctaliaSession
 	sm.noctaliaMu.Unlock()
 	firstCookie := <-cookies
-	_, currentNotifier, err := sm.promptNoctalia("")
+	_, currentNotifier, err := sm.promptNoctalia(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,7 +707,7 @@ func TestNoctaliaSessionConcurrentNotifierInvocation(t *testing.T) {
 		return nil
 	}
 	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, noctalia.NewClient(noctalia.WithCommandRunner(runner)))
-	_, notifier, err := sm.promptNoctalia("")
+	_, notifier, err := sm.promptNoctalia(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +762,7 @@ func TestNoctaliaSequentialSessionsUseDistinctDescriptors(t *testing.T) {
 	seenDescriptors := make([]noctaliaTestDescriptor, 0, 2)
 	seenInvocations := make([]commandInvocation, 0, 2)
 	for range 2 {
-		password, notify, err := sm.promptNoctalia("")
+		password, notify, err := sm.promptNoctalia(context.Background(), "")
 		if err != nil || password != "password" {
 			t.Fatalf("promptNoctalia() = %q, %v, want password", password, err)
 		}
