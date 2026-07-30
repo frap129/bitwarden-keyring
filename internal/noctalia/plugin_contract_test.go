@@ -608,9 +608,13 @@ func assertServiceSource(t *testing.T, source string) {
 	}
 	terminalFunction := regexp.MustCompile(`(?s)local function terminalFinish\(.*?\nend`).FindString(source)
 	publishTerminal := strings.Index(terminalFunction, `noctalia.state.set("auth", terminal)`)
+	clearTerminalCommand := strings.Index(terminalFunction, `clearMatchingCommand(id)`)
 	invalidateTerminal := strings.Index(terminalFunction, "invalidatePrivate()")
 	if publishTerminal < 0 || invalidateTerminal < 0 || publishTerminal > invalidateTerminal {
 		t.Error("service.luau must publish terminal auth before invalidating callbacks")
+	}
+	if clearTerminalCommand < 0 || invalidateTerminal < 0 || clearTerminalCommand > invalidateTerminal {
+		t.Error("service.luau must scrub its matching command before releasing terminal ownership")
 	}
 	for _, forbidden := range []string{
 		`Authorization =`, `["Cache-Control"]`, `headers["Content-Type"]`,
@@ -937,6 +941,68 @@ type startupRecoveryModel struct {
 	authPhase                 string
 	commandCleared, authClear bool
 	recovering                bool
+}
+
+type terminalRecoveryCommand struct {
+	id, action, password string
+	identity             int
+}
+
+type terminalRecoveryModel struct {
+	activeID string
+	queue    []string
+	command  *terminalRecoveryCommand
+	events   []string
+}
+
+func (m *terminalRecoveryModel) terminalFinish() {
+	terminalID := m.activeID
+	m.events = append(m.events, "terminal-published")
+	if m.command != nil && m.command.id == terminalID {
+		m.command.password = ""
+		m.command = nil
+		m.events = append(m.events, "command-cleared")
+	}
+	m.activeID = ""
+	m.events = append(m.events, "ownership-released")
+	if len(m.queue) > 0 {
+		m.activeID = m.queue[0]
+		m.queue = m.queue[1:]
+		m.events = append(m.events, "next-started")
+	}
+}
+
+func (m *terminalRecoveryModel) recoveryGETTerminalFailure() {
+	m.terminalFinish()
+}
+
+func TestServiceRecoveryTerminalFailureScrubsMatchingCommandBeforeAdvancing(t *testing.T) {
+	command := &terminalRecoveryCommand{id: requestIDA, action: "submit", password: "retained-password", identity: 17}
+	model := terminalRecoveryModel{activeID: requestIDA, queue: []string{requestIDB}, command: command}
+
+	model.recoveryGETTerminalFailure()
+
+	if command.password != "" || model.command != nil {
+		t.Fatalf("terminal recovery failure retained matching password command: %#v", command)
+	}
+	wantEvents := []string{"terminal-published", "command-cleared", "ownership-released", "next-started"}
+	if !reflect.DeepEqual(model.events, wantEvents) || model.activeID != requestIDB {
+		t.Fatalf("terminal recovery ordering = (%#v, %q), want (%#v, %q)", model.events, model.activeID, wantEvents, requestIDB)
+	}
+}
+
+func TestServiceRecoveryTerminalFailurePreservesUnrelatedReplacementCommand(t *testing.T) {
+	replacement := &terminalRecoveryCommand{id: requestIDC, action: "confirm", password: "replacement-value", identity: 23}
+	model := terminalRecoveryModel{activeID: requestIDA, queue: []string{requestIDB}, command: replacement}
+
+	model.recoveryGETTerminalFailure()
+
+	if model.command != replacement || replacement.id != requestIDC || replacement.action != "confirm" || replacement.password != "replacement-value" || replacement.identity != 23 {
+		t.Fatalf("terminal recovery failure changed unrelated replacement: %#v", replacement)
+	}
+	if model.activeID != requestIDB {
+		t.Fatalf("terminal recovery failure started %q, want %q", model.activeID, requestIDB)
+	}
 }
 
 func sameLifecycleQueueModel(left map[any]string, right []string) bool {

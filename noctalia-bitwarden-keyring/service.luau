@@ -203,6 +203,7 @@ local function terminalFinish(phase, errorText)
   local terminal = {id = id, title = title, prompt = prompt, confirm_only = confirmOnly, phase = phase, error = errorText}
   noctalia.state.set("auth", terminal)
   clearPanelOpening()
+  clearMatchingCommand(id)
   invalidatePrivate()
   lifecycle.active_id = ""
   lifecycle.phase = ""
