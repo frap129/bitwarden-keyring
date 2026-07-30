@@ -90,10 +90,9 @@ local function requestPanelOpen()
     clearPanelOpening()
     return
   end
-  local openingNow = os.clock()
-  if panelOpeningFor == id and openingNow - panelOpeningAt < 1 then return end
+  if panelOpeningFor == id and now - panelOpeningAt < 1 then return end
   panelOpeningFor = id
-  panelOpeningAt = openingNow
+  panelOpeningAt = now
   noctalia.togglePanel(PANEL_ID)
 end
 

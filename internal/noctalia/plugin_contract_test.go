@@ -506,10 +506,14 @@ func assertServiceSource(t *testing.T, source string) {
 		`local function enqueueRequest(id)`, `startNextRequest = function()`, `local function terminalFinish(`,
 		`enqueueRequest(payload)`, `startNextRequest()`, `noctalia.state.get("service_lifecycle")`,
 		`local panelOpeningFor = nil`, `local panelOpeningAt = 0`, `heartbeat >= now - 3`,
+		`panelOpeningAt = now`, `now - panelOpeningAt < 1`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
 		}
+	}
+	if strings.Contains(source, `os.clock`) {
+		t.Error("service.luau panel opening guard must use wall-clock seconds, not os.clock")
 	}
 	if regexp.MustCompile(`(?s)function onIpc\(event, payload\).*?active ~= nil.*?return`).MatchString(source) {
 		t.Error("service.luau onIpc must enqueue occupied requests instead of returning early")
@@ -1155,9 +1159,19 @@ func TestPanelReloadLeavesOldMarkerUntilHydration(t *testing.T) {
 }
 
 type panelPresenceModel struct {
-	open, command       bool
+	open                bool
+	commands            int
 	requestID, instance string
+	authID, phase       string
 	marker              any
+}
+
+func (m *panelPresenceModel) onOpen(sharedAuthID, sharedPhase string, now int64) {
+	m.open = true
+	m.authID = sharedAuthID
+	m.phase = sharedPhase
+	m.requestID = sharedAuthID
+	m.marker = panelMarkerFixture{ID: sharedAuthID, Instance: m.instance, Heartbeat: now}
 }
 
 func (m *panelPresenceModel) close(capturedID, capturedInstance string) {
@@ -1173,7 +1187,7 @@ func TestPanelCloseClearsExactOwnedMarkerWithoutCancellation(t *testing.T) {
 	model := panelPresenceModel{open: true, requestID: requestIDA, instance: requestIDB,
 		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 10}}
 	model.close(requestIDA, requestIDB)
-	if model.marker != false || model.command || model.open || model.requestID != "" {
+	if model.marker != false || model.commands != 0 || model.open || model.requestID != "" {
 		t.Fatalf("owned close lifecycle = %#v", model)
 	}
 }
@@ -1182,8 +1196,48 @@ func TestPanelOldCloseCallbackCannotClearReplacementMarker(t *testing.T) {
 	want := panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: 11}
 	model := panelPresenceModel{open: true, requestID: requestIDA, instance: requestIDC, marker: want}
 	model.close(requestIDA, requestIDB)
-	if !reflect.DeepEqual(model.marker, want) || model.command {
+	if !reflect.DeepEqual(model.marker, want) || model.commands != 0 {
 		t.Fatalf("old close callback changed replacement ownership: %#v", model)
+	}
+}
+
+func TestPanelOnOpenHydratesSharedAuthAndPublishesPresence(t *testing.T) {
+	model := panelPresenceModel{instance: requestIDB}
+	model.onOpen(requestIDA, "busy", 25)
+	wantMarker := panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 25}
+	if !model.open || model.authID != requestIDA || model.phase != "busy" || model.requestID != requestIDA || !reflect.DeepEqual(model.marker, wantMarker) {
+		t.Fatalf("onOpen hydration = %#v", model)
+	}
+}
+
+func TestPanelReadyCloseClearsMarkerWithoutCancellation(t *testing.T) {
+	model := panelPresenceModel{open: true, requestID: requestIDA, instance: requestIDB, authID: requestIDA, phase: "ready",
+		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 30}}
+	model.close(requestIDA, requestIDB)
+	if model.marker != false || model.commands != 0 {
+		t.Fatalf("ready close lifecycle = %#v", model)
+	}
+}
+
+func TestPanelBusyCloseClearsMarkerWithoutCancellation(t *testing.T) {
+	model := panelPresenceModel{open: true, requestID: requestIDA, instance: requestIDB, authID: requestIDA, phase: "busy",
+		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 30}}
+	model.close(requestIDA, requestIDB)
+	if model.marker != false || model.commands != 0 {
+		t.Fatalf("busy close lifecycle = %#v", model)
+	}
+}
+
+func TestPanelProgrammaticTerminalCloseDoesNotDuplicateCommand(t *testing.T) {
+	for _, phase := range []string{"success", "cancelled"} {
+		t.Run(phase, func(t *testing.T) {
+			model := panelPresenceModel{open: true, commands: 1, requestID: requestIDA, instance: requestIDB, phase: phase,
+				marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 30}}
+			model.close(requestIDA, requestIDB)
+			if model.commands != 1 || model.marker != false {
+				t.Fatalf("programmatic %s close = %#v", phase, model)
+			}
+		})
 	}
 }
 
@@ -1229,6 +1283,24 @@ func TestServiceModelFreshMarkerPreventsVisiblePanelToggleClosed(t *testing.T) {
 	model.requestOpen(12)
 	if model.toggles != 0 || model.openingFor != "" {
 		t.Fatalf("fresh visible panel toggled or retained guard: %#v", model)
+	}
+}
+
+func TestServiceReloadPreservesLiveMatchingMarker(t *testing.T) {
+	marker := panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 40}
+	model := servicePanelOpeningModel{activeID: requestIDA, marker: marker}
+	model.requestOpen(40)
+	if model.toggles != 0 || !reflect.DeepEqual(model.marker, marker) {
+		t.Fatalf("service reload changed live marker: %#v", model)
+	}
+}
+
+func TestServiceRetryOpensExactlyOnce(t *testing.T) {
+	model := servicePanelOpeningModel{activeID: requestIDA, marker: false}
+	model.requestOpen(50)
+	model.requestOpen(50)
+	if model.toggles != 1 {
+		t.Fatalf("retry toggles = %d, want exactly 1", model.toggles)
 	}
 }
 
