@@ -531,6 +531,21 @@ func assertServiceSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)processingCommand = true.*?value\.password = nil.*?noctalia\.state\.set\("command", nil\).*?value = nil.*?processingCommand = false`).MatchString(source) {
 		t.Error("service.luau must guard and single-clear rejected or acknowledged commands")
 	}
+	onExit := regexp.MustCompile(`(?s)function onExit\(\)(.*?)\nend`).FindStringSubmatch(source)
+	if len(onExit) != 2 {
+		t.Error("service.luau must define inspectable onExit")
+	} else if strings.Contains(onExit[1], `noctalia.state.set("command", nil)`) {
+		t.Error("service.luau onExit must retain an unacknowledged shared command")
+	} else {
+		for _, cleared := range []string{"bridgeToken = nil", "bridgeBaseUrl = nil", "encodedBody = nil", "postAction = nil"} {
+			if !strings.Contains(onExit[1], cleared) {
+				t.Errorf("service.luau onExit does not clear private value %q", cleared)
+			}
+		}
+	}
+	if regexp.MustCompile(`(?s)end\s+noctalia\.state\.set\("command", nil\)\s+noctalia\.state\.set\("auth", false\)\s+noctalia\.state\.watch\("command", onCommand\)`).MatchString(source) {
+		t.Error("service.luau startup must retain an unacknowledged shared command")
+	}
 	if regexp.MustCompile(`(?i)url\s*=[^\n]*(token|password)`).MatchString(source) {
 		t.Error("service.luau appears to place the token in a URL")
 	}

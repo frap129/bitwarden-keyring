@@ -387,11 +387,9 @@ function onExit()
   bridgeBaseUrl = nil
   encodedBody = nil
   postAction = nil
-  noctalia.state.set("command", nil)
   noctalia.state.set("auth", false)
 end
 
-noctalia.state.set("command", nil)
 noctalia.state.set("auth", false)
 noctalia.state.watch("command", onCommand)
 noctalia.setUpdateInterval(250)
