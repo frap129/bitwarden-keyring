@@ -38,11 +38,10 @@ func decodeJSON(r io.Reader, v interface{}, what string) error {
 }
 
 // APIError represents a sanitized API error that never leaks HTTP response bodies.
-// Use DebugDetails() to access the body for logging when debug mode is enabled.
 type APIError struct {
 	StatusCode int
 	Path       string
-	debugBody  string // never exposed in Error()
+	debugBody  string
 }
 
 // Error returns a safe error message without leaking the HTTP response body.
@@ -50,7 +49,7 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("API error %d on %s", e.StatusCode, e.Path)
 }
 
-// DebugDetails returns the HTTP response body for debug logging.
+// DebugDetails returns body-free diagnostic details.
 func (e *APIError) DebugDetails() string {
 	return e.debugBody
 }
@@ -161,10 +160,7 @@ func (c *Client) SetAutoUnlock(enabled bool) {
 	c.autoUnlock.Store(enabled)
 }
 
-// SetDebug enables or disables HTTP body logging for errors.
-// When enabled, APIError.DebugDetails() will contain response bodies (up to 4096 bytes
-// plus truncation indicator when exceeded), which are redacted but should only be
-// logged with --debug flag.
+// SetDebug enables or disables body-free HTTP error logging.
 func (c *Client) SetDebug(enabled bool) {
 	c.debug.Store(enabled)
 }
@@ -381,28 +377,14 @@ func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode >= http.StatusBadRequest {
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
-		if len(bodyBytes) <= maxErrorBody {
-			var result struct {
-				Message string `json:"message"`
-			}
-			if json.Unmarshal(bodyBytes, &result) == nil && isInvalidMasterPasswordMessage(result.Message) {
-				return "", ErrInvalidPassword
-			}
-		}
-
-		bodyStr := string(bodyBytes)
-		if len(bodyBytes) > maxErrorBody {
-			bodyStr = string(bodyBytes[:maxErrorBody]) + "... (truncated)"
-		}
-		apiErr := &APIError{StatusCode: resp.StatusCode, Path: "/unlock", debugBody: bodyStr}
-		if c.debug.Load() {
-			fmt.Fprintf(os.Stderr, "HTTP error %d on /unlock: %s\n", resp.StatusCode, logHTTPBodySnippet("Response", bodyStr))
+		bodyBytes, apiErr := c.consumeHTTPError(resp, "/unlock")
+		if resp.StatusCode == http.StatusBadRequest && isInvalidMasterPasswordResponse(bodyBytes) {
+			return "", ErrInvalidPassword
 		}
 		return "", apiErr
 	}
+	defer resp.Body.Close()
 
 	var result UnlockResponse
 	if err := decodeJSON(resp.Body, &result, "unlock response"); err != nil {
@@ -413,7 +395,7 @@ func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
 		if isInvalidMasterPasswordMessage(result.Data.Message) {
 			return "", ErrInvalidPassword
 		}
-		return "", fmt.Errorf("unlock failed: %s", result.Data.Message)
+		return "", errors.New("unlock failed")
 	}
 
 	// Store the session key
@@ -423,12 +405,19 @@ func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
 }
 
 func isInvalidMasterPasswordMessage(message string) bool {
-	switch strings.TrimSpace(message) {
-	case "Invalid master password", "Invalid master password.":
-		return true
-	default:
-		return false
+	message = strings.TrimSpace(message)
+	return message == "Invalid master password" || strings.HasPrefix(message, "Invalid master password.")
+}
+
+func isInvalidMasterPasswordResponse(body []byte) bool {
+	var result struct {
+		Message string `json:"message"`
+		Data    struct {
+			Message string `json:"message"`
+		} `json:"data"`
 	}
+	return json.Unmarshal(body, &result) == nil &&
+		(isInvalidMasterPasswordMessage(result.Message) || isInvalidMasterPasswordMessage(result.Data.Message))
 }
 
 // Lock locks the vault
@@ -856,32 +845,32 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body io.Rea
 	}
 
 	if resp.StatusCode >= 400 {
-		defer resp.Body.Close()
-		// Read at most maxErrorBody+1 bytes to detect if truncation occurred
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
-
-		// Check if truncation occurred and append indicator
-		var bodyStr string
-		if len(bodyBytes) > maxErrorBody {
-			bodyStr = string(bodyBytes[:maxErrorBody]) + "... (truncated)"
-		} else {
-			bodyStr = string(bodyBytes)
-		}
-
-		apiErr := &APIError{
-			StatusCode: resp.StatusCode,
-			Path:       path,
-			debugBody:  bodyStr,
-		}
-
-		if c.debug.Load() {
-			fmt.Fprintf(os.Stderr, "HTTP error %d on %s: %s\n", resp.StatusCode, path, logHTTPBodySnippet("Response", bodyStr))
-		}
-
+		_, apiErr := c.consumeHTTPError(resp, path)
 		return nil, apiErr
 	}
 
 	return resp, nil
+}
+
+// consumeHTTPError reads a bounded response body and closes it. Callers may inspect
+// the returned bytes, but APIError diagnostics never retain response content.
+func (c *Client) consumeHTTPError(resp *http.Response, path string) ([]byte, *APIError) {
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+	truncated := len(bodyBytes) > maxErrorBody
+	if truncated {
+		bodyBytes = bodyBytes[:maxErrorBody]
+	}
+
+	details := "response body omitted"
+	if truncated {
+		details += " (truncated)"
+	}
+	apiErr := &APIError{StatusCode: resp.StatusCode, Path: path, debugBody: details}
+	if c.debug.Load() {
+		fmt.Fprintf(os.Stderr, "HTTP error %d on %s\n", resp.StatusCode, path)
+	}
+	return bodyBytes, apiErr
 }
 
 // SessionManager returns the session manager for this client

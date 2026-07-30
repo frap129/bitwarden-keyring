@@ -198,6 +198,31 @@ func waitForTestError(t *testing.T, ctx context.Context, result <-chan error, na
 	}
 }
 
+func captureStderr(t *testing.T, run func()) string {
+	t.Helper()
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = writePipe
+	t.Cleanup(func() { os.Stderr = original })
+
+	run()
+	if err := writePipe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = original
+	output, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := readPipe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
+}
+
 // retryPrompter allows simulating password retries - returns different passwords on successive calls
 type retryPrompter struct {
 	passwords []string // Passwords to return on each call
@@ -1312,17 +1337,16 @@ func TestAPIError_Error_NeverLeaksBody(t *testing.T) {
 	}
 }
 
-func TestAPIError_DebugDetails_ReturnsBody(t *testing.T) {
-	body := `{"error":"test error"}`
+func TestAPIError_DebugDetails_ReturnsSanitizedDetails(t *testing.T) {
+	details := "response body omitted"
 	apiErr := &APIError{
 		StatusCode: 400,
 		Path:       "/test",
-		debugBody:  body,
+		debugBody:  details,
 	}
 
-	details := apiErr.DebugDetails()
-	if details != body {
-		t.Errorf("DebugDetails() = %q, want %q", details, body)
+	if got := apiErr.DebugDetails(); got != details {
+		t.Errorf("DebugDetails() = %q, want %q", got, details)
 	}
 }
 
@@ -1754,6 +1778,63 @@ func TestUnlock_HTTPBadRequestInvalidMasterPassword(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "do-not-leak-this-password") {
 		t.Fatal("Unlock() error leaked password")
+	}
+}
+
+func TestUnlock_OnlyHTTPBadRequestClassifiesInvalidPassword(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
+			}))
+			t.Cleanup(ts.Close)
+
+			c := clientWithPrompter(ts, &mockPrompter{}, true)
+			_, err := c.Unlock(context.Background(), "password")
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("Unlock() error = %T %v, want *APIError", err, err)
+			}
+			if errors.Is(err, ErrInvalidPassword) {
+				t.Fatal("Unlock() classified non-400 response as ErrInvalidPassword")
+			}
+		})
+	}
+}
+
+func TestUnlock_HTTPBadRequestRecognizesKnownMessageShapes(t *testing.T) {
+	tests := map[string]string{
+		"top-level with suffix": `{"success":false,"message":"Invalid master password. Please try again."}`,
+		"nested":                `{"success":false,"data":{"message":"Invalid master password."}}`,
+	}
+	for name, responseBody := range tests {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(responseBody))
+			}))
+			t.Cleanup(ts.Close)
+
+			c := clientWithPrompter(ts, &mockPrompter{}, true)
+			_, err := c.Unlock(context.Background(), "password")
+			if !errors.Is(err, ErrInvalidPassword) {
+				t.Fatalf("Unlock() error = %v, want ErrInvalidPassword", err)
+			}
+		})
+	}
+}
+
+func TestUnlock_NestedSuccessFalseResponseRecognizesKnownMessageSuffix(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password. Please try again."}}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	c := clientWithPrompter(ts, &mockPrompter{}, true)
+	_, err := c.Unlock(context.Background(), "password")
+	if !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("Unlock() error = %v, want ErrInvalidPassword", err)
 	}
 }
 
@@ -2245,5 +2326,49 @@ func TestDoRequest_TruncatesLargeErrorBody(t *testing.T) {
 	// Assert the body was actually truncated (should be around 4096 bytes plus marker)
 	if len(details) > 4200 {
 		t.Errorf("DebugDetails() length = %d, expected truncated to ~4096 bytes", len(details))
+	}
+}
+
+func TestAPIErrorDiagnosticsNeverRetainOrLogResponseSecrets(t *testing.T) {
+	tests := []struct {
+		name  string
+		debug bool
+		body  string
+	}{
+		{name: "debug disabled JSON", body: `{"password":"password-secret","token":"token-secret","message":"message-secret"}`},
+		{name: "debug enabled JSON", debug: true, body: `{"password":"password-secret","token":"token-secret","message":"message-secret"}`},
+		{name: "debug enabled malformed and truncated", debug: true, body: "malformed-secret " + strings.Repeat("x", maxErrorBody+100)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(ts.Close)
+
+			c := NewClient(0)
+			c.baseURL = ts.URL
+			c.httpClient = &http.Client{Timeout: time.Second}
+			c.SetDebug(tt.debug)
+			var requestErr error
+			stderr := captureStderr(t, func() { _, requestErr = c.Status(context.Background()) })
+			var apiErr *APIError
+			if !errors.As(requestErr, &apiErr) {
+				t.Fatalf("Status() error = %T %v, want *APIError", requestErr, requestErr)
+			}
+			combined := requestErr.Error() + apiErr.DebugDetails() + stderr
+			for _, secret := range []string{"password-secret", "token-secret", "message-secret", "malformed-secret"} {
+				if strings.Contains(combined, secret) {
+					t.Fatalf("diagnostics leaked %q: %q", secret, combined)
+				}
+			}
+			if tt.debug && !strings.Contains(stderr, "HTTP error 400 on /status") {
+				t.Fatalf("stderr = %q, want status and path", stderr)
+			}
+			if !tt.debug && stderr != "" {
+				t.Fatalf("stderr = %q, want empty", stderr)
+			}
+		})
 	}
 }
