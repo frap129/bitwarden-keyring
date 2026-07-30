@@ -463,7 +463,7 @@ func TestEnsureUnlocked_ConcurrentCalls_UserCancellationSharesResult(t *testing.
 	makeServeHealthy(c)
 	joined := make(chan struct{})
 	var joiners atomic.Int32
-	c.flightWaiterHook = func() {
+	c.flightWaiterHook = func(*unlockFlight) {
 		if joiners.Add(1) == callers-1 {
 			close(joined)
 		}
@@ -522,7 +522,7 @@ func TestEnsureUnlocked_ConcurrentCalls_MaxRetriesSharesResult(t *testing.T) {
 
 	sequence := make([]flightPromptResult, maxRetries)
 	for i := range sequence {
-		sequence[i].password = fmt.Sprintf("wrong-%d", i)
+		sequence[i].password = "wrong"
 	}
 	prompter := &flightPrompter{entered: make(chan struct{}), release: make(chan struct{}), sequence: sequence}
 	c := clientWithPrompter(ts, prompter, true)
@@ -530,7 +530,7 @@ func TestEnsureUnlocked_ConcurrentCalls_MaxRetriesSharesResult(t *testing.T) {
 	makeServeHealthy(c)
 	joined := make(chan struct{})
 	var joiners atomic.Int32
-	c.flightWaiterHook = func() {
+	c.flightWaiterHook = func(*unlockFlight) {
 		if joiners.Add(1) == callers-1 {
 			close(joined)
 		}
@@ -566,7 +566,7 @@ func TestEnsureUnlocked_ConcurrentCalls_MaxRetriesSharesResult(t *testing.T) {
 
 func TestEnsureUnlocked_ConcurrentCalls_NonPasswordFailureSharesResult(t *testing.T) {
 	const callers = 5
-	errConcurrentUnlock := errors.New("concurrent unlock failed")
+	errConcurrentUnlock := errors.New("concurrent unlock failure")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -579,7 +579,7 @@ func TestEnsureUnlocked_ConcurrentCalls_NonPasswordFailureSharesResult(t *testin
 	prompter := &flightPrompter{
 		entered:  make(chan struct{}),
 		release:  make(chan struct{}),
-		sequence: []flightPromptResult{{password: "password"}},
+		sequence: []flightPromptResult{{password: "wrong"}},
 	}
 	c := clientWithPrompter(ts, prompter, true)
 	transport := http.DefaultTransport
@@ -594,7 +594,7 @@ func TestEnsureUnlocked_ConcurrentCalls_NonPasswordFailureSharesResult(t *testin
 	makeServeHealthy(c)
 	joined := make(chan struct{})
 	var joiners atomic.Int32
-	c.flightWaiterHook = func() {
+	c.flightWaiterHook = func(*unlockFlight) {
 		if joiners.Add(1) == callers-1 {
 			close(joined)
 		}
@@ -642,7 +642,7 @@ func TestEnsureUnlocked_ConcurrentWaiterContextCancellationWins(t *testing.T) {
 		c := clientWithPrompter(ts, prompter, true)
 		makeServeHealthy(c)
 		joined := make(chan struct{})
-		c.flightWaiterHook = func() { close(joined) }
+		c.flightWaiterHook = func(*unlockFlight) { close(joined) }
 
 		ownerDone := make(chan error, 1)
 		go func() { ownerDone <- c.ensureUnlocked(ctx) }()
@@ -682,7 +682,7 @@ func TestEnsureUnlocked_ConcurrentWaiterContextCancellationWins(t *testing.T) {
 		makeServeHealthy(c)
 		hookEntered := make(chan struct{})
 		hookRelease := make(chan struct{})
-		c.flightWaiterHook = func() {
+		c.flightWaiterHook = func(*unlockFlight) {
 			close(hookEntered)
 			<-hookRelease
 		}
@@ -694,11 +694,11 @@ func TestEnsureUnlocked_ConcurrentWaiterContextCancellationWins(t *testing.T) {
 		waiterDone := make(chan error, 1)
 		go func() { waiterDone <- c.ensureUnlocked(waiterCtx) }()
 		waitForTestSignal(t, ctx, hookEntered, "blocked waiter hook")
-		cancelWaiter()
 		prompter.releasePrompt()
 		if err := <-ownerDone; !errors.Is(err, ErrUserCancelled) {
 			t.Fatalf("owner error = %v, want ErrUserCancelled", err)
 		}
+		cancelWaiter()
 		close(hookRelease)
 		select {
 		case err := <-waiterDone:
@@ -731,7 +731,7 @@ func TestEnsureUnlocked_OwnerCancellationIsShared(t *testing.T) {
 	makeServeHealthy(c)
 	joined := make(chan struct{})
 	var joiners atomic.Int32
-	c.flightWaiterHook = func() {
+	c.flightWaiterHook = func(*unlockFlight) {
 		if joiners.Add(1) == callers-1 {
 			close(joined)
 		}
@@ -771,16 +771,28 @@ func TestEnsureUnlocked_OwnerCancellationIsShared(t *testing.T) {
 }
 
 func TestEnsureUnlocked_FailedFlightAllowsLaterIndependentAttempt(t *testing.T) {
+	const firstFlightCallers = 5
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	barrier := newStartBarrier(firstFlightCallers)
 	var unlockCalls atomic.Int32
+	var unlocked atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/status":
-			_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+			if !unlocked.Load() && barrier.count.Load() < barrier.want {
+				barrier.handleStatus(w, r)
+				return
+			}
+			status := "locked"
+			if unlocked.Load() {
+				status = "unlocked"
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":{"template":{"status":%q}}}`, status)
 		case "/unlock":
 			unlockCalls.Add(1)
+			unlocked.Store(true)
 			_, _ = w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
 		}
 	}))
@@ -791,21 +803,51 @@ func TestEnsureUnlocked_FailedFlightAllowsLaterIndependentAttempt(t *testing.T) 
 		release: make(chan struct{}),
 		sequence: []flightPromptResult{
 			{err: ErrUserCancelled},
-			{password: "correct-password"},
+			{password: "correct"},
 		},
 	}
 	c := clientWithPrompter(ts, prompter, true)
 	makeServeHealthy(c)
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- c.ensureUnlocked(ctx) }()
+	joined := make(chan struct{})
+	var joiners atomic.Int32
+	c.flightWaiterHook = func(*unlockFlight) {
+		if joiners.Add(1) == firstFlightCallers-1 {
+			close(joined)
+		}
+	}
+	firstResults := make([]error, firstFlightCallers)
+	var firstWG sync.WaitGroup
+	for i := range firstResults {
+		firstWG.Add(1)
+		go func(index int) {
+			defer firstWG.Done()
+			firstResults[index] = c.ensureUnlocked(ctx)
+		}(i)
+	}
+	releaseConcurrentStart(t, ctx, barrier)
 	waitForTestSignal(t, ctx, prompter.entered, "first prompt")
+	waitForTestSignal(t, ctx, joined, "first-flight waiters")
 	prompter.releasePrompt()
-	if err := <-firstDone; !errors.Is(err, ErrUserCancelled) {
-		t.Fatalf("first attempt error = %v, want ErrUserCancelled", err)
+	waitForEnsureResults(t, ctx, &firstWG)
+	for i, err := range firstResults {
+		if !errors.Is(err, ErrUserCancelled) {
+			t.Errorf("first-flight caller %d error = %v, want ErrUserCancelled", i, err)
+		}
+	}
+	if got := joiners.Load(); got != firstFlightCallers-1 {
+		t.Fatalf("first-flight joiners = %d, want %d", got, firstFlightCallers-1)
 	}
 
+	c.flightWaiterHook = nil
 	if err := c.ensureUnlocked(ctx); err != nil {
 		t.Fatalf("second independent attempt error = %v, want nil", err)
+	}
+	locked, err := c.IsLocked(ctx)
+	if err != nil {
+		t.Fatalf("status after successful unlock error = %v", err)
+	}
+	if locked {
+		t.Fatal("status after successful unlock = locked, want unlocked")
 	}
 	if got := prompter.callCount.Load(); got != 2 {
 		t.Errorf("prompter calls = %d, want 2", got)
