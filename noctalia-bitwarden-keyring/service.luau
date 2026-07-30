@@ -15,6 +15,7 @@ local postAction = nil
 local processingCommand = false
 local commandIdentity = 0
 local watcherRegistered = false
+local startupRecovering = true
 local lifecycle = {version = 1, active_id = "", phase = "", queue = {}}
 
 local function validId(value)
@@ -126,6 +127,14 @@ local function clearMatchingCommand(id)
   current = nil
 end
 
+local function clearMatchingAuth(id)
+  local current = noctalia.state.get("auth")
+  if type(current) == "table" and current.id == id then
+    noctalia.state.set("auth", false)
+  end
+  current = nil
+end
+
 local function invalidatePrivate()
   generation = generation + 1
   active = nil
@@ -201,6 +210,12 @@ local function registerCommandWatcher()
   noctalia.state.watch("command", onCommand)
 end
 
+local function finalizeStartupRecovery()
+  if not startupRecovering then return end
+  startupRecovering = false
+  registerCommandWatcher()
+end
+
 local function openRequest(id, restoredPhase)
   pendingId = id
   generation = generation + 1
@@ -211,7 +226,6 @@ local function openRequest(id, restoredPhase)
   local descriptor = loadDescriptor(id)
   if descriptor == nil then
     dropOwnership()
-    registerCommandWatcher()
     return
   end
   bridgeBaseUrl = descriptor.base_url
@@ -229,40 +243,50 @@ local function openRequest(id, restoredPhase)
     fetching = false
     if type(res) ~= "table" or res.error ~= nil or res.status ~= 200 or type(res.body) ~= "string" then
       bridgeFailure()
-      registerCommandWatcher()
       return
     end
     local decodedRequest, request = pcall(noctalia.json.decode, res.body)
     if not decodedRequest or not validRequest(request, capturedId) then
       terminalFinish("failed", translated("panel.invalid_request"))
-      registerCommandWatcher()
       return
     end
     local phase = restoredPhase == "busy" and "busy" or "ready"
     active = {id = capturedId, title = request.title, prompt = request.message, confirmOnly = request.confirm_only == true, phase = phase}
     request = nil
     pendingId = nil
-    lifecycle.phase = phase
-    persistLifecycle()
-    publish(active.id, active.title, active.prompt, active.confirmOnly, phase, "")
-    if phase == "ready" then
-      requestPanelOpen()
-    else
-      clearMatchingCommand(capturedId)
+    if lifecycle.phase ~= phase then
+      lifecycle.phase = phase
+      persistLifecycle()
     end
-    registerCommandWatcher()
+    local retainedCommand = noctalia.state.get("command")
+    if phase == "busy" then
+      clearMatchingCommand(capturedId)
+      publish(active.id, active.title, active.prompt, active.confirmOnly, "busy", "")
+    elseif type(retainedCommand) == "table" and retainedCommand.id == capturedId then
+      onCommand(retainedCommand)
+      if not posting then
+        publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
+        requestPanelOpen()
+      end
+    else
+      publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
+      requestPanelOpen()
+    end
+    retainedCommand = nil
+    finalizeStartupRecovery()
   end)
   if started == false then
     fetching = false
     bridgeFailure()
-    registerCommandWatcher()
   end
 end
 
 startNextRequest = function()
   if lifecycle.active_id ~= "" or active ~= nil or fetching then return end
+  local changed = false
   while #lifecycle.queue > 0 do
     local id = table.remove(lifecycle.queue, 1)
+    changed = true
     local descriptor = loadDescriptor(id)
     if descriptor ~= nil then
       descriptor.token = nil
@@ -275,7 +299,10 @@ startNextRequest = function()
       return
     end
   end
-  persistLifecycle()
+  if changed then
+    persistLifecycle()
+  end
+  finalizeStartupRecovery()
 end
 
 local function validAction(action)
@@ -486,9 +513,25 @@ function onExit()
   postAction = nil
 end
 
+local function sameLifecycle(left, right)
+  if type(left) ~= "table" or left.version ~= right.version or left.active_id ~= right.active_id
+    or left.phase ~= right.phase or type(left.queue) ~= "table" or #left.queue ~= #right.queue then return false end
+  local fields = 0
+  for key, _ in pairs(left) do
+    if key ~= "version" and key ~= "active_id" and key ~= "phase" and key ~= "queue" then return false end
+    fields = fields + 1
+  end
+  if fields ~= 4 then return false end
+  for index, id in ipairs(right.queue) do
+    if left.queue[index] ~= id then return false end
+  end
+  return true
+end
+
 local function sanitizeLifecycle(value)
   local sanitized = {version = 1, active_id = "", phase = "", queue = {}}
   local seen = {}
+  local droppedActiveId = type(value) == "table" and type(value.active_id) == "string" and value.active_id or ""
   if type(value) == "table" and value.version == 1 and validId(value.active_id)
     and (value.phase == "fetching" or value.phase == "ready" or value.phase == "busy") then
     local descriptor = loadDescriptor(value.active_id)
@@ -499,6 +542,7 @@ local function sanitizeLifecycle(value)
       descriptor.token = nil
       descriptor.base_url = nil
       descriptor = nil
+      droppedActiveId = ""
     end
   end
   if type(value) == "table" and type(value.queue) == "table" then
@@ -515,17 +559,24 @@ local function sanitizeLifecycle(value)
       end
     end
   end
-  return sanitized
+  return sanitized, not sameLifecycle(value, sanitized), droppedActiveId
 end
 
 local restored = noctalia.state.get("service_lifecycle")
-lifecycle = sanitizeLifecycle(restored)
+local sanitized, lifecycleChanged, droppedActiveId = sanitizeLifecycle(restored)
+lifecycle = sanitized
+sanitized = nil
+if droppedActiveId ~= "" then
+  clearMatchingCommand(droppedActiveId)
+  clearMatchingAuth(droppedActiveId)
+end
 restored = nil
-persistLifecycle()
+if lifecycleChanged then
+  persistLifecycle()
+end
 if lifecycle.active_id ~= "" then
   openRequest(lifecycle.active_id, lifecycle.phase)
 else
   startNextRequest()
-  registerCommandWatcher()
 end
 noctalia.setUpdateInterval(250)

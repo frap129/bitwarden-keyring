@@ -509,9 +509,25 @@ func assertServiceSource(t *testing.T, source string) {
 		t.Error("service.luau lifecycle state contains sensitive or presentation data")
 	}
 	startupLifecycle := strings.Index(source, `noctalia.state.get("service_lifecycle")`)
-	startupWatch := strings.LastIndex(source, `registerCommandWatcher()`)
-	if startupLifecycle < 0 || startupWatch < 0 || startupLifecycle > startupWatch {
+	if startupLifecycle < 0 || strings.Contains(source[startupLifecycle:], `registerCommandWatcher()`) {
 		t.Error("service.luau must sanitize and restore lifecycle before registering the command watcher")
+	}
+	for _, required := range []string{
+		`local startupRecovering = true`, `local function finalizeStartupRecovery()`,
+		`local retainedCommand = noctalia.state.get("command")`, `clearMatchingAuth(droppedActiveId)`,
+		`if lifecycleChanged then`, `if phase == "busy" then`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Errorf("service.luau startup recovery does not contain required literal %q", required)
+		}
+	}
+	getRetained := strings.Index(source, `local retainedCommand = noctalia.state.get("command")`)
+	publishRehydrated := -1
+	if getRetained >= 0 {
+		publishRehydrated = strings.Index(source[getRetained:], `publish(active.id`)
+	}
+	if publishRehydrated < 0 {
+		t.Error("service.luau must inspect retained command before publishing rehydrated auth")
 	}
 	if strings.Count(source, `capturedGeneration ~= generation`) < 3 {
 		t.Error("service.luau must generation-guard every HTTP callback")
@@ -837,6 +853,102 @@ func TestServiceLifecycleRestoresFetchingReadyAndBusyRequests(t *testing.T) {
 				t.Fatalf("invalid restoration = (%q, %#v), want queued request started", got, model.state)
 			}
 		})
+	}
+}
+
+type startupRecoveryModel struct {
+	phase                     string
+	commandID, commandAction  string
+	activeValid, sanitized    bool
+	queue                     []string
+	persisted, watched        int
+	authPhase                 string
+	commandCleared, authClear bool
+	recovering                bool
+}
+
+func (m *startupRecoveryModel) begin() {
+	m.recovering = true
+	if m.sanitized {
+		m.persisted++
+	}
+	if !m.activeValid {
+		m.authClear = true
+		m.commandCleared = m.commandID == requestIDA
+		m.next()
+	}
+}
+
+func (m *startupRecoveryModel) next() {
+	if len(m.queue) == 0 {
+		m.recovering = false
+		m.watched++
+		return
+	}
+	m.queue = m.queue[1:]
+}
+
+func (m *startupRecoveryModel) rehydrated() {
+	if m.phase == "ready" && m.commandID == requestIDA && m.commandAction == "submit" {
+		m.authPhase = "busy"
+	} else {
+		m.authPhase = m.phase
+	}
+	if m.phase == "busy" && m.commandID == requestIDA {
+		m.commandCleared = true
+	}
+	m.recovering = false
+	m.watched++
+}
+
+func (m *startupRecoveryModel) fetchFailed() {
+	m.next()
+}
+
+func TestServiceLifecycleStartupPreservesUnchangedLifecycle(t *testing.T) {
+	model := startupRecoveryModel{activeValid: true, phase: "ready"}
+	model.begin()
+	if model.persisted != 0 {
+		t.Fatalf("valid unchanged lifecycle persisted %d times", model.persisted)
+	}
+}
+
+func TestServiceLifecycleReadyCommandBecomesBusyBeforeAuthPublish(t *testing.T) {
+	model := startupRecoveryModel{activeValid: true, phase: "ready", commandID: requestIDA, commandAction: "submit"}
+	model.begin()
+	model.rehydrated()
+	if model.authPhase != "busy" {
+		t.Fatalf("ready retained command published transient phase %q, want busy", model.authPhase)
+	}
+}
+
+func TestServiceLifecycleBusyRecoveryClearsAcknowledgedCommandBeforePolling(t *testing.T) {
+	model := startupRecoveryModel{activeValid: true, phase: "busy", commandID: requestIDA, commandAction: "submit"}
+	model.begin()
+	model.rehydrated()
+	if !model.commandCleared || model.authPhase != "busy" {
+		t.Fatalf("busy recovery = %#v, want stale command cleared before busy publish", model)
+	}
+}
+
+func TestServiceLifecycleWatcherWaitsForRecoveryChain(t *testing.T) {
+	model := startupRecoveryModel{queue: []string{requestIDB, requestIDC}}
+	model.begin()
+	model.fetchFailed()
+	if model.watched != 0 || !model.recovering {
+		t.Fatalf("failed active recovery registered watcher early: %#v", model)
+	}
+	model.rehydrated()
+	if model.watched != 1 || model.recovering {
+		t.Fatalf("settled queued recovery did not finalize once: %#v", model)
+	}
+}
+
+func TestServiceLifecycleDroppedActiveScrubsMatchingSharedState(t *testing.T) {
+	model := startupRecoveryModel{commandID: requestIDA, commandAction: "submit"}
+	model.begin()
+	if !model.authClear || !model.commandCleared {
+		t.Fatalf("dropped active retained stale shared state: %#v", model)
 	}
 }
 
