@@ -17,6 +17,7 @@ local commandIdentity = 0
 local watcherRegistered = false
 local startupRecovering = true
 local panelOpeningFor = nil
+local panelVisibleFor = nil
 local lifecycle = {version = 1, active_id = "", phase = "", queue = {}}
 
 local function validId(value)
@@ -80,16 +81,21 @@ end
 
 local function clearPanelOpening()
   panelOpeningFor = nil
+  panelVisibleFor = nil
 end
 
 local function requestPanelOpen(id)
   if not validId(id) then return end
-  if panelOpeningFor == id then return end
   local now = os.time()
   if freshPanelMarker(id, now) then
-    panelOpeningFor = id
+    panelOpeningFor = nil
+    panelVisibleFor = id
     return
   end
+  if panelVisibleFor == id then
+    panelVisibleFor = nil
+  end
+  if panelOpeningFor == id then return end
   panelOpeningFor = id
   noctalia.togglePanel(PANEL_ID)
 end

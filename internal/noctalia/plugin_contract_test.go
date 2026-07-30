@@ -507,6 +507,7 @@ func assertServiceSource(t *testing.T, source string) {
 		`local function enqueueRequest(id)`, `startNextRequest = function()`, `local function terminalFinish(`,
 		`enqueueRequest(payload)`, `startNextRequest()`, `noctalia.state.get("service_lifecycle")`,
 		`local panelOpeningFor = nil`, `heartbeat >= now - 3`, `heartbeat <= now + 1`, `heartbeat % 1 == 0`,
+		`local panelVisibleFor = nil`, `panelOpeningFor = nil`, `panelVisibleFor = id`,
 		`local function requestPanelOpen(id)`, `requestPanelOpen(id)`,
 	} {
 		if !strings.Contains(source, required) {
@@ -1254,15 +1255,20 @@ func TestPanelProgrammaticTerminalCloseDoesNotDuplicateCommand(t *testing.T) {
 type servicePanelOpeningModel struct {
 	marker     any
 	openingFor string
+	visibleFor string
 	toggles    int
 }
 
 func (m *servicePanelOpeningModel) requestOpen(id string, now int64) {
-	if m.openingFor == id {
+	if !shouldOpenPanel(id, m.marker, now) {
+		m.openingFor = ""
+		m.visibleFor = id
 		return
 	}
-	if !shouldOpenPanel(id, m.marker, now) {
-		m.openingFor = id
+	if m.visibleFor == id {
+		m.visibleFor = ""
+	}
+	if m.openingFor == id {
 		return
 	}
 	m.openingFor = id
@@ -1284,8 +1290,28 @@ func TestServiceModelFreshMarkerPreventsVisiblePanelToggleClosed(t *testing.T) {
 		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 11}}
 	model.requestOpen(requestIDA, 11)
 	model.requestOpen(requestIDA, 12)
-	if model.toggles != 0 || model.openingFor != requestIDA {
+	if model.toggles != 0 || model.openingFor != "" || model.visibleFor != requestIDA {
 		t.Fatalf("fresh visible panel toggled or retained guard: %#v", model)
+	}
+}
+
+func TestServiceMarkerAcknowledgmentAllowsOneReopenAfterClose(t *testing.T) {
+	model := servicePanelOpeningModel{marker: false}
+	model.requestOpen(requestIDA, 10)
+	if model.toggles != 1 || model.openingFor != requestIDA {
+		t.Fatalf("initial toggle = %#v", model)
+	}
+	model.marker = panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 11}
+	model.requestOpen(requestIDA, 11)
+	if model.openingFor != "" || model.visibleFor != requestIDA || model.toggles != 1 {
+		t.Fatalf("fresh marker acknowledgment = %#v", model)
+	}
+	model.marker = false
+	model.requestOpen(requestIDA, 12)
+	model.requestOpen(requestIDA, 13)
+	model.requestOpen(requestIDA, 100)
+	if model.toggles != 2 || model.openingFor != requestIDA || model.visibleFor != "" {
+		t.Fatalf("closed marker reopen lifecycle = %#v", model)
 	}
 }
 
