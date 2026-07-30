@@ -573,8 +573,9 @@ type serviceLifecycleFixture struct {
 }
 
 type serviceLifecycleModel struct {
-	state   serviceLifecycleFixture
-	outcome string
+	state          serviceLifecycleFixture
+	outcome        string
+	pendingCommand string
 }
 
 func validRequestID(id string) bool {
@@ -617,7 +618,10 @@ func (m *serviceLifecycleModel) finish(outcome string) string {
 }
 
 func (m *serviceLifecycleModel) restore() string {
-	if m.state.ActiveID != "" && validRequestID(m.state.ActiveID) && !m.state.StaleIDs[m.state.ActiveID] {
+	validPhase := m.state.Phase == "fetching" || m.state.Phase == "ready" || m.state.Phase == "busy"
+	validOperation := m.state.Operation == "idle" || m.state.Operation == "fetching" || m.state.Operation == "posting" || m.state.Operation == "polling"
+	validOwnership := m.state.ActiveID != "" && validRequestID(m.state.ActiveID) && validPhase && validOperation
+	if validOwnership && !m.state.StaleIDs[m.state.ActiveID] {
 		return m.state.ActiveID
 	}
 	return m.startNext()
@@ -629,11 +633,26 @@ func (m *serviceLifecycleModel) responseAttempt(started, transportOK bool, statu
 	}
 	switch status {
 	case 202, 409:
+		m.pendingCommand = ""
+		m.outcome = "accepted"
 		return "accepted"
 	case 410:
+		m.pendingCommand = ""
+		m.outcome = "gone"
+		m.startNext()
 		return "gone"
 	default:
 		return "retry"
+	}
+}
+
+func (m *serviceLifecycleModel) transportFailure() {
+	switch m.state.Operation {
+	case "fetching", "polling":
+		m.outcome = "failed"
+		m.pendingCommand = ""
+	case "posting":
+		m.outcome = "retry"
 	}
 }
 
@@ -732,10 +751,30 @@ func TestServiceLifecycleRestoresFetchingReadyAndBusyRequests(t *testing.T) {
 			t.Errorf("persisted lifecycle contains secret field %q", name)
 		}
 	}
+
+	for _, test := range []struct {
+		name      string
+		activeID  string
+		phase     string
+		operation string
+	}{
+		{name: "invalid phase", activeID: requestIDA, phase: "failed", operation: "idle"},
+		{name: "invalid operation", activeID: requestIDA, phase: "ready", operation: "cancelling"},
+		{name: "missing active ID with phase", phase: "ready", operation: "idle"},
+		{name: "active ID without phase", activeID: requestIDA, operation: "idle"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := serviceLifecycleModel{state: serviceLifecycleFixture{
+				ActiveID: test.activeID, Phase: test.phase, Operation: test.operation, Queue: []string{requestIDB},
+			}}
+			if got := model.restore(); got != requestIDB || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" || model.state.Operation != "fetching" {
+				t.Fatalf("invalid restoration = (%q, %#v), want queued request started", got, model.state)
+			}
+		})
+	}
 }
 
 func TestServiceCancellationRetriesStartAndTransportFailures(t *testing.T) {
-	model := serviceLifecycleModel{}
 	for _, test := range []struct {
 		started, transportOK bool
 		status               int
@@ -745,23 +784,38 @@ func TestServiceCancellationRetriesStartAndTransportFailures(t *testing.T) {
 		{started: true, transportOK: true, status: 200},
 		{started: true, transportOK: true, status: 500},
 	} {
+		model := serviceLifecycleModel{pendingCommand: "cancel"}
 		if got := model.responseAttempt(test.started, test.transportOK, test.status); got != "retry" {
 			t.Errorf("responseAttempt(%v, %v, %d) = %q, want retry", test.started, test.transportOK, test.status, got)
+		}
+		if model.pendingCommand != "cancel" {
+			t.Errorf("responseAttempt(%v, %v, %d) cleared pending cancellation", test.started, test.transportOK, test.status)
 		}
 	}
 }
 
 func TestServiceCancellationTreatsConflictAsAcknowledged(t *testing.T) {
 	for _, status := range []int{202, 409} {
-		if got := (&serviceLifecycleModel{}).responseAttempt(true, true, status); got != "accepted" {
+		model := serviceLifecycleModel{pendingCommand: "cancel"}
+		if got := model.responseAttempt(true, true, status); got != "accepted" {
 			t.Fatalf("status %d outcome = %q, want accepted", status, got)
+		}
+		if model.pendingCommand != "" || model.outcome != "accepted" {
+			t.Fatalf("status %d cancellation state = %#v, want completed command", status, model)
 		}
 	}
 }
 
 func TestServiceCancellationTreatsGoneAsTerminal(t *testing.T) {
-	if got := (&serviceLifecycleModel{}).responseAttempt(true, true, 410); got != "gone" {
+	model := serviceLifecycleModel{
+		state:          serviceLifecycleFixture{ActiveID: requestIDA, Phase: "ready", Operation: "posting", Queue: []string{requestIDB}},
+		pendingCommand: "cancel",
+	}
+	if got := model.responseAttempt(true, true, 410); got != "gone" {
 		t.Fatalf("gone outcome = %q, want gone", got)
+	}
+	if model.pendingCommand != "" || model.outcome != "gone" || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" {
+		t.Fatalf("gone cancellation state = %#v, want ownership advanced", model)
 	}
 }
 
@@ -775,19 +829,21 @@ func TestServiceCancellationDoesNotTurnIntoGenericBridgeFailure(t *testing.T) {
 func TestServiceOrdinaryTransportFailuresRemainFailures(t *testing.T) {
 	for _, test := range []struct {
 		name        string
+		operation   string
+		command     string
 		wantOutcome string
 		wantCommand bool
 	}{
-		{name: "fetch", wantOutcome: "failed"},
-		{name: "result", wantOutcome: "failed"},
-		{name: "submit", wantOutcome: "retry", wantCommand: true},
-		{name: "confirm", wantOutcome: "retry", wantCommand: true},
+		{name: "fetch", operation: "fetching", wantOutcome: "failed"},
+		{name: "result", operation: "polling", wantOutcome: "failed"},
+		{name: "submit", operation: "posting", command: "submit", wantOutcome: "retry", wantCommand: true},
+		{name: "confirm", operation: "posting", command: "confirm", wantOutcome: "retry", wantCommand: true},
 	} {
-		model := serviceLifecycleModel{}
-		model.outcome = test.wantOutcome
-		commandRetained := test.wantCommand && model.outcome == "retry"
+		model := serviceLifecycleModel{state: serviceLifecycleFixture{Operation: test.operation}, pendingCommand: test.command}
+		model.transportFailure()
+		commandRetained := model.pendingCommand != ""
 		if model.outcome != test.wantOutcome || commandRetained != test.wantCommand {
-			t.Fatalf("ordinary %s transport failure = (%q, command retained %v)", test.name, model.outcome, commandRetained)
+			t.Fatalf("ordinary %s transport failure = (%q, command retained %v), want (%q, %v)", test.name, model.outcome, commandRetained, test.wantOutcome, test.wantCommand)
 		}
 	}
 }
