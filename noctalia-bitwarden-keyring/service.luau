@@ -91,15 +91,15 @@ end
 
 local function requestHeaders(token)
   return {
-    Authorization = "Bearer " .. token,
-    Accept = "application/json",
-    ["Cache-Control"] = "no-store",
+    "Authorization: Bearer " .. token,
+    "Accept: application/json",
+    "Cache-Control: no-store",
   }
 end
 
 local function responseHeaders(token)
   local headers = requestHeaders(token)
-  headers["Content-Type"] = "application/json"
+  table.insert(headers, "Content-Type: application/json")
   return headers
 end
 

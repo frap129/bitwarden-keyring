@@ -256,7 +256,7 @@ func assertPanelSource(t *testing.T, source string) {
 	for _, required := range []string{
 		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local inputAccepting`, `local suppressCloseCancel`,
 		`function render()`, `ui.label({ text = title })`, `ui.label({ text = prompt })`, `ui.input({`,
-		`ui.glyph({ name = "lock" })`, `ui.image({ path = "assets/bitwarden.svg" })`, `ui.column({ gap = 12 }, children)`,
+		`ui.glyph({ name = "lock" })`, `ui.image({ path = "assets/bitwarden.svg", width = 48, height = 48, fit = "contain" })`, `ui.column({ gap = 12 }, children)`,
 		`noctalia.getConfig("show_bitwarden_icon")`,
 		`key = "password-" .. inputKey`, `value = ""`, `password = true`, `focus = true`, `enabled = auth.phase == "ready"`,
 		`local capturedInputKey = inputKey`, `local capturedId = auth.id`, `onChange = function(value)`, `onSubmit = function()`,
@@ -269,7 +269,8 @@ func assertPanelSource(t *testing.T, source string) {
 		`noctalia.state.watch("auth", onAuthChanged)`,
 		`if capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id then return end`,
 		`if not inputAccepting or auth.phase ~= "ready" or auth.confirm_only then return end`,
-		`if auth == nil or auth.phase ~= "failed" then return end`,
+		`if auth == nil or not terminalPhase(auth.phase) then return end`,
+		`ui.row({ gap = 8 }, actions)`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("panel.luau does not contain required literal %q", required)
@@ -305,14 +306,30 @@ func assertPanelSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)local nextAuth = sanitizeAuth\(value\).*?if nextAuth == nil then.*?end\s+clearPassword\(\)\s+auth = nextAuth`).MatchString(source) {
 		t.Error("panel.luau must clear password and increment its key for every valid auth update")
 	}
-	if !regexp.MustCompile(`(?s)function onDismiss\(\)\s+if auth == nil or auth\.phase ~= "failed" then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
-		t.Error("panel.luau dismiss must validate the current failed auth before suppressing close")
+	if !regexp.MustCompile(`(?s)function onDismiss\(\)\s+if auth == nil or not terminalPhase\(auth\.phase\) then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
+		t.Error("panel.luau dismiss must validate the current terminal auth before suppressing close")
 	}
 	if !regexp.MustCompile(`(?s)function onInvalidDismiss\(\)\s+if auth ~= nil then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
 		t.Error("panel.luau invalid-state dismiss must not close or suppress a valid request")
 	}
 	if !strings.Contains(source, `onClick = "onInvalidDismiss"`) {
 		t.Error("panel.luau invalid state is not dismissible")
+	}
+	for _, callback := range []string{`onClick = "onInvalidDismiss"`, `onClick = "onDismiss"`, `onClick = "onCancel"`, `onClick = "onUnlock"`, `onClick = "onConfirm"`} {
+		if strings.Count(source, callback) != 1 {
+			t.Errorf("panel.luau action callback %q must have exactly one render path", callback)
+		}
+	}
+	actionBranches := regexp.MustCompile(`(?s)if auth == nil then\s+table\.insert\(children, ui\.button\(\{[^}]*onClick = "onInvalidDismiss"[^}]*\}\)\)\s+elseif terminalPhase\(auth\.phase\) then\s+table\.insert\(children, ui\.button\(\{[^}]*onClick = "onDismiss"[^}]*\}\)\)\s+elseif auth\.phase == "ready" or auth\.phase == "busy" or auth\.phase == "cancelling" then(.*?)table\.insert\(children, ui\.row\(\{ gap = 8 \}, actions\)\)\s+end`)
+	branchMatch := actionBranches.FindStringSubmatch(source)
+	if len(branchMatch) != 2 {
+		t.Error("panel.luau must render invalid, terminal, and normal actions as mutually exclusive branches")
+	} else {
+		for _, callback := range []string{`onClick = "onCancel"`, `onClick = "onUnlock"`, `onClick = "onConfirm"`} {
+			if !strings.Contains(branchMatch[1], callback) {
+				t.Errorf("panel.luau normal action row does not contain %q", callback)
+			}
+		}
 	}
 	if !regexp.MustCompile(`(?s)function onClose\(\).*?if not suppressCloseCancel and auth ~= nil and auth\.phase == "ready" then\s+auth\.phase = "cancelling"\s+clearPassword\(\)\s+noctalia\.state\.set\("command", \{ action = "cancel", id = auth\.id \}\)`).MatchString(source) {
 		t.Error("panel.luau close must transition ready auth before publishing one cancellation")
@@ -459,7 +476,8 @@ func assertServiceSource(t *testing.T, source string) {
 	t.Helper()
 	for _, required := range []string{
 		`--!nonstrict`, `noctalia.getenv("XDG_RUNTIME_DIR")`, `noctalia.readFile`,
-		`Authorization = "Bearer "`, `/v1/request`, `/v1/response`, `/v1/result`,
+		`"Authorization: Bearer " .. token`, `"Accept: application/json"`, `"Cache-Control: no-store"`,
+		`table.insert(headers, "Content-Type: application/json")`, `/v1/request`, `/v1/response`, `/v1/result`,
 		`noctalia.setUpdateInterval(250)`, `function update()`, `capturedGeneration ~= generation`,
 		`capturedId ~= pendingId`, `capturedId ~= active.id`, `status ~= 200 and status ~= 204 and status ~= 409`,
 		`noctalia.state.set("command", nil)`, `noctalia.state.set("auth", false)`, `noctalia.state.get("panel_open")`,
@@ -487,6 +505,7 @@ func assertServiceSource(t *testing.T, source string) {
 		t.Error("service.luau must publish terminal auth before invalidating callbacks")
 	}
 	for _, forbidden := range []string{
+		`Authorization =`, `["Cache-Control"]`, `headers["Content-Type"]`,
 		`panel_open", nil`, `panel_open", false`, `panel_open", true`,
 		"os.execute", "io.popen", "noctalia.exec", "noctalia.spawn", "console.log", "logger", "notify(", "noctalia.http.request",
 		`publish(active.id, active.title, active.prompt, active.confirmOnly, "cancelling"`, `result.error`,

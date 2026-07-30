@@ -45,6 +45,10 @@ local function terminalText()
   return ""
 end
 
+local function terminalPhase(phase)
+  return phase == "failed" or phase == "success" or phase == "cancelled" or phase == "confirmed"
+end
+
 local function requestProgrammaticDismiss()
   suppressCloseCancel = true
   panel.close()
@@ -69,7 +73,7 @@ function render()
 
   local icon
   if noctalia.getConfig("show_bitwarden_icon") == true then
-    icon = ui.image({ path = "assets/bitwarden.svg" })
+    icon = ui.image({ path = "assets/bitwarden.svg", width = 48, height = 48, fit = "contain" })
   else
     icon = ui.glyph({ name = "lock" })
   end
@@ -101,18 +105,22 @@ function render()
   table.insert(children, ui.label({ text = errorText }))
   if auth == nil then
     table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = true, onClick = "onInvalidDismiss" }))
-  elseif auth.phase == "failed" then
+  elseif terminalPhase(auth.phase) then
     table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = true, onClick = "onDismiss" }))
-  end
-  table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = ready, onClick = "onCancel" }))
-  if confirmOnly then
-    table.insert(children, ui.button({ text = noctalia.tr("panel.confirm"), enabled = ready, onClick = "onConfirm" }))
-  else
-    table.insert(children, ui.button({
-      text = busy and noctalia.tr("panel.unlocking") or noctalia.tr("panel.unlock"),
-      enabled = ready and password ~= "",
-      onClick = "onUnlock",
-    }))
+  elseif auth.phase == "ready" or auth.phase == "busy" or auth.phase == "cancelling" then
+    local actions = {
+      ui.button({ text = noctalia.tr("panel.cancel"), enabled = ready, onClick = "onCancel" }),
+    }
+    if confirmOnly then
+      table.insert(actions, ui.button({ text = noctalia.tr("panel.confirm"), enabled = ready, onClick = "onConfirm" }))
+    else
+      table.insert(actions, ui.button({
+        text = busy and noctalia.tr("panel.unlocking") or noctalia.tr("panel.unlock"),
+        enabled = ready and password ~= "",
+        onClick = "onUnlock",
+      }))
+    end
+    table.insert(children, ui.row({ gap = 8 }, actions))
   end
   return ui.column({ gap = 12 }, children)
 end
@@ -163,7 +171,7 @@ function onCancel()
 end
 
 function onDismiss()
-  if auth == nil or auth.phase ~= "failed" then return end
+  if auth == nil or not terminalPhase(auth.phase) then return end
   clearPassword()
   requestProgrammaticDismiss()
 end
