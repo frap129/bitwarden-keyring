@@ -60,6 +60,101 @@ func (p *blockingPrompter) PromptForPassword(errMsg string) (string, ResultNotif
 	return password, nil, p.err
 }
 
+type flightPromptResult struct {
+	password string
+	err      error
+}
+
+type flightPrompter struct {
+	entered   chan struct{}
+	release   chan struct{}
+	sequence  []flightPromptResult
+	callCount atomic.Int32
+	enterOnce sync.Once
+	relOnce   sync.Once
+}
+
+func (p *flightPrompter) PromptForPassword(string) (string, ResultNotifier, error) {
+	index := int(p.callCount.Add(1)) - 1
+	p.enterOnce.Do(func() { close(p.entered) })
+	<-p.release
+	if index >= len(p.sequence) {
+		return "", nil, errors.New("no more flight prompt results configured")
+	}
+	result := p.sequence[index]
+	return result.password, nil, result.err
+}
+
+func (p *flightPrompter) releasePrompt() {
+	p.relOnce.Do(func() { close(p.release) })
+}
+
+type startBarrier struct {
+	want     int32
+	arrived  chan struct{}
+	release  chan struct{}
+	count    atomic.Int32
+	closeOne sync.Once
+}
+
+func newStartBarrier(want int) *startBarrier {
+	return &startBarrier{
+		want:    int32(want),
+		arrived: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (b *startBarrier) handleStatus(w http.ResponseWriter, r *http.Request) {
+	count := b.count.Add(1)
+	if count <= b.want {
+		if count == b.want {
+			b.closeOne.Do(func() { close(b.arrived) })
+		}
+		select {
+		case <-b.release:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func waitForTestSignal(t *testing.T, ctx context.Context, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", name, ctx.Err())
+	}
+}
+
+func releaseConcurrentStart(t *testing.T, ctx context.Context, barrier *startBarrier) {
+	t.Helper()
+	waitForTestSignal(t, ctx, barrier.arrived, "initial locked status checks")
+	if got := barrier.count.Load(); got != barrier.want {
+		t.Fatalf("initial /status calls before release = %d, want %d", got, barrier.want)
+	}
+	close(barrier.release)
+}
+
+func waitForEnsureResults(t *testing.T, ctx context.Context, wg *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	waitForTestSignal(t, ctx, done, "ensureUnlocked callers")
+}
+
 // retryPrompter allows simulating password retries - returns different passwords on successive calls
 type retryPrompter struct {
 	passwords []string // Passwords to return on each call
@@ -339,6 +434,384 @@ func TestEnsureUnlocked_ConcurrentCalls_OnlyOnePrompt(t *testing.T) {
 	}
 	if atomic.LoadInt32(&unlockCalls) != 1 {
 		t.Errorf("Unlock called %d times, want 1", unlockCalls)
+	}
+}
+
+func TestEnsureUnlocked_ConcurrentCalls_UserCancellationSharesResult(t *testing.T) {
+	const callers = 5
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	barrier := newStartBarrier(callers)
+	var unlockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			barrier.handleStatus(w, r)
+		case "/unlock":
+			unlockCalls.Add(1)
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &flightPrompter{
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+		sequence: []flightPromptResult{{err: ErrUserCancelled}},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c)
+	joined := make(chan struct{})
+	var joiners atomic.Int32
+	c.flightWaiterHook = func() {
+		if joiners.Add(1) == callers-1 {
+			close(joined)
+		}
+	}
+
+	results := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			results[index] = c.ensureUnlocked(ctx)
+		}(i)
+	}
+	releaseConcurrentStart(t, ctx, barrier)
+	waitForTestSignal(t, ctx, prompter.entered, "owner prompt")
+	waitForTestSignal(t, ctx, joined, "four flight joiners")
+	prompter.releasePrompt()
+	waitForEnsureResults(t, ctx, &wg)
+
+	for i, err := range results {
+		if !errors.Is(err, ErrUserCancelled) {
+			t.Errorf("caller %d error = %v, want ErrUserCancelled", i, err)
+		}
+	}
+	if got := joiners.Load(); got != callers-1 {
+		t.Errorf("flight joiners = %d, want %d", got, callers-1)
+	}
+	if got := prompter.callCount.Load(); got != 1 {
+		t.Errorf("prompter calls = %d, want 1", got)
+	}
+	if got := unlockCalls.Load(); got != 0 {
+		t.Errorf("unlock calls = %d, want 0", got)
+	}
+}
+
+func TestEnsureUnlocked_ConcurrentCalls_MaxRetriesSharesResult(t *testing.T) {
+	const callers = 5
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	maxRetries := DefaultSessionConfig().MaxPasswordRetries
+
+	barrier := newStartBarrier(callers)
+	var unlockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			barrier.handleStatus(w, r)
+		case "/unlock":
+			unlockCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	sequence := make([]flightPromptResult, maxRetries)
+	for i := range sequence {
+		sequence[i].password = fmt.Sprintf("wrong-%d", i)
+	}
+	prompter := &flightPrompter{entered: make(chan struct{}), release: make(chan struct{}), sequence: sequence}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = maxRetries
+	makeServeHealthy(c)
+	joined := make(chan struct{})
+	var joiners atomic.Int32
+	c.flightWaiterHook = func() {
+		if joiners.Add(1) == callers-1 {
+			close(joined)
+		}
+	}
+
+	results := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			results[index] = c.ensureUnlocked(ctx)
+		}(i)
+	}
+	releaseConcurrentStart(t, ctx, barrier)
+	waitForTestSignal(t, ctx, prompter.entered, "owner prompt")
+	waitForTestSignal(t, ctx, joined, "four flight joiners")
+	prompter.releasePrompt()
+	waitForEnsureResults(t, ctx, &wg)
+
+	for i, err := range results {
+		if !errors.Is(err, ErrMaxRetriesExceeded) {
+			t.Errorf("caller %d error = %v, want ErrMaxRetriesExceeded", i, err)
+		}
+	}
+	if got := prompter.callCount.Load(); got != int32(maxRetries) {
+		t.Errorf("prompter calls = %d, want %d", got, maxRetries)
+	}
+	if got := unlockCalls.Load(); got != int32(maxRetries) {
+		t.Errorf("unlock calls = %d, want %d", got, maxRetries)
+	}
+}
+
+func TestEnsureUnlocked_ConcurrentCalls_NonPasswordFailureSharesResult(t *testing.T) {
+	const callers = 5
+	errConcurrentUnlock := errors.New("concurrent unlock failed")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	barrier := newStartBarrier(callers)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		barrier.handleStatus(w, r)
+	}))
+	defer ts.Close()
+
+	prompter := &flightPrompter{
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+		sequence: []flightPromptResult{{password: "password"}},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	transport := http.DefaultTransport
+	var unlockCalls atomic.Int32
+	c.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/unlock" {
+			unlockCalls.Add(1)
+			return nil, errConcurrentUnlock
+		}
+		return transport.RoundTrip(r)
+	})
+	makeServeHealthy(c)
+	joined := make(chan struct{})
+	var joiners atomic.Int32
+	c.flightWaiterHook = func() {
+		if joiners.Add(1) == callers-1 {
+			close(joined)
+		}
+	}
+
+	results := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			results[index] = c.ensureUnlocked(ctx)
+		}(i)
+	}
+	releaseConcurrentStart(t, ctx, barrier)
+	waitForTestSignal(t, ctx, prompter.entered, "owner prompt")
+	waitForTestSignal(t, ctx, joined, "four flight joiners")
+	prompter.releasePrompt()
+	waitForEnsureResults(t, ctx, &wg)
+
+	for i, err := range results {
+		if !errors.Is(err, errConcurrentUnlock) {
+			t.Errorf("caller %d error = %v, want errConcurrentUnlock", i, err)
+		}
+	}
+	if got := prompter.callCount.Load(); got != 1 {
+		t.Errorf("prompter calls = %d, want 1", got)
+	}
+	if got := unlockCalls.Load(); got != 1 {
+		t.Errorf("unlock calls = %d, want 1", got)
+	}
+}
+
+func TestEnsureUnlocked_ConcurrentWaiterContextCancellationWins(t *testing.T) {
+	t.Run("cancellation while owner remains blocked", func(t *testing.T) {
+		ctx, cancelOuter := context.WithTimeout(context.Background(), time.Second)
+		defer cancelOuter()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		}))
+		defer ts.Close()
+
+		prompter := &flightPrompter{entered: make(chan struct{}), release: make(chan struct{}), sequence: []flightPromptResult{{err: ErrUserCancelled}}}
+		c := clientWithPrompter(ts, prompter, true)
+		makeServeHealthy(c)
+		joined := make(chan struct{})
+		c.flightWaiterHook = func() { close(joined) }
+
+		ownerDone := make(chan error, 1)
+		go func() { ownerDone <- c.ensureUnlocked(ctx) }()
+		waitForTestSignal(t, ctx, prompter.entered, "owner prompt")
+		waiterCtx, cancelWaiter := context.WithCancel(ctx)
+		waiterDone := make(chan error, 1)
+		go func() { waiterDone <- c.ensureUnlocked(waiterCtx) }()
+		waitForTestSignal(t, ctx, joined, "waiter join")
+		cancelWaiter()
+		select {
+		case err := <-waiterDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("waiter error = %v, want context.Canceled", err)
+			}
+		case <-prompter.release:
+			t.Fatal("owner prompt unexpectedly released")
+		case <-ctx.Done():
+			t.Fatalf("waiter did not honor cancellation: %v", ctx.Err())
+		}
+		prompter.releasePrompt()
+		if err := <-ownerDone; !errors.Is(err, ErrUserCancelled) {
+			t.Fatalf("owner error = %v, want ErrUserCancelled", err)
+		}
+	})
+
+	t.Run("context wins when context and flight are both done", func(t *testing.T) {
+		ctx, cancelOuter := context.WithTimeout(context.Background(), time.Second)
+		defer cancelOuter()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		}))
+		defer ts.Close()
+
+		prompter := &flightPrompter{entered: make(chan struct{}), release: make(chan struct{}), sequence: []flightPromptResult{{err: ErrUserCancelled}}}
+		c := clientWithPrompter(ts, prompter, true)
+		makeServeHealthy(c)
+		hookEntered := make(chan struct{})
+		hookRelease := make(chan struct{})
+		c.flightWaiterHook = func() {
+			close(hookEntered)
+			<-hookRelease
+		}
+
+		ownerDone := make(chan error, 1)
+		go func() { ownerDone <- c.ensureUnlocked(ctx) }()
+		waitForTestSignal(t, ctx, prompter.entered, "owner prompt")
+		waiterCtx, cancelWaiter := context.WithCancel(ctx)
+		waiterDone := make(chan error, 1)
+		go func() { waiterDone <- c.ensureUnlocked(waiterCtx) }()
+		waitForTestSignal(t, ctx, hookEntered, "blocked waiter hook")
+		cancelWaiter()
+		prompter.releasePrompt()
+		if err := <-ownerDone; !errors.Is(err, ErrUserCancelled) {
+			t.Fatalf("owner error = %v, want ErrUserCancelled", err)
+		}
+		close(hookRelease)
+		select {
+		case err := <-waiterDone:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("waiter error = %v, want context.Canceled", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("waiter did not return: %v", ctx.Err())
+		}
+	})
+}
+
+func TestEnsureUnlocked_OwnerCancellationIsShared(t *testing.T) {
+	const callers = 5
+	ctx, cancelOuter := context.WithTimeout(context.Background(), time.Second)
+	defer cancelOuter()
+	var unlockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/status" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+			return
+		}
+		unlockCalls.Add(1)
+	}))
+	defer ts.Close()
+
+	prompter := &flightPrompter{entered: make(chan struct{}), release: make(chan struct{}), sequence: []flightPromptResult{{password: "password"}}}
+	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c)
+	joined := make(chan struct{})
+	var joiners atomic.Int32
+	c.flightWaiterHook = func() {
+		if joiners.Add(1) == callers-1 {
+			close(joined)
+		}
+	}
+	ownerCtx, cancelOwner := context.WithCancel(ctx)
+	results := make([]error, callers)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results[0] = c.ensureUnlocked(ownerCtx)
+	}()
+	waitForTestSignal(t, ctx, prompter.entered, "owner prompt")
+	for i := 1; i < callers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			results[index] = c.ensureUnlocked(ctx)
+		}(i)
+	}
+	waitForTestSignal(t, ctx, joined, "joined callers")
+	cancelOwner()
+	prompter.releasePrompt()
+	waitForEnsureResults(t, ctx, &wg)
+
+	for i, err := range results {
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("caller %d error = %v, want context.Canceled", i, err)
+		}
+	}
+	if got := prompter.callCount.Load(); got != 1 {
+		t.Errorf("prompter calls = %d, want 1", got)
+	}
+	if got := unlockCalls.Load(); got != 0 {
+		t.Errorf("unlock calls = %d, want 0", got)
+	}
+}
+
+func TestEnsureUnlocked_FailedFlightAllowsLaterIndependentAttempt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var unlockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/status":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			unlockCalls.Add(1)
+			_, _ = w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	defer ts.Close()
+
+	prompter := &flightPrompter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		sequence: []flightPromptResult{
+			{err: ErrUserCancelled},
+			{password: "correct-password"},
+		},
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c)
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- c.ensureUnlocked(ctx) }()
+	waitForTestSignal(t, ctx, prompter.entered, "first prompt")
+	prompter.releasePrompt()
+	if err := <-firstDone; !errors.Is(err, ErrUserCancelled) {
+		t.Fatalf("first attempt error = %v, want ErrUserCancelled", err)
+	}
+
+	if err := c.ensureUnlocked(ctx); err != nil {
+		t.Fatalf("second independent attempt error = %v, want nil", err)
+	}
+	if got := prompter.callCount.Load(); got != 2 {
+		t.Errorf("prompter calls = %d, want 2", got)
+	}
+	if got := unlockCalls.Load(); got != 1 {
+		t.Errorf("unlock calls = %d, want 1", got)
 	}
 }
 
