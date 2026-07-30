@@ -371,11 +371,38 @@ func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
 		return "", err
 	}
 
-	resp, err := c.doRequest(ctx, "POST", "/unlock", body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/unlock", body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+		if len(bodyBytes) <= maxErrorBody {
+			var result struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(bodyBytes, &result) == nil && isInvalidMasterPasswordMessage(result.Message) {
+				return "", ErrInvalidPassword
+			}
+		}
+
+		bodyStr := string(bodyBytes)
+		if len(bodyBytes) > maxErrorBody {
+			bodyStr = string(bodyBytes[:maxErrorBody]) + "... (truncated)"
+		}
+		apiErr := &APIError{StatusCode: resp.StatusCode, Path: "/unlock", debugBody: bodyStr}
+		if c.debug.Load() {
+			fmt.Fprintf(os.Stderr, "HTTP error %d on /unlock: %s\n", resp.StatusCode, logHTTPBodySnippet("Response", bodyStr))
+		}
+		return "", apiErr
+	}
 
 	var result UnlockResponse
 	if err := decodeJSON(resp.Body, &result, "unlock response"); err != nil {
@@ -383,8 +410,7 @@ func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
 	}
 
 	if !result.Success {
-		// Bitwarden CLI returns specific message for wrong password
-		if strings.Contains(result.Data.Message, "Invalid master password") {
+		if isInvalidMasterPasswordMessage(result.Data.Message) {
 			return "", ErrInvalidPassword
 		}
 		return "", fmt.Errorf("unlock failed: %s", result.Data.Message)
@@ -394,6 +420,15 @@ func (c *Client) Unlock(ctx context.Context, password string) (string, error) {
 	c.session.SetSession(result.Data.Raw)
 
 	return result.Data.Raw, nil
+}
+
+func isInvalidMasterPasswordMessage(message string) bool {
+	switch strings.TrimSpace(message) {
+	case "Invalid master password", "Invalid master password.":
+		return true
+	default:
+		return false
+	}
 }
 
 // Lock locks the vault

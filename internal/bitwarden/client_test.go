@@ -207,6 +207,25 @@ type retryPrompter struct {
 	mu        sync.Mutex
 }
 
+type notifierRetryPrompter struct {
+	retryNotified chan struct{}
+	releaseRetry  chan struct{}
+	callCount     atomic.Int32
+	retryCount    atomic.Int32
+}
+
+func (p *notifierRetryPrompter) PromptForPassword(_ context.Context, _ string) (string, ResultNotifier, error) {
+	if p.callCount.Add(1) == 1 {
+		return "wrong-password", func(success bool, _ string, allowRetry bool) {
+			if !success && allowRetry && p.retryCount.Add(1) == 1 {
+				close(p.retryNotified)
+			}
+		}, nil
+	}
+	<-p.releaseRetry
+	return "correct-password", func(bool, string, bool) {}, nil
+}
+
 func (p *retryPrompter) PromptForPassword(_ context.Context, errMsg string) (string, ResultNotifier, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -543,7 +562,8 @@ func TestEnsureUnlocked_ConcurrentCalls_MaxRetriesSharesResult(t *testing.T) {
 		case "/unlock":
 			unlockCalls.Add(1)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
 		}
 	}))
 	t.Cleanup(ts.Close)
@@ -1719,6 +1739,108 @@ PY
 
 // --- Password Retry Tests ---
 
+func TestUnlock_HTTPBadRequestInvalidMasterPassword(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	c := clientWithPrompter(ts, &mockPrompter{}, true)
+	_, err := c.Unlock(context.Background(), "do-not-leak-this-password")
+	if !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("Unlock() error = %v, want ErrInvalidPassword", err)
+	}
+	if strings.Contains(err.Error(), "do-not-leak-this-password") {
+		t.Fatal("Unlock() error leaked password")
+	}
+}
+
+func TestEnsureUnlocked_HTTPBadRequestInvalidPasswordNotifiesAndRetries(t *testing.T) {
+	var unlockCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/status":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
+		case "/unlock":
+			if unlockCalls.Add(1) == 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	prompter := &notifierRetryPrompter{retryNotified: make(chan struct{}), releaseRetry: make(chan struct{})}
+	c := clientWithPrompter(ts, prompter, true)
+	c.session.maxPasswordRetries = 3
+	makeServeHealthy(c)
+	done := make(chan error, 1)
+	go func() { done <- c.ensureUnlocked(context.Background()) }()
+
+	testCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waitForTestSignal(t, testCtx, prompter.retryNotified, "retry notifier")
+	select {
+	case err := <-done:
+		t.Fatalf("ensureUnlocked() returned after first HTTP 400: %v", err)
+	default:
+	}
+	close(prompter.releaseRetry)
+	if err := waitForTestError(t, testCtx, done, "successful retry"); err != nil {
+		t.Fatalf("ensureUnlocked() error = %v, want nil", err)
+	}
+	if got := prompter.retryCount.Load(); got != 1 {
+		t.Errorf("retry notifications = %d, want 1", got)
+	}
+	if got := unlockCalls.Load(); got != 2 {
+		t.Errorf("unlock calls = %d, want 2", got)
+	}
+}
+
+func TestUnlock_HTTPBadRequestOtherMessageRemainsSanitizedAPIError(t *testing.T) {
+	const responseBody = `{"success":false,"message":"prefix Invalid master password. secret-body-value","password":"body-password"}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(responseBody))
+	}))
+	t.Cleanup(ts.Close)
+
+	c := clientWithPrompter(ts, &mockPrompter{}, true)
+	_, err := c.Unlock(context.Background(), "request-password")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Unlock() error = %T %v, want *APIError", err, err)
+	}
+	for _, secret := range []string{"secret-body-value", "body-password", "request-password"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("Unlock() error leaked %q", secret)
+		}
+	}
+}
+
+func TestUnlock_DoesNotClassifyInvalidPasswordMarkerBeyondBodyLimit(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(strings.Repeat(" ", maxErrorBody) + `{"message":"Invalid master password."}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	c := clientWithPrompter(ts, &mockPrompter{}, true)
+	_, err := c.Unlock(context.Background(), "request-password")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Unlock() error = %T %v, want *APIError", err, err)
+	}
+	if errors.Is(err, ErrInvalidPassword) {
+		t.Fatal("Unlock() classified marker beyond bounded body as ErrInvalidPassword")
+	}
+}
+
 func TestEnsureUnlocked_RetryOnWrongPassword_SuccessOnSecondAttempt(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
@@ -1736,7 +1858,8 @@ func TestEnsureUnlocked_RetryOnWrongPassword_SuccessOnSecondAttempt(t *testing.T
 			w.Header().Set("Content-Type", "application/json")
 			// First call returns invalid password, second returns success
 			if atomic.LoadInt32(&unlockCalls) == 1 {
-				w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
 			} else {
 				w.Write([]byte(`{"success":true,"data":{"title":"test vault","message":"Vault unlocked","raw":"test-token"}}`))
 			}
@@ -1796,7 +1919,8 @@ func TestEnsureUnlocked_RetryExhausted_ReturnsMaxRetriesError(t *testing.T) {
 			atomic.AddInt32(&unlockCalls, 1)
 			w.Header().Set("Content-Type", "application/json")
 			// Always return invalid password
-			w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
 		}
 	}))
 	defer ts.Close()
@@ -1847,7 +1971,8 @@ func TestEnsureUnlocked_UserCancellationDuringRetry_StopsImmediately(t *testing.
 		case "/unlock":
 			atomic.AddInt32(&unlockCalls, 1)
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
 		}
 	}))
 	defer ts.Close()
@@ -1889,8 +2014,8 @@ func TestEnsureUnlocked_NonPasswordError_DoesNotRetry(t *testing.T) {
 		case "/unlock":
 			atomic.AddInt32(&unlockCalls, 1)
 			w.Header().Set("Content-Type", "application/json")
-			// Return a non-password error (network error, API error, etc.)
-			w.Write([]byte(`{"success":false,"data":{"message":"Connection to server failed"}}`))
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"success":false,"message":"Connection to server failed"}`))
 		}
 	}))
 	defer ts.Close()
@@ -1908,6 +2033,10 @@ func TestEnsureUnlocked_NonPasswordError_DoesNotRetry(t *testing.T) {
 	}
 	if errors.Is(err, ErrMaxRetriesExceeded) {
 		t.Fatal("ensureUnlocked() should not return ErrMaxRetriesExceeded for non-password errors")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("ensureUnlocked() error = %T %v, want wrapped *APIError", err, err)
 	}
 
 	// Verify we only made 1 unlock attempt (no retry for non-password errors)
@@ -1976,7 +2105,8 @@ func TestEnsureUnlocked_ContextCancelledDuringRetryLoop(t *testing.T) {
 		case "/unlock":
 			atomic.AddInt32(&unlockCalls, 1)
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
 		}
 	}))
 	defer ts.Close()
@@ -2040,7 +2170,8 @@ func TestEnsureUnlocked_OwnerCancellationAfterRetryTerminatesPrompt(t *testing.T
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/unlock" {
 			unlockCalls.Add(1)
-			_, _ = w.Write([]byte(`{"success":false,"data":{"message":"Invalid master password"}}`))
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"success":false,"message":"Invalid master password."}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"success":true,"data":{"template":{"status":"locked"}}}`))
