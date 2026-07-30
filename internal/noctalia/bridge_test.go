@@ -1751,6 +1751,53 @@ func TestPromptBridgeResponseResultAndDuplicateBehavior(t *testing.T) {
 	}
 }
 
+func TestNoctaliaCancellationConflictStillReturnsCancelled(t *testing.T) {
+	bridge := newTestPromptBridge(t, testPromptRequest())
+	waiterStarted := make(chan struct{})
+	releaseWaiter := make(chan struct{})
+	bridge.timerFactory = func(timeout time.Duration) bridgeTimer {
+		close(waiterStarted)
+		<-releaseWaiter
+		return newBridgeTimer(timeout)
+	}
+	reserved := make(chan struct{})
+	bridge.responseReservationHook = func(phase responseReservationPhase) {
+		if phase == responseReservationAfter {
+			close(reserved)
+		}
+	}
+
+	waitDone := make(chan KeyringResponse, 1)
+	waitErr := make(chan error, 1)
+	go func() {
+		response, err := bridge.waitResponse(context.Background(), time.Second)
+		waitDone <- response
+		waitErr <- err
+	}()
+	<-waiterStarted
+
+	cancelled := testKeyringResponse(bridge, ResultCancelled, "")
+	first := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, cancelled))
+	first.Body.Close()
+	if first.StatusCode != http.StatusAccepted {
+		t.Fatalf("first cancellation status = %d, want %d", first.StatusCode, http.StatusAccepted)
+	}
+	<-reserved
+	second := doAuthorizedBridgeRequest(t, bridge, http.MethodPost, "/v1/response", "application/json", encodeBridgeResponse(t, cancelled))
+	second.Body.Close()
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate cancellation status = %d, want %d", second.StatusCode, http.StatusConflict)
+	}
+
+	close(releaseWaiter)
+	if response := <-waitDone; response != cancelled {
+		t.Errorf("waitResponse() = %#v, want cancellation %#v", response, cancelled)
+	}
+	if err := <-waitErr; err != nil {
+		t.Errorf("waitResponse() error = %v, want nil", err)
+	}
+}
+
 func TestPromptBridgeClosedResponseAndResultAreGoneAfterAuthentication(t *testing.T) {
 	bridge := newTestPromptBridge(t, testPromptRequest())
 	if err := bridge.Close(); err != nil {

@@ -678,6 +678,71 @@ func TestNoctaliaSessionConcurrentNotifierInvocation(t *testing.T) {
 	}
 }
 
+func TestNoctaliaSequentialSessionsUseDistinctDescriptors(t *testing.T) {
+	runtimeDir := setNoctaliaTestRuntime(t)
+	type commandInvocation struct {
+		name string
+		args []string
+	}
+	invocations := make(chan commandInvocation, 2)
+	descriptors := make(chan noctaliaTestDescriptor, 2)
+	helperErr := make(chan error, 2)
+	runner := func(_ context.Context, name string, args ...string) error {
+		invocations <- commandInvocation{name: name, args: append([]string(nil), args...)}
+		cookie := args[len(args)-1]
+		go func() {
+			helperErr <- serveNoctaliaPasswordAndResultWithDescriptor(runtimeDir, cookie, nil, descriptors)
+		}()
+		return nil
+	}
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, noctalia.NewClient(noctalia.WithCommandRunner(runner)))
+
+	requestIDs := make([]string, 0, 2)
+	seenDescriptors := make([]noctaliaTestDescriptor, 0, 2)
+	seenInvocations := make([]commandInvocation, 0, 2)
+	for range 2 {
+		password, notify, err := sm.promptNoctalia("")
+		if err != nil || password != "password" {
+			t.Fatalf("promptNoctalia() = %q, %v, want password", password, err)
+		}
+		invocation := <-invocations
+		descriptor := <-descriptors
+		requestID := invocation.args[len(invocation.args)-1]
+		if descriptor.RequestID != requestID {
+			t.Fatalf("descriptor request ID = %q, want command request ID %q", descriptor.RequestID, requestID)
+		}
+
+		notify(true, "", false)
+		if err := <-helperErr; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(descriptor.Path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("descriptor %q stat error after terminal result = %v, want not exists", descriptor.Path, err)
+		}
+
+		requestIDs = append(requestIDs, requestID)
+		seenDescriptors = append(seenDescriptors, descriptor)
+		seenInvocations = append(seenInvocations, invocation)
+	}
+	if requestIDs[0] == requestIDs[1] {
+		t.Fatalf("sequential request IDs are both %q, want distinct IDs", requestIDs[0])
+	}
+	if seenDescriptors[0].Path == seenDescriptors[1].Path {
+		t.Fatalf("sequential descriptor paths are both %q, want distinct paths", seenDescriptors[0].Path)
+	}
+	for _, invocation := range seenInvocations {
+		for _, arg := range invocation.args {
+			containsDescriptorSecret := false
+			for _, descriptor := range seenDescriptors {
+				containsDescriptorSecret = containsDescriptorSecret || strings.Contains(arg, descriptor.Token) || strings.Contains(arg, descriptor.BaseURL) || strings.Contains(arg, descriptor.Path)
+			}
+			if strings.Contains(arg, "password") || containsDescriptorSecret || strings.Contains(arg, "http://") || strings.Contains(arg, "https://") {
+				t.Errorf("Noctalia command %q contains sensitive argument %q", invocation.name, arg)
+			}
+		}
+	}
+}
+
 func setNoctaliaTestRuntime(t *testing.T) string {
 	t.Helper()
 	runtimeDir := t.TempDir()
@@ -698,16 +763,17 @@ func assertNoctaliaTimeout(t *testing.T, err error, elapsed time.Duration) {
 	}
 }
 
-func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	descriptorPath := filepath.Join(runtimeDir, "bitwarden-keyring", "noctalia-"+cookie+".json")
-	var descriptor struct {
-		BaseURL string `json:"base_url"`
-		Token   string `json:"token"`
-	}
-	if err := pollNoctalia(ctx, func() (bool, error) {
-		contents, err := os.ReadFile(descriptorPath)
+type noctaliaTestDescriptor struct {
+	RequestID string `json:"request_id"`
+	BaseURL   string `json:"base_url"`
+	Token     string `json:"token"`
+	Path      string `json:"-"`
+}
+
+func loadNoctaliaTestDescriptor(ctx context.Context, runtimeDir, cookie string) (noctaliaTestDescriptor, error) {
+	descriptor := noctaliaTestDescriptor{Path: filepath.Join(runtimeDir, "bitwarden-keyring", "noctalia-"+cookie+".json")}
+	err := pollNoctalia(ctx, func() (bool, error) {
+		contents, err := os.ReadFile(descriptor.Path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return false, nil
@@ -715,18 +781,30 @@ func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
 			return false, err
 		}
 		return true, json.Unmarshal(contents, &descriptor)
-	}); err != nil {
+	})
+	return descriptor, err
+}
+
+func doNoctaliaTestRequest(ctx context.Context, client *http.Client, descriptor noctaliaTestDescriptor, method, path, body string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, descriptor.BaseURL+path, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+descriptor.Token)
+	req.Header.Set("Content-Type", "application/json")
+	return client.Do(req)
+}
+
+func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	descriptor, err := loadNoctaliaTestDescriptor(ctx, runtimeDir, cookie)
+	if err != nil {
 		return err
 	}
 	client := &http.Client{Timeout: time.Second}
 	do := func(method, path, body string) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, method, descriptor.BaseURL+path, strings.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+descriptor.Token)
-		req.Header.Set("Content-Type", "application/json")
-		return client.Do(req)
+		return doNoctaliaTestRequest(ctx, client, descriptor, method, path, body)
 	}
 	response, err := do(http.MethodGet, "/v1/request", "")
 	if err != nil {
@@ -757,34 +835,22 @@ func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
 }
 
 func serveNoctaliaPasswordAndResult(runtimeDir, cookie string, results chan<- noctalia.KeyringResult) error {
+	return serveNoctaliaPasswordAndResultWithDescriptor(runtimeDir, cookie, results, nil)
+}
+
+func serveNoctaliaPasswordAndResultWithDescriptor(runtimeDir, cookie string, results chan<- noctalia.KeyringResult, descriptors chan<- noctaliaTestDescriptor) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	descriptorPath := filepath.Join(runtimeDir, "bitwarden-keyring", "noctalia-"+cookie+".json")
-	var descriptor struct {
-		BaseURL string `json:"base_url"`
-		Token   string `json:"token"`
-	}
-	if err := pollNoctalia(ctx, func() (bool, error) {
-		contents, err := os.ReadFile(descriptorPath)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, json.Unmarshal(contents, &descriptor)
-	}); err != nil {
+	descriptor, err := loadNoctaliaTestDescriptor(ctx, runtimeDir, cookie)
+	if err != nil {
 		return err
+	}
+	if descriptors != nil {
+		descriptors <- descriptor
 	}
 	client := &http.Client{Timeout: time.Second}
 	do := func(method, path, body string) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, method, descriptor.BaseURL+path, strings.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+descriptor.Token)
-		req.Header.Set("Content-Type", "application/json")
-		return client.Do(req)
+		return doNoctaliaTestRequest(ctx, client, descriptor, method, path, body)
 	}
 	response, err := do(http.MethodGet, "/v1/request", "")
 	if err != nil {
@@ -810,7 +876,9 @@ func serveNoctaliaPasswordAndResult(runtimeDir, cookie string, results chan<- no
 		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 			return false, err
 		}
-		results <- result
+		if results != nil {
+			results <- result
+		}
 		return true, nil
 	})
 }
