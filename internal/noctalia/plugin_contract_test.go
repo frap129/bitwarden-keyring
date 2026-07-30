@@ -529,6 +529,9 @@ func assertServiceSource(t *testing.T, source string) {
 	if publishRehydrated < 0 {
 		t.Error("service.luau must inspect retained command before publishing rehydrated auth")
 	}
+	if !regexp.MustCompile(`(?s)local recoveryGeneration = generation\s+local recoveryId = capturedId.*?onCommand\(retainedCommand\).*?if recoveryGeneration == generation and active ~= nil and recoveryId == active\.id`).MatchString(source) {
+		t.Error("service.luau retained startup command must generation- and ID-guard mutable active state")
+	}
 	if strings.Count(source, `capturedGeneration ~= generation`) < 3 {
 		t.Error("service.luau must generation-guard every HTTP callback")
 	}
@@ -905,6 +908,16 @@ func (m *startupRecoveryModel) fetchFailed() {
 	m.next()
 }
 
+func (m *startupRecoveryModel) retainedCommandDropsOwnership() {
+	m.activeValid = false
+	m.authPhase = ""
+	m.commandID = ""
+	m.commandAction = ""
+	m.next()
+	m.activeValid = true
+	m.rehydrated()
+}
+
 func TestServiceLifecycleStartupPreservesUnchangedLifecycle(t *testing.T) {
 	model := startupRecoveryModel{activeValid: true, phase: "ready"}
 	model.begin()
@@ -949,6 +962,17 @@ func TestServiceLifecycleDroppedActiveScrubsMatchingSharedState(t *testing.T) {
 	model.begin()
 	if !model.authClear || !model.commandCleared {
 		t.Fatalf("dropped active retained stale shared state: %#v", model)
+	}
+}
+
+func TestServiceLifecycleRetainedCommandOwnershipDropCompletesRecovery(t *testing.T) {
+	model := startupRecoveryModel{
+		activeValid: true, phase: "ready", commandID: requestIDA, commandAction: "submit",
+		queue: []string{requestIDB}, recovering: true,
+	}
+	model.retainedCommandDropsOwnership()
+	if model.authPhase != "ready" || len(model.queue) != 0 || model.recovering || model.watched != 1 {
+		t.Fatalf("retained command ownership drop left recovery incomplete: %#v", model)
 	}
 }
 

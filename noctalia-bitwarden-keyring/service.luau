@@ -258,13 +258,15 @@ local function openRequest(id, restoredPhase)
       lifecycle.phase = phase
       persistLifecycle()
     end
+    local recoveryGeneration = generation
+    local recoveryId = capturedId
     local retainedCommand = noctalia.state.get("command")
     if phase == "busy" then
       clearMatchingCommand(capturedId)
       publish(active.id, active.title, active.prompt, active.confirmOnly, "busy", "")
     elseif type(retainedCommand) == "table" and retainedCommand.id == capturedId then
       onCommand(retainedCommand)
-      if not posting then
+      if recoveryGeneration == generation and active ~= nil and recoveryId == active.id and not posting then
         publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
         requestPanelOpen()
       end
@@ -273,7 +275,9 @@ local function openRequest(id, restoredPhase)
       requestPanelOpen()
     end
     retainedCommand = nil
-    finalizeStartupRecovery()
+    if recoveryGeneration == generation and active ~= nil and recoveryId == active.id then
+      finalizeStartupRecovery()
+    end
   end)
   if started == false then
     fetching = false
