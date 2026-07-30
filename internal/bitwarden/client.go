@@ -70,6 +70,11 @@ const maxErrorBody = 4096
 // showing inline retry feedback without re-opening the prompt.
 type ResultNotifier func(success bool, errMsg string, allowRetry bool)
 
+type unlockFlight struct {
+	done chan struct{}
+	err  error
+}
+
 // passwordPrompter provides a way to prompt for passwords.
 // It is implemented by SessionManager and can be overridden in tests.
 type passwordPrompter interface {
@@ -112,18 +117,20 @@ func logHTTPBodySnippet(prefix, body string) string {
 
 // Client provides access to the Bitwarden CLI REST API
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	session    *SessionManager
-	mu         sync.RWMutex
-	serveCmd   *exec.Cmd
-	serveDone  chan error // closed/sent when Wait() returns
-	serveErr   error      // last exit error
-	servePID   int        // process ID
-	unlockMu   sync.Mutex
-	autoUnlock atomic.Bool
-	debug      atomic.Bool
-	prompter   passwordPrompter // used for password prompting; defaults to session
+	baseURL          string
+	httpClient       *http.Client
+	session          *SessionManager
+	mu               sync.RWMutex
+	serveCmd         *exec.Cmd
+	serveDone        chan error // closed/sent when Wait() returns
+	serveErr         error      // last exit error
+	servePID         int        // process ID
+	unlockFlightMu   sync.Mutex
+	unlockFlight     *unlockFlight
+	flightWaiterHook func(*unlockFlight)
+	autoUnlock       atomic.Bool
+	debug            atomic.Bool
+	prompter         passwordPrompter // used for password prompting; defaults to session
 }
 
 // NewClient creates a new Bitwarden API client
@@ -401,7 +408,7 @@ func (c *Client) Lock(ctx context.Context) error {
 
 // ensureUnlocked checks if the vault is locked and prompts for unlock if needed.
 // Only prompts if autoUnlock is true. Returns ErrVaultLocked if autoUnlock is false.
-// Uses double-check locking to prevent concurrent password prompts.
+// Concurrent callers share the result of one unlock attempt.
 func (c *Client) ensureUnlocked(ctx context.Context) error {
 	if !c.autoUnlock.Load() {
 		locked, err := c.IsLocked(ctx)
@@ -423,22 +430,51 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 		return nil
 	}
 
-	// Check context before waiting on lock
+	c.unlockFlightMu.Lock()
+	if flight := c.unlockFlight; flight != nil {
+		hook := c.flightWaiterHook
+		c.unlockFlightMu.Unlock()
+		if hook != nil {
+			hook(flight)
+		}
+		return c.waitForUnlockFlight(ctx, flight)
+	}
+	flight := &unlockFlight{done: make(chan struct{})}
+	c.unlockFlight = flight
+	c.unlockFlightMu.Unlock()
+
+	return c.runUnlockFlight(ctx, flight)
+}
+
+func (c *Client) waitForUnlockFlight(ctx context.Context, flight *unlockFlight) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	// Serialize unlock attempts
-	c.unlockMu.Lock()
-	defer c.unlockMu.Unlock()
+	select {
+	case <-flight.done:
+	case <-ctx.Done():
+	}
 
-	// Check context after acquiring lock (may have waited)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	// Re-check after acquiring lock (another goroutine may have unlocked)
-	locked, err = c.IsLocked(ctx)
+	c.unlockFlightMu.Lock()
+	err := flight.err
+	c.unlockFlightMu.Unlock()
+	return err
+}
+
+func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (resultErr error) {
+	defer func() { c.completeUnlockFlight(flight, resultErr) }()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Re-check after becoming owner (another process may have unlocked).
+	locked, err := c.IsLocked(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to check vault status: %w", err)
 	}
@@ -522,6 +558,16 @@ func (c *Client) ensureUnlocked(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("%w: tried %d times", ErrMaxRetriesExceeded, maxRetries)
+}
+
+func (c *Client) completeUnlockFlight(flight *unlockFlight, err error) {
+	c.unlockFlightMu.Lock()
+	flight.err = err
+	close(flight.done)
+	if c.unlockFlight == flight {
+		c.unlockFlight = nil
+	}
+	c.unlockFlightMu.Unlock()
 }
 
 // withAutoUnlock wraps an operation with auto-unlock logic

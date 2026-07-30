@@ -212,23 +212,6 @@ func (p *retryPrompter) PromptForPassword(errMsg string) (string, ResultNotifier
 	return p.passwords[idx], nil, err
 }
 
-// gatingErrCtx blocks on the first Err() call until allowed.
-// This lets tests coordinate exactly when the pre-lock ctx.Err() checkpoint returns.
-type gatingErrCtx struct {
-	context.Context
-	firstCalled      chan struct{}
-	allowFirstReturn chan struct{}
-	errCalls         atomic.Int32
-}
-
-func (c *gatingErrCtx) Err() error {
-	if c.errCalls.Add(1) == 1 {
-		close(c.firstCalled)
-		<-c.allowFirstReturn
-	}
-	return c.Context.Err()
-}
-
 // blockingErrCtx blocks every Err() call until gate is closed.
 // Useful to deterministically test that cancellation is checked at an explicit ctx.Err checkpoint.
 type blockingErrCtx struct {
@@ -964,38 +947,40 @@ func TestEnsureUnlocked_ContextCancelled_AfterLock(t *testing.T) {
 
 	prompter := &mockPrompter{}
 	c := clientWithPrompter(ts, prompter, true)
-
-	// Force ensureUnlocked to block on unlockMu.Lock().
-	c.unlockMu.Lock()
-	locked := true
+	flight := &unlockFlight{done: make(chan struct{})}
+	c.unlockFlightMu.Lock()
+	c.unlockFlight = flight
+	c.unlockFlightMu.Unlock()
 	t.Cleanup(func() {
-		if locked {
-			c.unlockMu.Unlock()
+		c.unlockFlightMu.Lock()
+		current := c.unlockFlight
+		c.unlockFlightMu.Unlock()
+		if current == flight {
+			c.completeUnlockFlight(flight, nil)
 		}
 	})
-
-	base, cancel := context.WithCancel(context.Background())
-	ctx := &gatingErrCtx{
-		Context:          base,
-		firstCalled:      make(chan struct{}),
-		allowFirstReturn: make(chan struct{}),
+	hookEntered := newTestSignal()
+	hookRelease := newTestSignal()
+	t.Cleanup(hookRelease.trigger)
+	c.flightWaiterHook = func(joined *unlockFlight) {
+		if joined != flight {
+			t.Errorf("joined flight = %p, want %p", joined, flight)
+		}
+		hookEntered.trigger()
+		<-hookRelease.channel
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	done := make(chan error, 1)
 	go func() {
 		done <- c.ensureUnlocked(ctx)
 	}()
 
-	// Wait for checkpoint A to be reached, then allow it to return nil.
-	<-ctx.firstCalled
-	close(ctx.allowFirstReturn)
-
-	// Now cancel while the goroutine is blocked waiting for unlockMu.
+	waitForTestSignal(t, context.Background(), hookEntered.channel, "flight waiter hook")
 	cancel()
-
-	// Release unlockMu so the goroutine can acquire it and observe cancellation at checkpoint B.
-	c.unlockMu.Unlock()
-	locked = false
+	hookRelease.trigger()
 	err := <-done
 
 	if !errors.Is(err, context.Canceled) {
@@ -1007,7 +992,7 @@ func TestEnsureUnlocked_ContextCancelled_AfterLock(t *testing.T) {
 	if atomic.LoadInt32(&unlockCalls) != 0 {
 		t.Fatalf("/unlock called %d times, want 0", unlockCalls)
 	}
-	// Only the quick IsLocked should have run; the post-lock re-check must not run because we exit at checkpoint B.
+	// Only the quick IsLocked should run because a waiter never performs owner work.
 	if atomic.LoadInt32(&statusCalls) != 1 {
 		t.Fatalf("/status calls = %d, want 1", statusCalls)
 	}
@@ -1171,7 +1156,7 @@ func TestEnsureUnlocked_RecheckAfterLockAvoidsPrompt(t *testing.T) {
 	c := clientWithPrompter(ts, block, true)
 	makeServeHealthy(c) // Simulate healthy serve
 
-	// Goroutine A will enter the prompt while holding unlockMu.
+	// Goroutine A will enter the prompt as the flight owner.
 	aDone := make(chan error, 1)
 	go func() { aDone <- c.ensureUnlocked(context.Background()) }()
 	<-block.entered
