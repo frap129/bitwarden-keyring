@@ -486,11 +486,10 @@ func assertServiceSource(t *testing.T, source string) {
 		`value.retry == nil or type(value.retry) == "boolean"`, `local terminal = {`,
 		`noctalia.state.set("auth", terminal)`, `local showPanel = owner == nil and validId(pendingId)`,
 		`(action == "submit" and active.confirmOnly == true)`,
-		`if active ~= nil and active.phase == "ready" and bridgeToken ~= nil and bridgeBaseUrl ~= nil then`,
-		`result = "cancelled"`, `function ignoreExitResponse`, `noctalia.http({`, `pcall(noctalia.http, request, ignoreExitResponse)`,
-		`local processingCommand = false`, `local postAction = nil`, `if processingCommand or postAction ~= nil then return end`,
+		`local processingCommand = false`, `local postAction = nil`, `if processingCommand then return end`, `if postAction ~= nil then return end`,
 		`if type(value) ~= "table" then return end`, `local retainedCommand = noctalia.state.get("command")`,
 		`onCommand(retainedCommand)`, `status ~= 202 and status ~= 409 and status ~= 410`,
+		`local commandIdentity = 0`, `commandIdentity = commandIdentity + 1`, `local capturedCommandIdentity = commandIdentity`, `local capturedAction = action`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
@@ -513,6 +512,7 @@ func assertServiceSource(t *testing.T, source string) {
 		"os.execute", "io.popen", "noctalia.exec", "noctalia.spawn", "console.log", "logger", "notify(", "noctalia.http.request",
 		`publish(active.id, active.title, active.prompt, active.confirmOnly, "cancelling"`, `result.error`,
 		`active.phase = postAction == "submit" and "busy" or "cancelling"`,
+		`function ignoreExitResponse`, `pcall(noctalia.http, request, ignoreExitResponse)`,
 		`function(res)
     body`, `function(res)
     token`, `function(res)
@@ -531,6 +531,12 @@ func assertServiceSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)processingCommand = true.*?value\.password = nil.*?noctalia\.state\.set\("command", nil\).*?value = nil.*?processingCommand = false`).MatchString(source) {
 		t.Error("service.luau must guard and single-clear rejected or acknowledged commands")
 	}
+	if !regexp.MustCompile(`(?s)local function clearAcknowledgedCommand\(id, action, identity\).*?local current = noctalia\.state\.get\("command"\).*?if identity ~= commandIdentity or type\(current\) ~= "table" or current\.id ~= id or current\.action ~= action then return end.*?clearCommand\(current\)`).MatchString(source) {
+		t.Error("service.luau acknowledgment must clear only the exact observed command identity")
+	}
+	if !regexp.MustCompile(`(?s)local capturedAction = action.*?clearAcknowledgedCommand\(capturedId, capturedAction, capturedCommandIdentity\)`).MatchString(source) {
+		t.Error("service.luau acknowledgment must use captured ID, action, and monotonic identity")
+	}
 	onExit := regexp.MustCompile(`(?s)function onExit\(\)(.*?)\nend`).FindStringSubmatch(source)
 	if len(onExit) != 2 {
 		t.Error("service.luau must define inspectable onExit")
@@ -540,6 +546,11 @@ func assertServiceSource(t *testing.T, source string) {
 		for _, cleared := range []string{"bridgeToken = nil", "bridgeBaseUrl = nil", "encodedBody = nil", "postAction = nil"} {
 			if !strings.Contains(onExit[1], cleared) {
 				t.Errorf("service.luau onExit does not clear private value %q", cleared)
+			}
+		}
+		for _, forbiddenExit := range []string{"noctalia.http", "noctalia.state.set", "keyring_response", "cancelled", "clearCommand("} {
+			if strings.Contains(onExit[1], forbiddenExit) {
+				t.Errorf("service.luau onExit races retained commands via %q", forbiddenExit)
 			}
 		}
 	}
@@ -944,6 +955,56 @@ type serviceModel struct {
 	phase                      string
 	panelOpen, requestOpen     bool
 	confirmOnly, exitCancel    bool
+	commandID, commandAction   string
+	commandIdentity            int
+	privateSecrets             bool
+}
+
+func (m *serviceModel) exit() {
+	m.generation++
+	m.active = false
+	m.pending = false
+	m.fetching = false
+	m.posting = false
+	m.polling = false
+	m.privateSecrets = false
+}
+
+func (m *serviceModel) acknowledge(id, action string, identity int) {
+	if m.command && m.commandID == id && m.commandAction == action && m.commandIdentity == identity {
+		m.command = false
+		m.commandID = ""
+		m.commandAction = ""
+	}
+}
+
+func TestServiceModelExitRetainsSharedCommandWithoutCancellation(t *testing.T) {
+	for _, posting := range []bool{false, true} {
+		model := serviceModel{
+			generation: 7, active: true, posting: posting, auth: true, command: true,
+			phase: "ready", commandID: requestIDA, commandAction: "submit", commandIdentity: 4,
+			privateSecrets: true,
+		}
+		model.exit()
+		if !model.command || model.commandID != requestIDA || model.commandAction != "submit" || model.commandIdentity != 4 {
+			t.Fatalf("exit posting=%v changed retained command: %#v", posting, model)
+		}
+		if model.privateSecrets || model.active || model.posting || model.generation != 8 || model.exitCancel {
+			t.Fatalf("exit posting=%v private lifecycle = %#v", posting, model)
+		}
+	}
+}
+
+func TestServiceModelAcknowledgmentDoesNotClearReplacementCommand(t *testing.T) {
+	model := serviceModel{command: true, commandID: requestIDA, commandAction: "submit", commandIdentity: 12}
+	model.acknowledge(requestIDA, "submit", 11)
+	if !model.command || model.commandIdentity != 12 {
+		t.Fatalf("old acknowledgment cleared replacement command: %#v", model)
+	}
+	model.acknowledge(requestIDA, "submit", 12)
+	if model.command {
+		t.Fatalf("matching acknowledgment retained command: %#v", model)
+	}
 }
 
 func (m *serviceModel) commandFor(generation int, action string) {

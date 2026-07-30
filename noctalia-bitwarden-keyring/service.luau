@@ -13,6 +13,7 @@ local bridgeBaseUrl = nil
 local encodedBody = nil
 local postAction = nil
 local processingCommand = false
+local commandIdentity = 0
 
 local function validId(value)
   return type(value)=="string" and #value==32 and string.match(value,"^[0-9a-f]+$")~=nil
@@ -189,6 +190,13 @@ local function clearCommand(value)
   processingCommand = false
 end
 
+local function clearAcknowledgedCommand(id, action, identity)
+  local current = noctalia.state.get("command")
+  if identity ~= commandIdentity or type(current) ~= "table" or current.id ~= id or current.action ~= action then return end
+  clearCommand(current)
+  current = nil
+end
+
 local function dropOwnership()
   generation = generation + 1
   active = nil
@@ -205,7 +213,10 @@ end
 
 local function onCommand(value)
   if type(value) ~= "table" then return end
-  if processingCommand or postAction ~= nil then return end
+  if processingCommand then return end
+  commandIdentity = commandIdentity + 1
+  local capturedCommandIdentity = commandIdentity
+  if postAction ~= nil then return end
   local id = value.id
   local action = value.action
   local password = value.password
@@ -249,6 +260,7 @@ local function onCommand(value)
 
   local capturedGeneration = generation
   local capturedId = id
+  local capturedAction = action
   encodedBody = body
   body = nil
   postAction = action
@@ -273,14 +285,12 @@ local function onCommand(value)
       postAction = nil
       return
     end
-    local retainedCommand = noctalia.state.get("command")
-    clearCommand(retainedCommand)
-    retainedCommand = nil
+    clearAcknowledgedCommand(capturedId, capturedAction, capturedCommandIdentity)
     if status == 410 then
       dropOwnership()
-    elseif postAction == "cancel" then
+    elseif capturedAction == "cancel" then
       finish("cancelled", translated("panel.cancelled"))
-    elseif postAction == "confirm" then
+    elseif capturedAction == "confirm" then
       finish("confirmed", translated("panel.success"))
     else
       active.phase = "busy"
@@ -354,29 +364,7 @@ function onIpc(event, payload)
   openRequest(payload)
 end
 
-local function ignoreExitResponse(_res)
-end
-
 function onExit()
-  if active ~= nil and active.phase == "ready" and bridgeToken ~= nil and bridgeBaseUrl ~= nil then
-    local wire = {type = "keyring_response", id = active.id, result = "cancelled"}
-    local encoded, body = pcall(noctalia.json.encode, wire)
-    wire = nil
-    if encoded and type(body) == "string" then
-      local request = {
-        method = "POST",
-        url = bridgeBaseUrl .. "/v1/response",
-        headers = responseHeaders(bridgeToken),
-        body = body,
-      }
-      pcall(noctalia.http, request, ignoreExitResponse)
-      request.body = nil
-      request.headers = nil
-      request.url = nil
-      request = nil
-    end
-    body = nil
-  end
   generation = generation + 1
   active = nil
   pendingId = nil
@@ -387,7 +375,6 @@ function onExit()
   bridgeBaseUrl = nil
   encodedBody = nil
   postAction = nil
-  noctalia.state.set("auth", false)
 end
 
 noctalia.state.set("auth", false)
