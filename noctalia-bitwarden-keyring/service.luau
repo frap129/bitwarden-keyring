@@ -383,8 +383,9 @@ onCommand = function(value)
 end
 
 local function activeDescriptorExists()
-  if active == nil then return true end
-  local descriptor = loadDescriptor(active.id)
+  local id = lifecycle.active_id
+  if id == "" then return true end
+  local descriptor = loadDescriptor(id)
   if descriptor == nil then return false end
   descriptor.token = nil
   descriptor.base_url = nil

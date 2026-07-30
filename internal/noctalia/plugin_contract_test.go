@@ -502,6 +502,9 @@ func assertServiceSource(t *testing.T, source string) {
 	if regexp.MustCompile(`(?s)function onIpc\(event, payload\).*?active ~= nil.*?return`).MatchString(source) {
 		t.Error("service.luau onIpc must enqueue occupied requests instead of returning early")
 	}
+	if !regexp.MustCompile(`(?s)local function activeDescriptorExists\(\)\s+local id = lifecycle\.active_id\s+if id == "" then return true end`).MatchString(source) {
+		t.Error("service.luau update must validate persisted active ownership before any retry, poll, or open logic")
+	}
 	if regexp.MustCompile(`(?s)state\.set\("service_lifecycle",\s*\{[^}]*?(token|url|path|password|body|title|prompt|error)`).MatchString(strings.ToLower(source)) {
 		t.Error("service.luau lifecycle state contains sensitive or presentation data")
 	}
