@@ -242,9 +242,9 @@ function onClose()
 end
 
 function onAuthChanged(value)
-  inputAccepting = false
   if value == false then
     if noctalia.state.get("auth") ~= false then return end
+    inputAccepting = false
     local ownedRequestId = panelRequestId
     clearPassword()
     auth = nil
@@ -259,6 +259,7 @@ function onAuthChanged(value)
     end
     return
   end
+  inputAccepting = false
   local ownedRequestId = panelRequestId
   local nextAuth = sanitizeAuth(value)
   if nextAuth == nil then

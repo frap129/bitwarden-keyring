@@ -303,10 +303,10 @@ func assertPanelSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)local function clearPassword\(\)\s+inputAccepting = false\s+password = ""\s+inputKey = inputKey \+ 1`).MatchString(source) {
 		t.Error("panel.luau must stop accepting input before clearing and incrementing its key")
 	}
-	if !regexp.MustCompile(`(?s)function onAuthChanged\(value\)\s+inputAccepting = false`).MatchString(source) {
-		t.Error("panel.luau auth watch must synchronously stop accepting stale input")
+	if !regexp.MustCompile(`(?s)function onAuthChanged\(value\)\s+if value == false then\s+if noctalia\.state\.get\("auth"\) ~= false then return end\s+inputAccepting = false`).MatchString(source) {
+		t.Error("panel.luau auth watch must reject stale false before mutating input state")
 	}
-	if !regexp.MustCompile(`(?s)if value == false then\s+if noctalia\.state\.get\("auth"\) ~= false then return end.*?clearPassword\(\)\s+auth = nil.*?panelRequestId = nil\s+clearOwnedPanelMarker\(ownedRequestId, panelInstanceId\).*?rerender\(\)\s+if panelOpen then\s+panelOpen = false\s+requestProgrammaticDismiss\(\)\s+end\s+return`).MatchString(source) {
+	if !regexp.MustCompile(`(?s)if value == false then\s+if noctalia\.state\.get\("auth"\) ~= false then return end\s+inputAccepting = false.*?clearPassword\(\)\s+auth = nil.*?panelRequestId = nil\s+clearOwnedPanelMarker\(ownedRequestId, panelInstanceId\).*?rerender\(\)\s+if panelOpen then\s+panelOpen = false\s+requestProgrammaticDismiss\(\)\s+end\s+return`).MatchString(source) {
 		t.Error("panel.luau must authoritatively clear and safely dismiss an owned open panel when auth expires")
 	}
 	if !regexp.MustCompile(`(?s)local nextAuth = sanitizeAuth\(value\).*?if nextAuth == nil then.*?end\s+clearPassword\(\)\s+auth = nextAuth`).MatchString(source) {
@@ -1175,13 +1175,14 @@ func TestPanelReloadLeavesOldMarkerUntilHydration(t *testing.T) {
 }
 
 type panelPresenceModel struct {
-	open                bool
-	commands            int
-	closeCalls          int
-	requestID, instance string
-	authID, phase       string
-	password            string
-	marker              any
+	open, inputAccepting bool
+	commands             int
+	closeCalls           int
+	inputKey             int
+	requestID, instance  string
+	authID, phase        string
+	password             string
+	marker               any
 }
 
 func (m *panelPresenceModel) onOpen(sharedAuthID, sharedPhase string, now int64) {
@@ -1206,7 +1207,9 @@ func (m *panelPresenceModel) authChangedFalse(sharedAuth any) {
 		return
 	}
 	ownedRequestID := m.requestID
+	m.inputAccepting = false
 	m.password = ""
+	m.inputKey++
 	m.authID = ""
 	m.requestID = ""
 	marker, ok := m.marker.(panelMarkerFixture)
@@ -1220,11 +1223,11 @@ func (m *panelPresenceModel) authChangedFalse(sharedAuth any) {
 }
 
 func TestPanelAuthFalseDismissesOwnedOpenPanelWithoutCommand(t *testing.T) {
-	model := panelPresenceModel{open: true, requestID: requestIDA, instance: requestIDB, authID: requestIDA, phase: "busy", password: "secret",
+	model := panelPresenceModel{open: true, inputAccepting: true, inputKey: 8, requestID: requestIDA, instance: requestIDB, authID: requestIDA, phase: "busy", password: "secret",
 		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 30}}
 	model.authChangedFalse(false)
 	model.authChangedFalse(false)
-	if model.open || model.password != "" || model.authID != "" || model.requestID != "" || model.marker != false || model.closeCalls != 1 || model.commands != 0 {
+	if model.open || model.inputAccepting || model.inputKey != 10 || model.password != "" || model.authID != "" || model.requestID != "" || model.marker != false || model.closeCalls != 1 || model.commands != 0 {
 		t.Fatalf("authoritative false lifecycle = %#v", model)
 	}
 }
@@ -1239,9 +1242,9 @@ func TestPanelAuthFalseDoesNotDismissClosedPanel(t *testing.T) {
 
 func TestPanelStaleAuthFalseDoesNotDismissNewRequest(t *testing.T) {
 	marker := panelMarkerFixture{ID: requestIDB, Instance: requestIDC, Heartbeat: 31}
-	model := panelPresenceModel{open: true, requestID: requestIDB, instance: requestIDC, authID: requestIDB, phase: "ready", password: "new", marker: marker}
+	model := panelPresenceModel{open: true, inputAccepting: true, inputKey: 9, requestID: requestIDB, instance: requestIDC, authID: requestIDB, phase: "ready", password: "new", marker: marker}
 	model.authChangedFalse(map[string]any{"id": requestIDB})
-	if model.closeCalls != 0 || model.commands != 0 || model.password != "new" || model.authID != requestIDB || model.requestID != requestIDB || !reflect.DeepEqual(model.marker, marker) {
+	if !model.open || !model.inputAccepting || model.inputKey != 9 || model.closeCalls != 0 || model.commands != 0 || model.password != "new" || model.authID != requestIDB || model.requestID != requestIDB || !reflect.DeepEqual(model.marker, marker) {
 		t.Fatalf("stale false callback changed newer request: %#v", model)
 	}
 }
