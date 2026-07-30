@@ -526,6 +526,12 @@ local function sameLifecycle(left, right)
     fields = fields + 1
   end
   if fields ~= 4 then return false end
+  local queueFields = 0
+  for key, _ in pairs(left.queue) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or key > #right.queue then return false end
+    queueFields = queueFields + 1
+  end
+  if queueFields ~= #right.queue then return false end
   for index, id in ipairs(right.queue) do
     if left.queue[index] ~= id then return false end
   end

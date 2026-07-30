@@ -508,6 +508,22 @@ func assertServiceSource(t *testing.T, source string) {
 	if regexp.MustCompile(`(?s)state\.set\("service_lifecycle",\s*\{[^}]*?(token|url|path|password|body|title|prompt|error)`).MatchString(strings.ToLower(source)) {
 		t.Error("service.luau lifecycle state contains sensitive or presentation data")
 	}
+	snapshotMatch := regexp.MustCompile(`local snapshot = \{([^}]*)\}`).FindStringSubmatch(source)
+	if len(snapshotMatch) != 2 {
+		t.Error("service.luau must define an inspectable lifecycle snapshot initializer")
+	} else {
+		keys := regexp.MustCompile(`([a-z_]+)\s*=`).FindAllStringSubmatch(snapshotMatch[1], -1)
+		got := make([]string, 0, len(keys))
+		for _, key := range keys {
+			got = append(got, key[1])
+		}
+		if want := []string{"version", "active_id", "phase", "queue"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("service.luau lifecycle snapshot keys = %#v, want exact %#v", got, want)
+		}
+	}
+	if !regexp.MustCompile(`(?s)for key, _ in pairs\(left\.queue\) do.*?type\(key\) ~= "number".*?key < 1.*?key % 1 ~= 0.*?key > #right\.queue`).MatchString(source) {
+		t.Error("service.luau must reject non-array, sparse, and noninteger lifecycle queue keys")
+	}
 	startupLifecycle := strings.Index(source, `noctalia.state.get("service_lifecycle")`)
 	if startupLifecycle < 0 || strings.Contains(source[startupLifecycle:], `registerCommandWatcher()`) {
 		t.Error("service.luau must sanitize and restore lifecycle before registering the command watcher")
@@ -868,6 +884,43 @@ type startupRecoveryModel struct {
 	authPhase                 string
 	commandCleared, authClear bool
 	recovering                bool
+}
+
+func sameLifecycleQueueModel(left map[any]string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key := range left {
+		index, ok := key.(int)
+		if !ok || index < 1 || index > len(right) {
+			return false
+		}
+	}
+	for index, id := range right {
+		if left[index+1] != id {
+			return false
+		}
+	}
+	return true
+}
+
+func TestServiceLifecycleMalformedQueueIsNeverCanonical(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		queue map[any]string
+	}{
+		{name: "secret string key", queue: map[any]string{1: requestIDB, "token": "secret"}},
+		{name: "sparse key", queue: map[any]string{1: requestIDB, 3: requestIDC}},
+		{name: "zero key", queue: map[any]string{0: requestIDC, 1: requestIDB}},
+		{name: "negative key", queue: map[any]string{-1: requestIDC, 1: requestIDB}},
+		{name: "fractional key", queue: map[any]string{1: requestIDB, 1.5: requestIDC}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if sameLifecycleQueueModel(test.queue, []string{requestIDB}) {
+				t.Fatalf("malformed queue accepted as canonical: %#v", test.queue)
+			}
+		})
+	}
 }
 
 func (m *startupRecoveryModel) begin() {
