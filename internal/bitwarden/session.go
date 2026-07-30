@@ -363,16 +363,7 @@ func getPromptOrder(cfg SessionConfig) []promptMethod {
 // If errMsg is non-empty, it's displayed as part of the prompt (for retry feedback).
 // It tries various GUI methods, falling back through the chain in order of security.
 // Returns the password, an optional ResultNotifier for two-phase communication, and an error.
-func (sm *SessionManager) PromptForPassword(ctx context.Context, errMsg string) (password string, notifier ResultNotifier, resultErr error) {
-	sm.noctaliaMu.Lock()
-	ownedNoctaliaSession := sm.noctaliaSession
-	sm.noctaliaMu.Unlock()
-	defer func() {
-		if ctx.Err() != nil && ownedNoctaliaSession != nil {
-			_ = ownedNoctaliaSession.Close()
-			sm.clearNoctaliaSession(ownedNoctaliaSession)
-		}
-	}()
+func (sm *SessionManager) PromptForPassword(ctx context.Context, errMsg string) (string, ResultNotifier, error) {
 	// Build minimal config from session manager fields
 	cfg := SessionConfig{
 		NoctaliaEnabled:      sm.noctaliaEnabled,

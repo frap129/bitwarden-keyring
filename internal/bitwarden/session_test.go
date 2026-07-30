@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -587,6 +588,8 @@ func TestNoctaliaTimeoutRetryUsesConfiguredTimeout(t *testing.T) {
 
 func TestPromptForPassword_CancellationAfterRetryClosesNoctaliaSession(t *testing.T) {
 	runtimeDir := setNoctaliaTestRuntime(t)
+	testCtx, testCancel := context.WithTimeout(context.Background(), time.Second)
+	defer testCancel()
 	descriptors := make(chan noctaliaTestDescriptor, 1)
 	helperErr := make(chan error, 1)
 	var commandCalls int
@@ -604,26 +607,24 @@ func TestPromptForPassword_CancellationAfterRetryClosesNoctaliaSession(t *testin
 	if err != nil || password != "password" {
 		t.Fatalf("PromptForPassword() = %q, %v, want password", password, err)
 	}
-	descriptor := <-descriptors
+	descriptor := waitForSessionSignal(t, testCtx, descriptors, "Noctalia descriptor")
 	notify(false, "invalid password", true)
-	if err := <-helperErr; err != nil {
+	if err := waitForSessionSignal(t, testCtx, helperErr, "retry result consumption"); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	waiting := make(chan struct{})
+	waitCtx := &doneSignalContext{Context: ctx, doneCalled: waiting}
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := sm.PromptForPassword(ctx, "invalid password")
+		_, _, err := sm.PromptForPassword(waitCtx, "invalid password")
 		done <- err
 	}()
+	waitForSessionSignal(t, testCtx, waiting, "WaitForRetry entry")
 	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("retry prompt error = %v, want context.Canceled", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("retry prompt did not return promptly")
+	if err := waitForSessionSignal(t, testCtx, done, "cancelled retry prompt"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("retry prompt error = %v, want context.Canceled", err)
 	}
 	if commandCalls != 1 {
 		t.Fatalf("Noctalia command calls = %d, want 1", commandCalls)
@@ -643,6 +644,123 @@ func TestPromptForPassword_CancellationAfterRetryClosesNoctaliaSession(t *testin
 	if response, err := doNoctaliaTestRequest(requestCtx, &http.Client{}, descriptor, http.MethodPost, "/v1/response", body); err == nil {
 		response.Body.Close()
 		t.Fatalf("response accepted after cancellation with status %d", response.StatusCode)
+	}
+}
+
+func TestPromptForPassword_CancelledCallerDoesNotCloseRetryOwnerSession(t *testing.T) {
+	runtimeDir := setNoctaliaTestRuntime(t)
+	testCtx, testCancel := context.WithTimeout(context.Background(), time.Second)
+	defer testCancel()
+	descriptors := make(chan noctaliaTestDescriptor, 1)
+	helperErr := make(chan error, 1)
+	runner := func(_ context.Context, _ string, args ...string) error {
+		cookie := args[len(args)-1]
+		go func() {
+			helperErr <- serveNoctaliaPasswordAndResultWithDescriptor(runtimeDir, cookie, nil, descriptors)
+		}()
+		return nil
+	}
+	sm := newSessionManagerWithNoctaliaClient(SessionConfig{NoctaliaEnabled: true}, noctalia.NewClient(noctalia.WithCommandRunner(runner)))
+
+	_, notify, err := sm.PromptForPassword(testCtx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := waitForSessionSignal(t, testCtx, descriptors, "owner descriptor")
+	notify(false, "invalid password", true)
+	if err := waitForSessionSignal(t, testCtx, helperErr, "owner retry result consumption"); err != nil {
+		t.Fatal(err)
+	}
+	sm.noctaliaMu.Lock()
+	ownerSession := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := sm.PromptForPassword(cancelledCtx, "invalid password"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled caller error = %v, want context.Canceled", err)
+	}
+	sm.noctaliaMu.Lock()
+	retainedSession := sm.noctaliaSession
+	sm.noctaliaMu.Unlock()
+	if retainedSession != ownerSession {
+		t.Fatal("cancelled caller changed retry owner's session")
+	}
+	if _, err := os.Stat(descriptor.Path); err != nil {
+		t.Fatalf("owner descriptor after unrelated cancellation: %v", err)
+	}
+
+	waiting := make(chan struct{})
+	ownerCtx := &doneSignalContext{Context: testCtx, doneCalled: waiting}
+	retryDone := make(chan struct {
+		password string
+		notify   ResultNotifier
+		err      error
+	}, 1)
+	go func() {
+		password, retryNotify, err := sm.PromptForPassword(ownerCtx, "invalid password")
+		retryDone <- struct {
+			password string
+			notify   ResultNotifier
+			err      error
+		}{password, retryNotify, err}
+	}()
+	waitForSessionSignal(t, testCtx, waiting, "owner WaitForRetry entry")
+	body := fmt.Sprintf(`{"type":"keyring_response","id":%q,"result":"ok","password":"replacement"}`, descriptor.RequestID)
+	response, err := doNoctaliaTestRequest(testCtx, &http.Client{}, descriptor, http.MethodPost, "/v1/response", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	retry := waitForSessionSignal(t, testCtx, retryDone, "owner retry password")
+	if retry.err != nil || retry.password != "replacement" {
+		t.Fatalf("owner retry = %q, %v, want replacement", retry.password, retry.err)
+	}
+	terminalResult := make(chan error, 1)
+	go func() {
+		terminalResult <- consumeNoctaliaResult(testCtx, descriptor)
+	}()
+	retry.notify(false, "done", false)
+	if err := waitForSessionSignal(t, testCtx, terminalResult, "owner terminal result consumption"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(descriptor.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owner descriptor after terminal cleanup = %v, want not exists", err)
+	}
+}
+
+func consumeNoctaliaResult(ctx context.Context, descriptor noctaliaTestDescriptor) error {
+	client := &http.Client{Timeout: time.Second}
+	return pollNoctalia(ctx, func() (bool, error) {
+		response, err := doNoctaliaTestRequest(ctx, client, descriptor, http.MethodGet, "/v1/result?id="+descriptor.RequestID, "")
+		if err != nil {
+			return false, err
+		}
+		defer response.Body.Close()
+		return response.StatusCode != http.StatusNoContent, nil
+	})
+}
+
+type doneSignalContext struct {
+	context.Context
+	doneCalled chan struct{}
+	once       sync.Once
+}
+
+func (c *doneSignalContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.doneCalled) })
+	return c.Context.Done()
+}
+
+func waitForSessionSignal[T any](t *testing.T, ctx context.Context, signal <-chan T, name string) T {
+	t.Helper()
+	select {
+	case value := <-signal:
+		return value
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", name, ctx.Err())
+		var zero T
+		return zero
 	}
 }
 

@@ -2015,6 +2015,7 @@ type retryCancellationPrompter struct {
 	retryResults  atomic.Int32
 	terminalCalls atomic.Int32
 	retryReady    chan struct{}
+	retryWaiting  chan struct{}
 }
 
 func (p *retryCancellationPrompter) PromptForPassword(ctx context.Context, _ string) (string, ResultNotifier, error) {
@@ -2028,6 +2029,7 @@ func (p *retryCancellationPrompter) PromptForPassword(ctx context.Context, _ str
 			p.terminalCalls.Add(1)
 		}, nil
 	}
+	close(p.retryWaiting)
 	<-ctx.Done()
 	return "", nil, ctx.Err()
 }
@@ -2045,14 +2047,17 @@ func TestEnsureUnlocked_OwnerCancellationAfterRetryTerminatesPrompt(t *testing.T
 	}))
 	t.Cleanup(ts.Close)
 
-	prompter := &retryCancellationPrompter{retryReady: make(chan struct{})}
+	prompter := &retryCancellationPrompter{retryReady: make(chan struct{}), retryWaiting: make(chan struct{})}
 	c := clientWithPrompter(ts, prompter, true)
 	c.session.maxPasswordRetries = 3
 	makeServeHealthy(c)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- c.ensureUnlocked(ctx) }()
-	waitForTestSignal(t, context.Background(), prompter.retryReady, "retry publication")
+	testCtx, testCancel := context.WithTimeout(context.Background(), time.Second)
+	defer testCancel()
+	waitForTestSignal(t, testCtx, prompter.retryReady, "retry publication")
+	waitForTestSignal(t, testCtx, prompter.retryWaiting, "retry wait")
 	cancel()
 
 	resultCtx, resultCancel := context.WithTimeout(context.Background(), time.Second)
