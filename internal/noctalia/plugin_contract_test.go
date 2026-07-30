@@ -254,14 +254,16 @@ func assertTranslationReferences(t *testing.T, source string, contents []byte) {
 func assertPanelSource(t *testing.T, source string) {
 	t.Helper()
 	for _, required := range []string{
-		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local inputAccepting`, `local suppressCloseCancel`,
+		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local inputAccepting`,
+		`local panelOpen = false`, `local panelRequestId = nil`, `local panelInstanceId = newInstanceId()`,
 		`function render()`, `ui.label({ text = title })`, `ui.label({ text = prompt })`, `ui.input({`,
 		`ui.glyph({ name = "lock" })`, `ui.image({ path = "assets/bitwarden.svg", width = 48, height = 48, fit = "contain" })`, `ui.column({ gap = 12 }, children)`,
 		`noctalia.getConfig("show_bitwarden_icon")`,
 		`key = "password-" .. inputKey`, `value = ""`, `password = true`, `focus = true`, `enabled = auth.phase == "ready"`,
 		`local capturedInputKey = inputKey`, `local capturedId = auth.id`, `onChange = function(value)`, `onSubmit = function()`,
 		`handlePasswordChange(value, capturedInputKey, capturedId)`, `handleUnlock(capturedInputKey, capturedId)`, `panel.render(render())`,
-		`function onOpen()`, `function onClose()`, `panel.close()`, `noctalia.state.set("panel_open", true)`, `noctalia.state.set("panel_open", false)`,
+		`function onOpen()`, `function update()`, `function onClose()`, `panel.close()`, `noctalia.setUpdateInterval(1000)`,
+		`id = panelRequestId`, `instance = panelInstanceId`, `heartbeat = os.time()`,
 		`value.id`, `value.title`, `value.prompt`, `value.confirm_only`, `value.phase`, `value.error`,
 		`action = "submit"`, `action = "cancel"`, `action = "confirm"`,
 		`submitted = nil`, `password = ""`, `inputKey = inputKey + 1`,
@@ -285,7 +287,7 @@ func assertPanelSource(t *testing.T, source string) {
 		t.Error("panel.luau terminal failure is not dismissible with a named callback")
 	}
 	for _, forbidden := range []string{
-		"frameTick", "onFrame", "setUpdateInterval", "setTimeout", "setInterval", "animation", "timer", "geometry",
+		"frameTick", "onFrame", "setTimeout", "setInterval", "animation", "timer", "geometry",
 		"pluginSettings", "openPanel", "closePanel", "saveSettings",
 		"pluginApi", "SocketServer", "Quickshell", "runAsync", "runStream", "print(",
 		"ui.text(", "ui.textInput(", "source =", "children = children",
@@ -331,8 +333,21 @@ func assertPanelSource(t *testing.T, source string) {
 			}
 		}
 	}
-	if !regexp.MustCompile(`(?s)function onClose\(\).*?if not suppressCloseCancel and auth ~= nil and auth\.phase == "ready" then\s+auth\.phase = "cancelling"\s+clearPassword\(\)\s+noctalia\.state\.set\("command", \{ action = "cancel", id = auth\.id \}\)`).MatchString(source) {
-		t.Error("panel.luau close must transition ready auth before publishing one cancellation")
+	if !regexp.MustCompile(`(?s)function onClose\(\)\s+local closingRequestId = panelRequestId\s+local closingInstanceId = panelInstanceId.*?clearOwnedPanelMarker\(closingRequestId, closingInstanceId\)`).MatchString(source) {
+		t.Error("panel.luau close must clear only its immutable ID and instance marker")
+	}
+	if !regexp.MustCompile(`(?s)local function newInstanceId\(\).*?for index = 1, 32 do.*?string\.format\("%x", math\.random\(0, 15\)\)`).MatchString(source) {
+		t.Error("panel.luau must create a fresh random 32-lowercase-hex instance ID")
+	}
+	if !strings.Contains(source, `local function clearOwnedPanelMarker(requestId, instanceId)`) || strings.Count(source, `clearOwnedPanelMarker(`) < 3 {
+		t.Error("panel.luau must ownership-guard close and auth marker clearing")
+	}
+	if !strings.Contains(source, `local function refreshOwnedPanelMarker(requestId, instanceId)`) || strings.Count(source, `refreshOwnedPanelMarker(`) < 3 {
+		t.Error("panel.luau must ownership-guard heartbeat and auth marker updates")
+	}
+	closeCallback := regexp.MustCompile(`(?s)function onClose\(\)(.*?)\nend`).FindStringSubmatch(source)
+	if len(closeCallback) != 2 || strings.Contains(closeCallback[1], `state.set("command"`) || strings.Contains(closeCallback[1], `action = "cancel"`) {
+		t.Error("panel.luau onClose must never publish cancellation")
 	}
 	if strings.Count(source, `capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id`) != 2 {
 		t.Error("panel.luau must generation- and ID-guard both input callbacks")
@@ -363,12 +378,8 @@ func (m *panelCallbackModel) authUpdate() {
 }
 
 func (m *panelCallbackModel) close() {
-	if !m.suppressed && m.authComplete && m.phase == "ready" {
-		m.phase = "cancelling"
-		m.password = ""
-		m.inputKey++
-		m.commands++
-	}
+	m.password = ""
+	m.inputKey++
 	m.suppressed = false
 }
 
@@ -388,11 +399,11 @@ func TestPanelModelSameAuthUpdateClearsAndIncrements(t *testing.T) {
 	}
 }
 
-func TestPanelModelRepeatedCloseCancelsOnce(t *testing.T) {
+func TestPanelModelRepeatedCloseNeverCancels(t *testing.T) {
 	model := panelCallbackModel{authComplete: true, inputKey: 2, phase: "ready", password: "secret"}
 	model.close()
 	model.close()
-	if model.commands != 1 || model.phase != "cancelling" || model.password != "" || model.inputKey != 3 {
+	if model.commands != 0 || model.phase != "ready" || model.password != "" || model.inputKey != 4 {
 		t.Fatalf("repeated close lifecycle = %#v", model)
 	}
 }
@@ -494,6 +505,7 @@ func assertServiceSource(t *testing.T, source string) {
 		`local function persistLifecycle()`, `noctalia.state.set("service_lifecycle", snapshot)`,
 		`local function enqueueRequest(id)`, `startNextRequest = function()`, `local function terminalFinish(`,
 		`enqueueRequest(payload)`, `startNextRequest()`, `noctalia.state.get("service_lifecycle")`,
+		`local panelOpeningFor = nil`, `local panelOpeningAt = 0`, `heartbeat >= now - 3`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
@@ -762,7 +774,7 @@ type panelMarkerFixture struct {
 
 func shouldOpenPanel(activeID string, marker any, now int64) bool {
 	presence, ok := marker.(panelMarkerFixture)
-	return !ok || presence.ID != activeID || presence.Instance == "" || presence.Heartbeat < now-3000
+	return !ok || presence.ID != activeID || !validRequestID(presence.Instance) || presence.Heartbeat < now-3
 }
 
 func TestServiceLifecycleQueuesEveryOccupiedPhaseFIFO(t *testing.T) {
@@ -1118,9 +1130,9 @@ func TestPanelPresenceMatchesOnlyCurrentRequest(t *testing.T) {
 	}{
 		{name: "false", marker: false, open: true},
 		{name: "malformed", marker: map[string]any{"id": requestIDA}, open: true},
-		{name: "mismatched", marker: panelMarkerFixture{ID: requestIDB, Instance: "panel-1", Heartbeat: now}, open: true},
-		{name: "stale", marker: panelMarkerFixture{ID: requestIDA, Instance: "panel-1", Heartbeat: now - 3001}, open: true},
-		{name: "matching fresh", marker: panelMarkerFixture{ID: requestIDA, Instance: "panel-1", Heartbeat: now - 3000}},
+		{name: "mismatched", marker: panelMarkerFixture{ID: requestIDB, Instance: requestIDC, Heartbeat: now}, open: true},
+		{name: "stale", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: now - 4}, open: true},
+		{name: "matching fresh", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: now - 3}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := shouldOpenPanel(requestIDA, test.marker, now); got != test.open {
@@ -1130,15 +1142,93 @@ func TestPanelPresenceMatchesOnlyCurrentRequest(t *testing.T) {
 	}
 }
 
-func TestPanelReloadClearsItsOwnStalePresenceMarker(t *testing.T) {
+func TestPanelReloadLeavesOldMarkerUntilHydration(t *testing.T) {
 	now := int64(20_000)
-	marker := any(panelMarkerFixture{ID: requestIDA, Instance: "reloading-panel", Heartbeat: now})
-	if shouldOpenPanel(requestIDA, marker, now) {
-		t.Fatal("fresh owned marker requested a duplicate panel")
-	}
-	marker = false
+	marker := any(panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: now - 4})
 	if !shouldOpenPanel(requestIDA, marker, now) {
-		t.Fatal("cleared reload marker prevented panel reopening")
+		t.Fatal("stale marker from old panel VM prevented reopening")
+	}
+	marker = panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: now}
+	if shouldOpenPanel(requestIDA, marker, now) {
+		t.Fatal("hydrated replacement marker requested a duplicate panel")
+	}
+}
+
+type panelPresenceModel struct {
+	open, command       bool
+	requestID, instance string
+	marker              any
+}
+
+func (m *panelPresenceModel) close(capturedID, capturedInstance string) {
+	m.open = false
+	m.requestID = ""
+	marker, ok := m.marker.(panelMarkerFixture)
+	if ok && marker.ID == capturedID && marker.Instance == capturedInstance {
+		m.marker = false
+	}
+}
+
+func TestPanelCloseClearsExactOwnedMarkerWithoutCancellation(t *testing.T) {
+	model := panelPresenceModel{open: true, requestID: requestIDA, instance: requestIDB,
+		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 10}}
+	model.close(requestIDA, requestIDB)
+	if model.marker != false || model.command || model.open || model.requestID != "" {
+		t.Fatalf("owned close lifecycle = %#v", model)
+	}
+}
+
+func TestPanelOldCloseCallbackCannotClearReplacementMarker(t *testing.T) {
+	want := panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: 11}
+	model := panelPresenceModel{open: true, requestID: requestIDA, instance: requestIDC, marker: want}
+	model.close(requestIDA, requestIDB)
+	if !reflect.DeepEqual(model.marker, want) || model.command {
+		t.Fatalf("old close callback changed replacement ownership: %#v", model)
+	}
+}
+
+type servicePanelOpeningModel struct {
+	activeID   string
+	marker     any
+	openingFor string
+	openingAt  int64
+	toggles    int
+}
+
+func (m *servicePanelOpeningModel) requestOpen(now int64) {
+	if !shouldOpenPanel(m.activeID, m.marker, now) {
+		m.openingFor = ""
+		m.openingAt = 0
+		return
+	}
+	if m.openingFor == m.activeID && now-m.openingAt < 1 {
+		return
+	}
+	m.openingFor = m.activeID
+	m.openingAt = now
+	m.toggles++
+}
+
+func TestServiceModelBusyCloseReopensAtMostOncePerSecond(t *testing.T) {
+	model := servicePanelOpeningModel{activeID: requestIDA, marker: false}
+	model.requestOpen(10)
+	model.requestOpen(10)
+	if model.toggles != 1 {
+		t.Fatalf("same-second closed-panel toggles = %d, want 1", model.toggles)
+	}
+	model.requestOpen(11)
+	if model.toggles != 2 {
+		t.Fatalf("nonterminal closed panel was not retried: %#v", model)
+	}
+}
+
+func TestServiceModelFreshMarkerPreventsVisiblePanelToggleClosed(t *testing.T) {
+	model := servicePanelOpeningModel{activeID: requestIDA, openingFor: requestIDA, openingAt: 10,
+		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 11}}
+	model.requestOpen(11)
+	model.requestOpen(12)
+	if model.toggles != 0 || model.openingFor != "" {
+		t.Fatalf("fresh visible panel toggled or retained guard: %#v", model)
 	}
 }
 

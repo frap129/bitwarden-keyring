@@ -16,6 +16,8 @@ local processingCommand = false
 local commandIdentity = 0
 local watcherRegistered = false
 local startupRecovering = true
+local panelOpeningFor = nil
+local panelOpeningAt = 0
 local lifecycle = {version = 1, active_id = "", phase = "", queue = {}}
 
 local function validId(value)
@@ -69,10 +71,30 @@ local function publish(id, title, prompt, confirmOnly, phase, errorText)
   })
 end
 
+local function freshPanelMarker(id, now)
+  local marker = noctalia.state.get("panel_open")
+  return type(marker) == "table" and marker.id == id and validId(marker.instance)
+    and type(marker.heartbeat) == "number" and marker.heartbeat >= now - 3
+end
+
+local function clearPanelOpening()
+  panelOpeningFor = nil
+  panelOpeningAt = 0
+end
+
 local function requestPanelOpen()
-  if noctalia.state.get("panel_open") ~= true then
-    noctalia.togglePanel(PANEL_ID)
+  local id = lifecycle.active_id
+  if not validId(id) then return end
+  local now = os.time()
+  if freshPanelMarker(id, now) then
+    clearPanelOpening()
+    return
   end
+  local openingNow = os.clock()
+  if panelOpeningFor == id and openingNow - panelOpeningAt < 1 then return end
+  panelOpeningFor = id
+  panelOpeningAt = openingNow
+  noctalia.togglePanel(PANEL_ID)
 end
 
 local function requestHeaders(token)
@@ -176,6 +198,7 @@ local function terminalFinish(phase, errorText)
   local showPanel = owner == nil and validId(pendingId)
   local terminal = {id = id, title = title, prompt = prompt, confirm_only = confirmOnly, phase = phase, error = errorText}
   noctalia.state.set("auth", terminal)
+  clearPanelOpening()
   invalidatePrivate()
   lifecycle.active_id = ""
   lifecycle.phase = ""
@@ -434,6 +457,7 @@ function update()
     startNextRequest()
     return
   end
+  requestPanelOpen()
   if fetching or posting or polling then return end
   if not validId(active.id) then
     bridgeFailure()
@@ -445,9 +469,6 @@ function update()
       onCommand(retainedCommand)
     end
     retainedCommand = nil
-    if noctalia.state.get("panel_open") ~= true then
-      requestPanelOpen()
-    end
     return
   end
   clearMatchingCommand(active.id)
@@ -515,6 +536,7 @@ function onExit()
   bridgeBaseUrl = nil
   encodedBody = nil
   postAction = nil
+  clearPanelOpening()
 end
 
 local function sameLifecycle(left, right)

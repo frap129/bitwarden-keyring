@@ -4,9 +4,20 @@ local auth = nil
 local password = ""
 local inputKey = 0
 local inputAccepting = false
-local suppressCloseCancel = false
 local handlePasswordChange
 local handleUnlock
+
+local function newInstanceId()
+  local characters = {}
+  for index = 1, 32 do
+    characters[index] = string.format("%x", math.random(0, 15))
+  end
+  return table.concat(characters)
+end
+
+local panelOpen = false
+local panelRequestId = nil
+local panelInstanceId = newInstanceId()
 
 local function clearPassword()
   inputAccepting = false
@@ -50,8 +61,32 @@ local function terminalPhase(phase)
 end
 
 local function requestProgrammaticDismiss()
-  suppressCloseCancel = true
   panel.close()
+end
+
+local function writePanelMarker()
+  if not panelOpen or panelRequestId == nil then return end
+  noctalia.state.set("panel_open", {
+    id = panelRequestId,
+    instance = panelInstanceId,
+    heartbeat = os.time(),
+  })
+end
+
+local function refreshOwnedPanelMarker(requestId, instanceId)
+  local current = noctalia.state.get("panel_open")
+  if type(current) == "table" and current.id == requestId and current.instance == instanceId then
+    writePanelMarker()
+  end
+  current = nil
+end
+
+local function clearOwnedPanelMarker(requestId, instanceId)
+  local current = noctalia.state.get("panel_open")
+  if type(current) == "table" and current.id == requestId and current.instance == instanceId then
+    noctalia.state.set("panel_open", false)
+  end
+  current = nil
 end
 
 function render()
@@ -183,42 +218,60 @@ function onInvalidDismiss()
 end
 
 function onOpen()
-  suppressCloseCancel = false
-  noctalia.state.set("panel_open", true)
   clearPassword()
   auth = sanitizeAuth(noctalia.state.get("auth"))
+  panelOpen = true
+  panelRequestId = auth ~= nil and auth.id or nil
+  if panelRequestId ~= nil then
+    writePanelMarker()
+  end
   rerender()
 end
 
+function update()
+  refreshOwnedPanelMarker(panelRequestId, panelInstanceId)
+end
+
 function onClose()
-  noctalia.state.set("panel_open", false)
-  if not suppressCloseCancel and auth ~= nil and auth.phase == "ready" then
-    auth.phase = "cancelling"
-    clearPassword()
-    noctalia.state.set("command", { action = "cancel", id = auth.id })
-  else
-    clearPassword()
-  end
-  suppressCloseCancel = false
+  local closingRequestId = panelRequestId
+  local closingInstanceId = panelInstanceId
+  panelOpen = false
+  panelRequestId = nil
+  clearPassword()
+  clearOwnedPanelMarker(closingRequestId, closingInstanceId)
 end
 
 function onAuthChanged(value)
   inputAccepting = false
   if value == false then
+    local ownedRequestId = panelRequestId
     clearPassword()
     auth = nil
+    if panelOpen then
+      panelRequestId = nil
+      clearOwnedPanelMarker(ownedRequestId, panelInstanceId)
+    end
     rerender()
     return
   end
+  local ownedRequestId = panelRequestId
   local nextAuth = sanitizeAuth(value)
   if nextAuth == nil then
     clearPassword()
     auth = nil
+    if panelOpen then
+      panelRequestId = nil
+      clearOwnedPanelMarker(ownedRequestId, panelInstanceId)
+    end
     rerender()
     return
   end
   clearPassword()
   auth = nextAuth
+  if panelOpen then
+    panelRequestId = auth.id
+    refreshOwnedPanelMarker(ownedRequestId, panelInstanceId)
+  end
   rerender()
   if auth.phase == "cancelled" then
     if noctalia.getConfig("auto_close_on_cancel") == true then requestProgrammaticDismiss() end
@@ -228,3 +281,4 @@ function onAuthChanged(value)
 end
 
 noctalia.state.watch("auth", onAuthChanged)
+noctalia.setUpdateInterval(1000)
