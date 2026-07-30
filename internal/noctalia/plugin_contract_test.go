@@ -634,7 +634,7 @@ func (m *serviceLifecycleModel) responseAttempt(started, transportOK bool, statu
 	switch status {
 	case 202, 409:
 		m.pendingCommand = ""
-		m.outcome = "accepted"
+		m.outcome = "cancelled"
 		return "accepted"
 	case 410:
 		m.pendingCommand = ""
@@ -800,8 +800,8 @@ func TestServiceCancellationTreatsConflictAsAcknowledged(t *testing.T) {
 		if got := model.responseAttempt(true, true, status); got != "accepted" {
 			t.Fatalf("status %d outcome = %q, want accepted", status, got)
 		}
-		if model.pendingCommand != "" || model.outcome != "accepted" {
-			t.Fatalf("status %d cancellation state = %#v, want completed command", status, model)
+		if model.pendingCommand != "" || model.outcome != "cancelled" {
+			t.Fatalf("status %d cancellation state = %#v, want cancelled outcome and completed command", status, model)
 		}
 	}
 }
