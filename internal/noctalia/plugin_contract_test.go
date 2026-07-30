@@ -490,10 +490,25 @@ func assertServiceSource(t *testing.T, source string) {
 		`if type(value) ~= "table" then return end`, `local retainedCommand = noctalia.state.get("command")`,
 		`onCommand(retainedCommand)`, `status ~= 202 and status ~= 409 and status ~= 410`,
 		`local commandIdentity = 0`, `commandIdentity = commandIdentity + 1`, `local capturedCommandIdentity = commandIdentity`, `local capturedAction = action`,
+		`local lifecycle = {version = 1, active_id = "", phase = "", queue = {}}`,
+		`local function persistLifecycle()`, `noctalia.state.set("service_lifecycle", snapshot)`,
+		`local function enqueueRequest(id)`, `startNextRequest = function()`, `local function terminalFinish(`,
+		`enqueueRequest(payload)`, `startNextRequest()`, `noctalia.state.get("service_lifecycle")`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
 		}
+	}
+	if regexp.MustCompile(`(?s)function onIpc\(event, payload\).*?active ~= nil.*?return`).MatchString(source) {
+		t.Error("service.luau onIpc must enqueue occupied requests instead of returning early")
+	}
+	if regexp.MustCompile(`(?s)state\.set\("service_lifecycle",\s*\{[^}]*?(token|url|path|password|body|title|prompt|error)`).MatchString(strings.ToLower(source)) {
+		t.Error("service.luau lifecycle state contains sensitive or presentation data")
+	}
+	startupLifecycle := strings.Index(source, `noctalia.state.get("service_lifecycle")`)
+	startupWatch := strings.LastIndex(source, `registerCommandWatcher()`)
+	if startupLifecycle < 0 || startupWatch < 0 || startupLifecycle > startupWatch {
+		t.Error("service.luau must sanitize and restore lifecycle before registering the command watcher")
 	}
 	if strings.Count(source, `capturedGeneration ~= generation`) < 3 {
 		t.Error("service.luau must generation-guard every HTTP callback")
@@ -501,8 +516,9 @@ func assertServiceSource(t *testing.T, source string) {
 	if strings.Count(source, `capturedId ~=`) < 3 {
 		t.Error("service.luau must ID-guard every HTTP callback")
 	}
-	publishTerminal := strings.Index(source, `noctalia.state.set("auth", terminal)`)
-	invalidateTerminal := strings.Index(source, "generation = generation + 1")
+	terminalFunction := regexp.MustCompile(`(?s)local function terminalFinish\(.*?\nend`).FindString(source)
+	publishTerminal := strings.Index(terminalFunction, `noctalia.state.set("auth", terminal)`)
+	invalidateTerminal := strings.Index(terminalFunction, "invalidatePrivate()")
 	if publishTerminal < 0 || invalidateTerminal < 0 || publishTerminal > invalidateTerminal {
 		t.Error("service.luau must publish terminal auth before invalidating callbacks")
 	}
@@ -522,7 +538,7 @@ func assertServiceSource(t *testing.T, source string) {
 			t.Errorf("service.luau contains forbidden literal %q", forbidden)
 		}
 	}
-	if regexp.MustCompile(`(?s)function onCommand\(value\)\s+if type\(value\) ~= "table" then return end`).FindString(source) == "" {
+	if regexp.MustCompile(`(?s)onCommand = function\(value\)\s+if type\(value\) ~= "table" then return end`).FindString(source) == "" {
 		t.Error("service.luau command watcher must immediately ignore non-table values")
 	}
 	if regexp.MustCompile(`(?s)if type\(value\) ~= "table" then\s+noctalia\.state\.set\("command", nil\)`).MatchString(source) {
@@ -603,18 +619,18 @@ const (
 )
 
 type serviceLifecycleFixture struct {
-	Version   int
-	ActiveID  string
-	Phase     string
-	Queue     []string
-	Operation string
-	StaleIDs  map[string]bool
+	Version  int
+	ActiveID string
+	Phase    string
+	Queue    []string
 }
 
 type serviceLifecycleModel struct {
 	state          serviceLifecycleFixture
 	outcome        string
 	pendingCommand string
+	operation      string
+	staleIDs       map[string]bool
 }
 
 func validRequestID(id string) bool {
@@ -637,16 +653,14 @@ func (m *serviceLifecycleModel) startNext() string {
 	m.state.Version = 1
 	m.state.ActiveID = ""
 	m.state.Phase = ""
-	m.state.Operation = "idle"
 	for len(m.state.Queue) > 0 {
 		id := m.state.Queue[0]
 		m.state.Queue = m.state.Queue[1:]
-		if !validRequestID(id) || m.state.StaleIDs[id] {
+		if !validRequestID(id) || m.staleIDs[id] {
 			continue
 		}
 		m.state.ActiveID = id
 		m.state.Phase = "fetching"
-		m.state.Operation = "fetching"
 		return id
 	}
 	return ""
@@ -661,15 +675,13 @@ func (m *serviceLifecycleModel) restore() string {
 	queue := m.state.Queue
 	m.state.Queue = nil
 	for _, id := range queue {
-		if id != m.state.ActiveID && !m.state.StaleIDs[id] {
+		if id != m.state.ActiveID && !m.staleIDs[id] {
 			m.enqueue(id)
 		}
 	}
-	validTransition := (m.state.Phase == "fetching" && m.state.Operation == "fetching") ||
-		(m.state.Phase == "ready" && (m.state.Operation == "idle" || m.state.Operation == "posting")) ||
-		(m.state.Phase == "busy" && m.state.Operation == "polling")
-	validOwnership := m.state.Version == 1 && m.state.ActiveID != "" && validRequestID(m.state.ActiveID) && validTransition
-	if validOwnership && !m.state.StaleIDs[m.state.ActiveID] {
+	validPhase := m.state.Phase == "fetching" || m.state.Phase == "ready" || m.state.Phase == "busy"
+	validOwnership := m.state.Version == 1 && m.state.ActiveID != "" && validRequestID(m.state.ActiveID) && validPhase
+	if validOwnership && !m.staleIDs[m.state.ActiveID] {
 		return m.state.ActiveID
 	}
 	return m.startNext()
@@ -695,7 +707,7 @@ func (m *serviceLifecycleModel) responseAttempt(started, transportOK bool, statu
 }
 
 func (m *serviceLifecycleModel) transportFailure() {
-	switch m.state.Operation {
+	switch m.operation {
 	case "fetching", "polling":
 		m.outcome = "failed"
 		m.pendingCommand = ""
@@ -727,8 +739,8 @@ func TestServiceLifecycleQueuesEveryOccupiedPhaseFIFO(t *testing.T) {
 	} {
 		t.Run(test.phase+"/"+test.operation, func(t *testing.T) {
 			model := serviceLifecycleModel{state: serviceLifecycleFixture{
-				Version: 1, ActiveID: requestIDA, Phase: test.phase, Operation: test.operation,
-			}}
+				Version: 1, ActiveID: requestIDA, Phase: test.phase,
+			}, operation: test.operation}
 			model.enqueue(requestIDB)
 			model.enqueue(requestIDC)
 			model.enqueue(requestIDB)
@@ -741,7 +753,7 @@ func TestServiceLifecycleQueuesEveryOccupiedPhaseFIFO(t *testing.T) {
 
 func TestServiceLifecycleDeduplicatesActiveAndQueuedIDs(t *testing.T) {
 	model := serviceLifecycleModel{state: serviceLifecycleFixture{
-		ActiveID: requestIDA, Phase: "ready", Queue: []string{requestIDB}, Operation: "idle",
+		ActiveID: requestIDA, Phase: "ready", Queue: []string{requestIDB},
 	}}
 	for _, id := range []string{requestIDA, requestIDB, "ABCDEF0123456789ABCDEF0123456789", "short", requestIDC} {
 		model.enqueue(id)
@@ -753,21 +765,19 @@ func TestServiceLifecycleDeduplicatesActiveAndQueuedIDs(t *testing.T) {
 
 func TestServiceLifecycleAdvancesAfterTerminalAndStaleRequests(t *testing.T) {
 	model := serviceLifecycleModel{state: serviceLifecycleFixture{
-		ActiveID:  requestIDA,
-		Phase:     "busy",
-		Queue:     []string{requestIDB, requestIDC},
-		Operation: "polling",
-		StaleIDs:  map[string]bool{},
-	}}
+		ActiveID: requestIDA,
+		Phase:    "busy",
+		Queue:    []string{requestIDB, requestIDC},
+	}, operation: "polling", staleIDs: map[string]bool{}}
 	if got := model.finish("succeeded"); got != requestIDB {
 		t.Fatalf("finish started %q, want queue head %q", got, requestIDB)
 	}
-	if model.outcome != "succeeded" || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" || model.state.Operation != "fetching" || !reflect.DeepEqual(model.state.Queue, []string{requestIDC}) {
+	if model.outcome != "succeeded" || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" || !reflect.DeepEqual(model.state.Queue, []string{requestIDC}) {
 		t.Fatalf("advanced lifecycle = %#v", model)
 	}
 
 	model.state.Queue = []string{requestIDA}
-	model.state.StaleIDs[requestIDB] = true
+	model.staleIDs[requestIDB] = true
 	if got := model.restore(); got != requestIDA {
 		t.Fatalf("stale restoration started %q, want %q", got, requestIDA)
 	}
@@ -786,10 +796,8 @@ func TestServiceLifecycleRestoresFetchingReadyAndBusyRequests(t *testing.T) {
 		t.Run(test.phase+"/"+test.operation, func(t *testing.T) {
 			model := serviceLifecycleModel{state: serviceLifecycleFixture{
 				Version: 1, ActiveID: requestIDA, Phase: test.phase,
-				Queue:     []string{"short", requestIDB, requestIDA, requestIDB, requestIDC},
-				Operation: test.operation,
-				StaleIDs:  map[string]bool{requestIDC: true},
-			}}
+				Queue: []string{"short", requestIDB, requestIDA, requestIDB, requestIDC},
+			}, operation: test.operation, staleIDs: map[string]bool{requestIDC: true}}
 			if got := model.restore(); got != requestIDA || !reflect.DeepEqual(model.state.Queue, []string{requestIDB}) {
 				t.Fatalf("valid restoration = (%q, %#v), want retained ownership and sanitized queue", got, model.state)
 			}
@@ -805,19 +813,14 @@ func TestServiceLifecycleRestoresFetchingReadyAndBusyRequests(t *testing.T) {
 	}
 
 	for _, test := range []struct {
-		name      string
-		activeID  string
-		phase     string
-		operation string
+		name     string
+		activeID string
+		phase    string
 	}{
-		{name: "invalid version", activeID: requestIDA, phase: "ready", operation: "idle"},
-		{name: "invalid phase", activeID: requestIDA, phase: "failed", operation: "idle"},
-		{name: "invalid operation", activeID: requestIDA, phase: "ready", operation: "cancelling"},
-		{name: "fetching idle mismatch", activeID: requestIDA, phase: "fetching", operation: "idle"},
-		{name: "ready polling mismatch", activeID: requestIDA, phase: "ready", operation: "polling"},
-		{name: "busy posting mismatch", activeID: requestIDA, phase: "busy", operation: "posting"},
-		{name: "missing active ID with phase", phase: "ready", operation: "idle"},
-		{name: "active ID without phase", activeID: requestIDA, operation: "idle"},
+		{name: "invalid version", activeID: requestIDA, phase: "ready"},
+		{name: "invalid phase", activeID: requestIDA, phase: "failed"},
+		{name: "missing active ID with phase", phase: "ready"},
+		{name: "active ID without phase", activeID: requestIDA},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			version := 1
@@ -825,9 +828,9 @@ func TestServiceLifecycleRestoresFetchingReadyAndBusyRequests(t *testing.T) {
 				version = 2
 			}
 			model := serviceLifecycleModel{state: serviceLifecycleFixture{
-				Version: version, ActiveID: test.activeID, Phase: test.phase, Operation: test.operation, Queue: []string{requestIDB},
+				Version: version, ActiveID: test.activeID, Phase: test.phase, Queue: []string{requestIDB},
 			}}
-			if got := model.restore(); got != requestIDB || model.state.Version != 1 || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" || model.state.Operation != "fetching" {
+			if got := model.restore(); got != requestIDB || model.state.Version != 1 || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" {
 				t.Fatalf("invalid restoration = (%q, %#v), want queued request started", got, model.state)
 			}
 		})
@@ -858,14 +861,14 @@ func TestServiceCancellationTreatsConflictAsAcknowledged(t *testing.T) {
 	for _, status := range []int{202, 409} {
 		model := serviceLifecycleModel{
 			state: serviceLifecycleFixture{
-				Version: 1, ActiveID: requestIDA, Phase: "ready", Operation: "posting", Queue: []string{requestIDB, requestIDC},
+				Version: 1, ActiveID: requestIDA, Phase: "ready", Queue: []string{requestIDB, requestIDC},
 			},
 			pendingCommand: "cancel",
 		}
 		if got := model.responseAttempt(true, true, status); got != "accepted" {
 			t.Fatalf("status %d outcome = %q, want accepted", status, got)
 		}
-		if model.pendingCommand != "" || model.outcome != "cancelled" || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" || model.state.Operation != "fetching" || !reflect.DeepEqual(model.state.Queue, []string{requestIDC}) {
+		if model.pendingCommand != "" || model.outcome != "cancelled" || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" || !reflect.DeepEqual(model.state.Queue, []string{requestIDC}) {
 			t.Fatalf("status %d cancellation state = %#v, want terminal finish and FIFO advance", status, model)
 		}
 	}
@@ -873,7 +876,7 @@ func TestServiceCancellationTreatsConflictAsAcknowledged(t *testing.T) {
 
 func TestServiceCancellationTreatsGoneAsTerminal(t *testing.T) {
 	model := serviceLifecycleModel{
-		state:          serviceLifecycleFixture{ActiveID: requestIDA, Phase: "ready", Operation: "posting", Queue: []string{requestIDB}},
+		state:          serviceLifecycleFixture{ActiveID: requestIDA, Phase: "ready", Queue: []string{requestIDB}},
 		pendingCommand: "cancel",
 	}
 	if got := model.responseAttempt(true, true, 410); got != "gone" {
@@ -885,7 +888,7 @@ func TestServiceCancellationTreatsGoneAsTerminal(t *testing.T) {
 }
 
 func TestServiceCancellationDoesNotTurnIntoGenericBridgeFailure(t *testing.T) {
-	wantState := serviceLifecycleFixture{Version: 1, ActiveID: requestIDA, Phase: "ready", Operation: "posting", Queue: []string{requestIDB}}
+	wantState := serviceLifecycleFixture{Version: 1, ActiveID: requestIDA, Phase: "ready", Queue: []string{requestIDB}}
 	model := serviceLifecycleModel{state: wantState, outcome: "cancelling", pendingCommand: "cancel"}
 	if got := model.responseAttempt(true, false, 0); got != "retry" || model.outcome != "cancelling" || model.pendingCommand != "cancel" || !reflect.DeepEqual(model.state, wantState) {
 		t.Fatalf("cancellation transport failure = (%q, %#v), want exact retained cancellation", got, model)
@@ -905,7 +908,7 @@ func TestServiceOrdinaryTransportFailuresRemainFailures(t *testing.T) {
 		{name: "submit", operation: "posting", command: "submit", wantOutcome: "retry", wantCommand: true},
 		{name: "confirm", operation: "posting", command: "confirm", wantOutcome: "retry", wantCommand: true},
 	} {
-		model := serviceLifecycleModel{state: serviceLifecycleFixture{Operation: test.operation}, pendingCommand: test.command}
+		model := serviceLifecycleModel{operation: test.operation, pendingCommand: test.command}
 		model.transportFailure()
 		commandRetained := model.pendingCommand != ""
 		if model.outcome != test.wantOutcome || commandRetained != test.wantCommand {
