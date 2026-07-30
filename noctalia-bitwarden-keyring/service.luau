@@ -12,6 +12,7 @@ local bridgeToken = nil
 local bridgeBaseUrl = nil
 local encodedBody = nil
 local postAction = nil
+local processingCommand = false
 
 local function validId(value)
   return type(value)=="string" and #value==32 and string.match(value,"^[0-9a-f]+$")~=nil
@@ -178,31 +179,73 @@ local function validAction(action)
   return action == "submit" or action == "cancel" or action == "confirm"
 end
 
-local function onCommand(value)
-  if type(value) ~= "table" then
-    noctalia.state.set("command", nil)
-    return
+local function clearCommand(value)
+  processingCommand = true
+  if type(value) == "table" then
+    value.password = nil
   end
+  noctalia.state.set("command", nil)
+  value = nil
+  processingCommand = false
+end
+
+local function dropOwnership()
+  generation = generation + 1
+  active = nil
+  pendingId = nil
+  fetching = false
+  posting = false
+  polling = false
+  bridgeToken = nil
+  bridgeBaseUrl = nil
+  encodedBody = nil
+  postAction = nil
+  noctalia.state.set("auth", false)
+end
+
+local function onCommand(value)
+  if type(value) ~= "table" then return end
+  if processingCommand or postAction ~= nil then return end
   local id = value.id
   local action = value.action
   local password = value.password
-  value.password = nil
-  noctalia.state.set("command", nil)
-  if not validId(id) or not validAction(action) then password = nil return end
-  if active == nil or id ~= active.id or active.phase ~= "ready" or posting then password = nil return end
-  if action == "submit" and active.confirmOnly == true then password = nil return end
-  if action == "submit" and (type(password) ~= "string" or #password == 0) then password = nil return end
-  if action == "confirm" and active.confirmOnly ~= true then password = nil return end
-  if action ~= "submit" then password = nil end
+  if not validId(id) or not validAction(action)
+    or active == nil or id ~= active.id or active.phase ~= "ready" or posting or postAction ~= nil
+    or (action == "submit" and active.confirmOnly == true)
+    or (action == "submit" and (type(password) ~= "string" or #password == 0))
+    or (action == "confirm" and active.confirmOnly ~= true) then
+    password = nil
+    clearCommand(value)
+    value = nil
+    return
+  end
+  if action ~= "submit" then
+    password = nil
+  end
+
+  local path = descriptorPath(id)
+  if path == nil or type(noctalia.readFile(path)) ~= "string" then
+    password = nil
+    clearCommand(value)
+    value = nil
+    dropOwnership()
+    return
+  end
 
   local result = action == "submit" and "ok" or (action == "cancel" and "cancelled" or "confirmed")
   local wire = {type = "keyring_response", id = id, result = result}
-  if action == "submit" then wire.password = password end
+  if action == "submit" then
+    wire.password = password
+  end
   local encoded, body = pcall(noctalia.json.encode, wire)
   wire.password = nil
   password = nil
   wire = nil
-  if not encoded or type(body) ~= "string" then body = nil return end
+  value = nil
+  if not encoded or type(body) ~= "string" then
+    body = nil
+    return
+  end
 
   local capturedGeneration = generation
   local capturedId = id
@@ -211,10 +254,7 @@ local function onCommand(value)
   postAction = action
   action = nil
   posting = true
-  active.phase = postAction == "submit" and "busy" or "cancelling"
-  if postAction == "submit" then
-    publish(active.id, active.title, active.prompt, active.confirmOnly, "busy", "")
-  end
+  publish(active.id, active.title, active.prompt, active.confirmOnly, "busy", "")
   local started = noctalia.http({
     method = "POST",
     url = bridgeBaseUrl .. "/v1/response",
@@ -224,19 +264,33 @@ local function onCommand(value)
     if capturedGeneration ~= generation or active == nil or capturedId ~= active.id then return end
     encodedBody = nil
     posting = false
-    if type(res) ~= "table" or res.error ~= nil or res.status ~= 202 then bridgeFailure() return end
-    if postAction == "cancel" then
+    if type(res) ~= "table" or res.error ~= nil or type(res.status) ~= "number" then
+      postAction = nil
+      return
+    end
+    local status = res.status
+    if status ~= 202 and status ~= 409 and status ~= 410 then
+      postAction = nil
+      return
+    end
+    local retainedCommand = noctalia.state.get("command")
+    clearCommand(retainedCommand)
+    retainedCommand = nil
+    if status == 410 then
+      dropOwnership()
+    elseif postAction == "cancel" then
       finish("cancelled", translated("panel.cancelled"))
     elseif postAction == "confirm" then
       finish("confirmed", translated("panel.success"))
     else
+      active.phase = "busy"
       postAction = nil
     end
   end)
   if started == false then
     encodedBody = nil
     posting = false
-    bridgeFailure()
+    postAction = nil
   end
 end
 
@@ -251,6 +305,14 @@ function update()
   if active == nil or (active.phase ~= "ready" and active.phase ~= "busy") then return end
   if fetching or posting or polling then return end
   if not validId(active.id) then bridgeFailure() return end
+  if active.phase == "ready" then
+    local retainedCommand = noctalia.state.get("command")
+    if retainedCommand ~= nil then
+      onCommand(retainedCommand)
+    end
+    retainedCommand = nil
+    return
+  end
   local capturedGeneration = generation
   local capturedId = active.id
   polling = true

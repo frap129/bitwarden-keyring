@@ -485,9 +485,12 @@ func assertServiceSource(t *testing.T, source string) {
 		`value.password = nil`, `wire.password = nil`, `body = nil`,
 		`value.retry == nil or type(value.retry) == "boolean"`, `local terminal = {`,
 		`noctalia.state.set("auth", terminal)`, `local showPanel = owner == nil and validId(pendingId)`,
-		`if action == "submit" and active.confirmOnly == true then password = nil return end`,
+		`(action == "submit" and active.confirmOnly == true)`,
 		`if active ~= nil and active.phase == "ready" and bridgeToken ~= nil and bridgeBaseUrl ~= nil then`,
 		`result = "cancelled"`, `function ignoreExitResponse`, `noctalia.http({`, `pcall(noctalia.http, request, ignoreExitResponse)`,
+		`local processingCommand = false`, `local postAction = nil`, `if processingCommand or postAction ~= nil then return end`,
+		`if type(value) ~= "table" then return end`, `local retainedCommand = noctalia.state.get("command")`,
+		`onCommand(retainedCommand)`, `status ~= 202 and status ~= 409 and status ~= 410`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
@@ -509,6 +512,7 @@ func assertServiceSource(t *testing.T, source string) {
 		`panel_open", nil`, `panel_open", false`, `panel_open", true`,
 		"os.execute", "io.popen", "noctalia.exec", "noctalia.spawn", "console.log", "logger", "notify(", "noctalia.http.request",
 		`publish(active.id, active.title, active.prompt, active.confirmOnly, "cancelling"`, `result.error`,
+		`active.phase = postAction == "submit" and "busy" or "cancelling"`,
 		`function(res)
     body`, `function(res)
     token`, `function(res)
@@ -517,6 +521,15 @@ func assertServiceSource(t *testing.T, source string) {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("service.luau contains forbidden literal %q", forbidden)
 		}
+	}
+	if regexp.MustCompile(`(?s)function onCommand\(value\)\s+if type\(value\) ~= "table" then return end`).FindString(source) == "" {
+		t.Error("service.luau command watcher must immediately ignore non-table values")
+	}
+	if regexp.MustCompile(`(?s)if type\(value\) ~= "table" then\s+noctalia\.state\.set\("command", nil\)`).MatchString(source) {
+		t.Error("service.luau command watcher recursively clears non-table values")
+	}
+	if !regexp.MustCompile(`(?s)processingCommand = true.*?value\.password = nil.*?noctalia\.state\.set\("command", nil\).*?value = nil.*?processingCommand = false`).MatchString(source) {
+		t.Error("service.luau must guard and single-clear rejected or acknowledged commands")
 	}
 	if regexp.MustCompile(`(?i)url\s*=[^\n]*(token|password)`).MatchString(source) {
 		t.Error("service.luau appears to place the token in a URL")
