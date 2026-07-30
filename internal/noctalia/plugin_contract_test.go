@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -505,15 +506,17 @@ func assertServiceSource(t *testing.T, source string) {
 		`local function persistLifecycle()`, `noctalia.state.set("service_lifecycle", snapshot)`,
 		`local function enqueueRequest(id)`, `startNextRequest = function()`, `local function terminalFinish(`,
 		`enqueueRequest(payload)`, `startNextRequest()`, `noctalia.state.get("service_lifecycle")`,
-		`local panelOpeningFor = nil`, `local panelOpeningAt = 0`, `heartbeat >= now - 3`,
-		`panelOpeningAt = now`, `now - panelOpeningAt < 1`,
+		`local panelOpeningFor = nil`, `heartbeat >= now - 3`, `heartbeat <= now + 1`, `heartbeat % 1 == 0`,
+		`local function requestPanelOpen(id)`, `requestPanelOpen(id)`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("service.luau does not contain required literal %q", required)
 		}
 	}
-	if strings.Contains(source, `os.clock`) {
-		t.Error("service.luau panel opening guard must use wall-clock seconds, not os.clock")
+	for _, forbidden := range []string{`os.clock`, `panelOpeningAt`, `now - panelOpening`} {
+		if strings.Contains(source, forbidden) {
+			t.Errorf("service.luau must not use timed panel retoggle mechanism %q", forbidden)
+		}
 	}
 	if regexp.MustCompile(`(?s)function onIpc\(event, payload\).*?active ~= nil.*?return`).MatchString(source) {
 		t.Error("service.luau onIpc must enqueue occupied requests instead of returning early")
@@ -773,12 +776,13 @@ func (m *serviceLifecycleModel) transportFailure() {
 type panelMarkerFixture struct {
 	ID        string
 	Instance  string
-	Heartbeat int64
+	Heartbeat float64
 }
 
 func shouldOpenPanel(activeID string, marker any, now int64) bool {
 	presence, ok := marker.(panelMarkerFixture)
-	return !ok || presence.ID != activeID || !validRequestID(presence.Instance) || presence.Heartbeat < now-3
+	heartbeat := presence.Heartbeat
+	return !ok || presence.ID != activeID || !validRequestID(presence.Instance) || math.IsNaN(heartbeat) || math.IsInf(heartbeat, 0) || math.Trunc(heartbeat) != heartbeat || heartbeat < float64(now-3) || heartbeat > float64(now+1)
 }
 
 func TestServiceLifecycleQueuesEveryOccupiedPhaseFIFO(t *testing.T) {
@@ -1134,9 +1138,15 @@ func TestPanelPresenceMatchesOnlyCurrentRequest(t *testing.T) {
 	}{
 		{name: "false", marker: false, open: true},
 		{name: "malformed", marker: map[string]any{"id": requestIDA}, open: true},
-		{name: "mismatched", marker: panelMarkerFixture{ID: requestIDB, Instance: requestIDC, Heartbeat: now}, open: true},
-		{name: "stale", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: now - 4}, open: true},
-		{name: "matching fresh", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: now - 3}},
+		{name: "mismatched", marker: panelMarkerFixture{ID: requestIDB, Instance: requestIDC, Heartbeat: float64(now)}, open: true},
+		{name: "stale", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: float64(now - 4)}, open: true},
+		{name: "future", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: float64(now + 2)}, open: true},
+		{name: "fractional", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: float64(now) + 0.5}, open: true},
+		{name: "nan", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: math.NaN()}, open: true},
+		{name: "positive infinity", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: math.Inf(1)}, open: true},
+		{name: "negative infinity", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: math.Inf(-1)}, open: true},
+		{name: "allowed future skew", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: float64(now + 1)}},
+		{name: "matching fresh", marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: float64(now - 3)}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := shouldOpenPanel(requestIDA, test.marker, now); got != test.open {
@@ -1148,11 +1158,11 @@ func TestPanelPresenceMatchesOnlyCurrentRequest(t *testing.T) {
 
 func TestPanelReloadLeavesOldMarkerUntilHydration(t *testing.T) {
 	now := int64(20_000)
-	marker := any(panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: now - 4})
+	marker := any(panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: float64(now - 4)})
 	if !shouldOpenPanel(requestIDA, marker, now) {
 		t.Fatal("stale marker from old panel VM prevented reopening")
 	}
-	marker = panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: now}
+	marker = panelMarkerFixture{ID: requestIDA, Instance: requestIDC, Heartbeat: float64(now)}
 	if shouldOpenPanel(requestIDA, marker, now) {
 		t.Fatal("hydrated replacement marker requested a duplicate panel")
 	}
@@ -1171,7 +1181,7 @@ func (m *panelPresenceModel) onOpen(sharedAuthID, sharedPhase string, now int64)
 	m.authID = sharedAuthID
 	m.phase = sharedPhase
 	m.requestID = sharedAuthID
-	m.marker = panelMarkerFixture{ID: sharedAuthID, Instance: m.instance, Heartbeat: now}
+	m.marker = panelMarkerFixture{ID: sharedAuthID, Instance: m.instance, Heartbeat: float64(now)}
 }
 
 func (m *panelPresenceModel) close(capturedID, capturedInstance string) {
@@ -1242,65 +1252,88 @@ func TestPanelProgrammaticTerminalCloseDoesNotDuplicateCommand(t *testing.T) {
 }
 
 type servicePanelOpeningModel struct {
-	activeID   string
 	marker     any
 	openingFor string
-	openingAt  int64
 	toggles    int
 }
 
-func (m *servicePanelOpeningModel) requestOpen(now int64) {
-	if !shouldOpenPanel(m.activeID, m.marker, now) {
-		m.openingFor = ""
-		m.openingAt = 0
+func (m *servicePanelOpeningModel) requestOpen(id string, now int64) {
+	if m.openingFor == id {
 		return
 	}
-	if m.openingFor == m.activeID && now-m.openingAt < 1 {
+	if !shouldOpenPanel(id, m.marker, now) {
+		m.openingFor = id
 		return
 	}
-	m.openingFor = m.activeID
-	m.openingAt = now
+	m.openingFor = id
 	m.toggles++
 }
 
-func TestServiceModelBusyCloseReopensAtMostOncePerSecond(t *testing.T) {
-	model := servicePanelOpeningModel{activeID: requestIDA, marker: false}
-	model.requestOpen(10)
-	model.requestOpen(10)
+func TestServiceModelDelayedOnOpenNeverRetoggles(t *testing.T) {
+	model := servicePanelOpeningModel{marker: false}
+	model.requestOpen(requestIDA, 10)
+	model.requestOpen(requestIDA, 12)
+	model.requestOpen(requestIDA, 100)
 	if model.toggles != 1 {
-		t.Fatalf("same-second closed-panel toggles = %d, want 1", model.toggles)
-	}
-	model.requestOpen(11)
-	if model.toggles != 2 {
-		t.Fatalf("nonterminal closed panel was not retried: %#v", model)
+		t.Fatalf("delayed onOpen toggles = %d, want 1", model.toggles)
 	}
 }
 
 func TestServiceModelFreshMarkerPreventsVisiblePanelToggleClosed(t *testing.T) {
-	model := servicePanelOpeningModel{activeID: requestIDA, openingFor: requestIDA, openingAt: 10,
+	model := servicePanelOpeningModel{openingFor: requestIDA,
 		marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 11}}
-	model.requestOpen(11)
-	model.requestOpen(12)
-	if model.toggles != 0 || model.openingFor != "" {
+	model.requestOpen(requestIDA, 11)
+	model.requestOpen(requestIDA, 12)
+	if model.toggles != 0 || model.openingFor != requestIDA {
 		t.Fatalf("fresh visible panel toggled or retained guard: %#v", model)
 	}
 }
 
 func TestServiceReloadPreservesLiveMatchingMarker(t *testing.T) {
 	marker := panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 40}
-	model := servicePanelOpeningModel{activeID: requestIDA, marker: marker}
-	model.requestOpen(40)
+	model := servicePanelOpeningModel{marker: marker}
+	model.requestOpen(requestIDA, 40)
 	if model.toggles != 0 || !reflect.DeepEqual(model.marker, marker) {
 		t.Fatalf("service reload changed live marker: %#v", model)
 	}
 }
 
 func TestServiceRetryOpensExactlyOnce(t *testing.T) {
-	model := servicePanelOpeningModel{activeID: requestIDA, marker: false}
-	model.requestOpen(50)
-	model.requestOpen(50)
+	model := servicePanelOpeningModel{marker: false}
+	model.requestOpen(requestIDA, 50)
+	model.requestOpen(requestIDA, 80)
 	if model.toggles != 1 {
 		t.Fatalf("retry toggles = %d, want exactly 1", model.toggles)
+	}
+}
+
+func TestServicePreActiveTerminalFailureOpensWithPreservedID(t *testing.T) {
+	model := servicePanelOpeningModel{marker: false}
+	activeID := requestIDA
+	terminalID := activeID
+	activeID = ""
+	model.requestOpen(terminalID, 60)
+	if activeID != "" || model.openingFor != requestIDA || model.toggles != 1 {
+		t.Fatalf("pre-active terminal open = %#v, active ID %q", model, activeID)
+	}
+}
+
+func TestServiceStalePriorVMMarkerPermitsOneInitialToggle(t *testing.T) {
+	model := servicePanelOpeningModel{marker: panelMarkerFixture{ID: requestIDA, Instance: requestIDB, Heartbeat: 60}}
+	model.requestOpen(requestIDA, 64)
+	model.requestOpen(requestIDA, 100)
+	if model.toggles != 1 {
+		t.Fatalf("stale prior marker toggles = %d, want 1", model.toggles)
+	}
+}
+
+func TestServiceOwnershipChangeAllowsOneToggleForNewRequest(t *testing.T) {
+	model := servicePanelOpeningModel{marker: false}
+	model.requestOpen(requestIDA, 70)
+	model.requestOpen(requestIDB, 70)
+	model.requestOpen(requestIDB, 90)
+	if model.toggles != 2 || model.openingFor != requestIDB {
+		t.Fatalf("ownership change lifecycle = %#v", model)
 	}
 }
 

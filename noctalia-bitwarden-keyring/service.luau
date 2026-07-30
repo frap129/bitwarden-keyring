@@ -17,7 +17,6 @@ local commandIdentity = 0
 local watcherRegistered = false
 local startupRecovering = true
 local panelOpeningFor = nil
-local panelOpeningAt = 0
 local lifecycle = {version = 1, active_id = "", phase = "", queue = {}}
 
 local function validId(value)
@@ -73,26 +72,25 @@ end
 
 local function freshPanelMarker(id, now)
   local marker = noctalia.state.get("panel_open")
+  local heartbeat = type(marker) == "table" and marker.heartbeat or nil
   return type(marker) == "table" and marker.id == id and validId(marker.instance)
-    and type(marker.heartbeat) == "number" and marker.heartbeat >= now - 3
+    and type(heartbeat) == "number" and heartbeat == heartbeat and heartbeat ~= math.huge and heartbeat ~= -math.huge
+    and heartbeat % 1 == 0 and heartbeat >= now - 3 and heartbeat <= now + 1
 end
 
 local function clearPanelOpening()
   panelOpeningFor = nil
-  panelOpeningAt = 0
 end
 
-local function requestPanelOpen()
-  local id = lifecycle.active_id
+local function requestPanelOpen(id)
   if not validId(id) then return end
+  if panelOpeningFor == id then return end
   local now = os.time()
   if freshPanelMarker(id, now) then
-    clearPanelOpening()
+    panelOpeningFor = id
     return
   end
-  if panelOpeningFor == id and now - panelOpeningAt < 1 then return end
   panelOpeningFor = id
-  panelOpeningAt = now
   noctalia.togglePanel(PANEL_ID)
 end
 
@@ -203,7 +201,7 @@ local function terminalFinish(phase, errorText)
   lifecycle.phase = ""
   persistLifecycle()
   if showPanel then
-    requestPanelOpen()
+    requestPanelOpen(id)
   end
   startNextRequest()
 end
@@ -290,11 +288,11 @@ local function openRequest(id, restoredPhase)
       onCommand(retainedCommand)
       if recoveryGeneration == generation and active ~= nil and recoveryId == active.id and not posting then
         publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
-        requestPanelOpen()
+        requestPanelOpen(active.id)
       end
     else
       publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", "")
-      requestPanelOpen()
+      requestPanelOpen(active.id)
     end
     retainedCommand = nil
     if recoveryGeneration == generation and active ~= nil and recoveryId == active.id then
@@ -456,7 +454,7 @@ function update()
     startNextRequest()
     return
   end
-  requestPanelOpen()
+  requestPanelOpen(active.id)
   if fetching or posting or polling then return end
   if not validId(active.id) then
     bridgeFailure()
@@ -507,7 +505,7 @@ function update()
       lifecycle.phase = "ready"
       persistLifecycle()
       publish(active.id, active.title, active.prompt, active.confirmOnly, "ready", translated("panel.incorrect_password"))
-      requestPanelOpen()
+      requestPanelOpen(active.id)
     else
       terminalFinish("failed", translated("panel.unlock_failed"))
     end
