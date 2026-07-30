@@ -74,6 +74,20 @@ type flightPrompter struct {
 	relOnce   sync.Once
 }
 
+type panicPrompter struct {
+	entered   chan struct{}
+	release   chan struct{}
+	panicWith any
+	callCount atomic.Int32
+}
+
+func (p *panicPrompter) PromptForPassword(string) (string, ResultNotifier, error) {
+	p.callCount.Add(1)
+	close(p.entered)
+	<-p.release
+	panic(p.panicWith)
+}
+
 func (p *flightPrompter) PromptForPassword(string) (string, ResultNotifier, error) {
 	index := int(p.callCount.Add(1)) - 1
 	p.enterOnce.Do(func() { close(p.entered) })
@@ -643,6 +657,72 @@ func TestEnsureUnlocked_ConcurrentCalls_NonPasswordFailureSharesResult(t *testin
 	}
 	if got := unlockCalls.Load(); got != 1 {
 		t.Errorf("unlock calls = %d, want 1", got)
+	}
+}
+
+func TestEnsureUnlocked_OwnerPanicPublishesAbortToWaiters(t *testing.T) {
+	const callers = 5
+	panicValue := errors.New("prompter panic")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	barrier := newStartBarrier(callers)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		barrier.handleStatus(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(barrier.releaseStart)
+
+	prompter := &panicPrompter{
+		entered:   make(chan struct{}),
+		release:   make(chan struct{}),
+		panicWith: panicValue,
+	}
+	c := clientWithPrompter(ts, prompter, true)
+	makeServeHealthy(c)
+	joined := newTestSignal()
+	var joiners atomic.Int32
+	c.flightWaiterHook = func(*unlockFlight) {
+		if joiners.Add(1) == callers-1 {
+			joined.trigger()
+		}
+	}
+
+	results := make([]error, callers)
+	panics := make([]any, callers)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			defer func() { panics[index] = recover() }()
+			results[index] = c.ensureUnlocked(ctx)
+		}(i)
+	}
+	releaseConcurrentStart(t, ctx, barrier)
+	waitForTestSignal(t, ctx, prompter.entered, "owner prompt")
+	waitForTestSignal(t, ctx, joined.channel, "panic-flight waiters")
+	close(prompter.release)
+	waitForEnsureResults(t, ctx, &wg)
+
+	panicCount := 0
+	for i := range results {
+		if panics[i] != nil {
+			panicCount++
+			if panics[i] != panicValue {
+				t.Errorf("caller %d recovered panic = %v, want %v", i, panics[i], panicValue)
+			}
+			continue
+		}
+		if !errors.Is(results[i], errUnlockFlightAborted) {
+			t.Errorf("waiter %d error = %v, want errUnlockFlightAborted", i, results[i])
+		}
+	}
+	if panicCount != 1 {
+		t.Errorf("recovered panics = %d, want 1", panicCount)
+	}
+	if got := prompter.callCount.Load(); got != 1 {
+		t.Errorf("prompter calls = %d, want 1", got)
 	}
 }
 

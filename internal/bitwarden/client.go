@@ -61,6 +61,8 @@ var ErrInvalidPassword = errors.New("invalid master password")
 // ErrMaxRetriesExceeded indicates the maximum password retry attempts were exceeded
 var ErrMaxRetriesExceeded = errors.New("maximum password attempts exceeded")
 
+var errUnlockFlightAborted = errors.New("unlock attempt aborted")
+
 // maxErrorBody is the maximum number of bytes to read from error response bodies
 // for debug logging. When exceeded, the body is truncated with an indicator.
 const maxErrorBody = 4096
@@ -467,6 +469,7 @@ func (c *Client) waitForUnlockFlight(ctx context.Context, flight *unlockFlight) 
 }
 
 func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (resultErr error) {
+	resultErr = fmt.Errorf("unlock flight ended before returning a result: %w", errUnlockFlightAborted)
 	defer func() { c.completeUnlockFlight(flight, resultErr) }()
 
 	if err := ctx.Err(); err != nil {
