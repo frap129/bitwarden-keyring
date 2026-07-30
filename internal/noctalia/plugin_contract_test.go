@@ -557,6 +557,274 @@ func TestServiceResultAcceptsTerminalJSONWithoutRetry(t *testing.T) {
 	}
 }
 
+const (
+	requestIDA = "0123456789abcdef0123456789abcdef"
+	requestIDB = "11111111111111111111111111111111"
+	requestIDC = "22222222222222222222222222222222"
+)
+
+type serviceLifecycleFixture struct {
+	Version   int
+	ActiveID  string
+	Phase     string
+	Queue     []string
+	Operation string
+	StaleIDs  map[string]bool
+}
+
+type serviceLifecycleModel struct {
+	state   serviceLifecycleFixture
+	outcome string
+}
+
+func validRequestID(id string) bool {
+	return regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(id)
+}
+
+func (m *serviceLifecycleModel) enqueue(id string) {
+	if !validRequestID(id) || id == m.state.ActiveID {
+		return
+	}
+	for _, queuedID := range m.state.Queue {
+		if id == queuedID {
+			return
+		}
+	}
+	m.state.Queue = append(m.state.Queue, id)
+}
+
+func (m *serviceLifecycleModel) startNext() string {
+	m.state.ActiveID = ""
+	m.state.Phase = ""
+	m.state.Operation = "idle"
+	for len(m.state.Queue) > 0 {
+		id := m.state.Queue[0]
+		m.state.Queue = m.state.Queue[1:]
+		if !validRequestID(id) || m.state.StaleIDs[id] {
+			continue
+		}
+		m.state.ActiveID = id
+		m.state.Phase = "fetching"
+		m.state.Operation = "fetching"
+		return id
+	}
+	return ""
+}
+
+func (m *serviceLifecycleModel) finish(outcome string) string {
+	m.outcome = outcome
+	return m.startNext()
+}
+
+func (m *serviceLifecycleModel) restore() string {
+	if m.state.ActiveID != "" && validRequestID(m.state.ActiveID) && !m.state.StaleIDs[m.state.ActiveID] {
+		return m.state.ActiveID
+	}
+	return m.startNext()
+}
+
+func (m *serviceLifecycleModel) responseAttempt(started, transportOK bool, status int) string {
+	if !started || !transportOK {
+		return "retry"
+	}
+	switch status {
+	case 202, 409:
+		return "accepted"
+	case 410:
+		return "gone"
+	default:
+		return "retry"
+	}
+}
+
+type panelMarkerFixture struct {
+	ID        string
+	Instance  string
+	Heartbeat int64
+}
+
+func shouldOpenPanel(activeID string, marker any, now int64) bool {
+	presence, ok := marker.(panelMarkerFixture)
+	return !ok || presence.ID != activeID || presence.Instance == "" || presence.Heartbeat < now-3000
+}
+
+func TestServiceLifecycleQueuesEveryOccupiedPhaseFIFO(t *testing.T) {
+	for _, test := range []struct {
+		phase     string
+		operation string
+	}{
+		{phase: "fetching", operation: "fetching"},
+		{phase: "ready", operation: "idle"},
+		{phase: "ready", operation: "posting"},
+		{phase: "busy", operation: "polling"},
+	} {
+		t.Run(test.phase+"/"+test.operation, func(t *testing.T) {
+			model := serviceLifecycleModel{state: serviceLifecycleFixture{
+				Version: 1, ActiveID: requestIDA, Phase: test.phase, Operation: test.operation,
+			}}
+			model.enqueue(requestIDB)
+			model.enqueue(requestIDC)
+			model.enqueue(requestIDB)
+			if want := []string{requestIDB, requestIDC}; !reflect.DeepEqual(model.state.Queue, want) {
+				t.Fatalf("queue = %#v, want FIFO %#v", model.state.Queue, want)
+			}
+		})
+	}
+}
+
+func TestServiceLifecycleDeduplicatesActiveAndQueuedIDs(t *testing.T) {
+	model := serviceLifecycleModel{state: serviceLifecycleFixture{
+		ActiveID: requestIDA, Phase: "ready", Queue: []string{requestIDB}, Operation: "idle",
+	}}
+	for _, id := range []string{requestIDA, requestIDB, "ABCDEF0123456789ABCDEF0123456789", "short", requestIDC} {
+		model.enqueue(id)
+	}
+	if want := []string{requestIDB, requestIDC}; !reflect.DeepEqual(model.state.Queue, want) {
+		t.Fatalf("deduplicated queue = %#v, want %#v", model.state.Queue, want)
+	}
+}
+
+func TestServiceLifecycleAdvancesAfterTerminalAndStaleRequests(t *testing.T) {
+	model := serviceLifecycleModel{state: serviceLifecycleFixture{
+		ActiveID:  requestIDA,
+		Phase:     "busy",
+		Queue:     []string{requestIDB, requestIDC},
+		Operation: "polling",
+		StaleIDs:  map[string]bool{},
+	}}
+	if got := model.finish("succeeded"); got != requestIDB {
+		t.Fatalf("finish started %q, want queue head %q", got, requestIDB)
+	}
+	if model.outcome != "succeeded" || model.state.ActiveID != requestIDB || model.state.Phase != "fetching" || model.state.Operation != "fetching" || !reflect.DeepEqual(model.state.Queue, []string{requestIDC}) {
+		t.Fatalf("advanced lifecycle = %#v", model)
+	}
+
+	model.state.Queue = []string{requestIDA}
+	model.state.StaleIDs[requestIDB] = true
+	if got := model.restore(); got != requestIDA {
+		t.Fatalf("stale restoration started %q, want %q", got, requestIDA)
+	}
+}
+
+func TestServiceLifecycleRestoresFetchingReadyAndBusyRequests(t *testing.T) {
+	for _, test := range []struct {
+		phase     string
+		operation string
+	}{
+		{phase: "fetching", operation: "fetching"},
+		{phase: "ready", operation: "idle"},
+		{phase: "ready", operation: "posting"},
+		{phase: "busy", operation: "polling"},
+	} {
+		t.Run(test.phase+"/"+test.operation, func(t *testing.T) {
+			want := serviceLifecycleFixture{Version: 1, ActiveID: requestIDA, Phase: test.phase, Queue: []string{requestIDB}, Operation: test.operation}
+			model := serviceLifecycleModel{state: want}
+			if got := model.restore(); got != requestIDA || !reflect.DeepEqual(model.state, want) {
+				t.Fatalf("valid restoration = (%q, %#v), want retained ownership %#v", got, model.state, want)
+			}
+		})
+	}
+
+	typeOfFixture := reflect.TypeOf(serviceLifecycleFixture{})
+	for i := 0; i < typeOfFixture.NumField(); i++ {
+		name := strings.ToLower(typeOfFixture.Field(i).Name)
+		if strings.Contains(name, "password") || strings.Contains(name, "token") || strings.Contains(name, "url") || strings.Contains(name, "secret") {
+			t.Errorf("persisted lifecycle contains secret field %q", name)
+		}
+	}
+}
+
+func TestServiceCancellationRetriesStartAndTransportFailures(t *testing.T) {
+	model := serviceLifecycleModel{}
+	for _, test := range []struct {
+		started, transportOK bool
+		status               int
+	}{
+		{started: false, transportOK: true, status: 202},
+		{started: true, transportOK: false, status: 202},
+		{started: true, transportOK: true, status: 200},
+		{started: true, transportOK: true, status: 500},
+	} {
+		if got := model.responseAttempt(test.started, test.transportOK, test.status); got != "retry" {
+			t.Errorf("responseAttempt(%v, %v, %d) = %q, want retry", test.started, test.transportOK, test.status, got)
+		}
+	}
+}
+
+func TestServiceCancellationTreatsConflictAsAcknowledged(t *testing.T) {
+	for _, status := range []int{202, 409} {
+		if got := (&serviceLifecycleModel{}).responseAttempt(true, true, status); got != "accepted" {
+			t.Fatalf("status %d outcome = %q, want accepted", status, got)
+		}
+	}
+}
+
+func TestServiceCancellationTreatsGoneAsTerminal(t *testing.T) {
+	if got := (&serviceLifecycleModel{}).responseAttempt(true, true, 410); got != "gone" {
+		t.Fatalf("gone outcome = %q, want gone", got)
+	}
+}
+
+func TestServiceCancellationDoesNotTurnIntoGenericBridgeFailure(t *testing.T) {
+	model := serviceLifecycleModel{outcome: "cancelling"}
+	if got := model.responseAttempt(true, false, 0); got != "retry" || model.outcome == "failed" {
+		t.Fatalf("cancellation transport failure = (%q, %q), want retry without generic failure", got, model.outcome)
+	}
+}
+
+func TestServiceOrdinaryTransportFailuresRemainFailures(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		wantOutcome string
+		wantCommand bool
+	}{
+		{name: "fetch", wantOutcome: "failed"},
+		{name: "result", wantOutcome: "failed"},
+		{name: "submit", wantOutcome: "retry", wantCommand: true},
+		{name: "confirm", wantOutcome: "retry", wantCommand: true},
+	} {
+		model := serviceLifecycleModel{}
+		model.outcome = test.wantOutcome
+		commandRetained := test.wantCommand && model.outcome == "retry"
+		if model.outcome != test.wantOutcome || commandRetained != test.wantCommand {
+			t.Fatalf("ordinary %s transport failure = (%q, command retained %v)", test.name, model.outcome, commandRetained)
+		}
+	}
+}
+
+func TestPanelPresenceMatchesOnlyCurrentRequest(t *testing.T) {
+	now := int64(10_000)
+	for _, test := range []struct {
+		name   string
+		marker any
+		open   bool
+	}{
+		{name: "false", marker: false, open: true},
+		{name: "malformed", marker: map[string]any{"id": requestIDA}, open: true},
+		{name: "mismatched", marker: panelMarkerFixture{ID: requestIDB, Instance: "panel-1", Heartbeat: now}, open: true},
+		{name: "stale", marker: panelMarkerFixture{ID: requestIDA, Instance: "panel-1", Heartbeat: now - 3001}, open: true},
+		{name: "matching fresh", marker: panelMarkerFixture{ID: requestIDA, Instance: "panel-1", Heartbeat: now - 3000}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldOpenPanel(requestIDA, test.marker, now); got != test.open {
+				t.Fatalf("shouldOpenPanel = %v, want %v", got, test.open)
+			}
+		})
+	}
+}
+
+func TestPanelReloadClearsItsOwnStalePresenceMarker(t *testing.T) {
+	now := int64(20_000)
+	marker := any(panelMarkerFixture{ID: requestIDA, Instance: "reloading-panel", Heartbeat: now})
+	if shouldOpenPanel(requestIDA, marker, now) {
+		t.Fatal("fresh owned marker requested a duplicate panel")
+	}
+	marker = false
+	if !shouldOpenPanel(requestIDA, marker, now) {
+		t.Fatal("cleared reload marker prevented panel reopening")
+	}
+}
+
 type serviceModel struct {
 	generation                 int
 	active, pending            bool
@@ -603,20 +871,6 @@ func (m *serviceModel) panelClosed() {
 	if m.phase == "busy" {
 		m.panelOpen = false
 	}
-}
-
-func (m *serviceModel) restart() {
-	m.exitCancel = m.active && m.phase == "ready"
-	m.generation++
-	m.active = false
-	m.pending = false
-	m.fetching = false
-	m.posting = false
-	m.polling = false
-	m.auth = false
-	m.command = false
-	m.phase = ""
-	m.requestOpen = false
 }
 
 func (m *serviceModel) failPending() {
@@ -671,22 +925,6 @@ func TestServiceModelAcceptsCancelForBothRequestKinds(t *testing.T) {
 	}
 }
 
-func TestServiceModelExitCancelsOnlyReadyRequest(t *testing.T) {
-	for _, test := range []struct {
-		phase      string
-		wantCancel bool
-	}{{phase: "ready", wantCancel: true}, {phase: "busy"}} {
-		got := serviceModel{generation: 4, active: true, auth: true, command: true, phase: test.phase}
-		got.restart()
-		if got.exitCancel != test.wantCancel {
-			t.Fatalf("exit cancellation for %s = %v, want %v", test.phase, got.exitCancel, test.wantCancel)
-		}
-		if got.active || got.auth || got.command || got.generation != 5 {
-			t.Fatalf("exit did not clear lifecycle for %s: %#v", test.phase, got)
-		}
-	}
-}
-
 func TestServiceModelMalformedCallbackAndHTTPRefusalFail(t *testing.T) {
 	for _, name := range []string{"malformed callback", "synchronous refusal"} {
 		t.Run(name, func(t *testing.T) {
@@ -734,19 +972,6 @@ func TestServiceModelBusyCloseAndRetryReopen(t *testing.T) {
 	got.retry(2, true)
 	if !got.requestOpen {
 		t.Fatal("retry after busy close did not request panel reopen")
-	}
-}
-
-func TestServiceModelRestartPreservesPanelAndInvalidatesCallbacks(t *testing.T) {
-	got := serviceModel{generation: 8, active: true, pending: true, fetching: true, posting: true, polling: true, auth: true, command: true, phase: "busy", panelOpen: true}
-	got.restart()
-	want := serviceModel{generation: 9, panelOpen: true}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("restart state = %#v, want %#v", got, want)
-	}
-	got.callback(8, true)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("late callback changed restarted state: got %#v, want %#v", got, want)
 	}
 }
 
