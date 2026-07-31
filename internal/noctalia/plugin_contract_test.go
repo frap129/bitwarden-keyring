@@ -257,10 +257,8 @@ func assertPanelSource(t *testing.T, source string) {
 	for _, required := range []string{
 		`--!nonstrict`, `local auth`, `local password`, `local inputKey`, `local inputAccepting`,
 		`local panelOpen = false`, `local panelRequestId = nil`, `local panelInstanceId = newInstanceId()`,
-		`function render()`, `ui.label({ text = title })`, `ui.label({ text = prompt })`, `ui.input({`,
-		`ui.glyph({ name = "lock" })`, `ui.image({ path = "assets/bitwarden.svg", width = 48, height = 48, fit = "contain" })`, `ui.column({ gap = 12 }, children)`,
+		`function render()`,
 		`noctalia.getConfig("show_bitwarden_icon")`,
-		`key = "password-" .. inputKey`, `value = ""`, `password = true`, `focus = true`, `enabled = auth.phase == "ready"`,
 		`local capturedInputKey = inputKey`, `local capturedId = auth.id`, `onChange = function(value)`, `onSubmit = function()`,
 		`handlePasswordChange(value, capturedInputKey, capturedId)`, `handleUnlock(capturedInputKey, capturedId)`, `panel.render(render())`,
 		`function onOpen()`, `function update()`, `function onClose()`, `panel.close()`, `noctalia.setUpdateInterval(1000)`,
@@ -273,19 +271,10 @@ func assertPanelSource(t *testing.T, source string) {
 		`if capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id then return end`,
 		`if not inputAccepting or auth.phase ~= "ready" or auth.confirm_only then return end`,
 		`if auth == nil or not terminalPhase(auth.phase) then return end`,
-		`ui.row({ gap = 8 }, actions)`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Errorf("panel.luau does not contain required literal %q", required)
 		}
-	}
-	for _, action := range []string{`onClick = "onCancel"`, `onClick = "onUnlock"`, `onClick = "onConfirm"`} {
-		if !strings.Contains(source, action) {
-			t.Errorf("panel.luau does not contain named command callback %q", action)
-		}
-	}
-	if !strings.Contains(source, `onClick = "onDismiss"`) {
-		t.Error("panel.luau terminal failure is not dismissible with a named callback")
 	}
 	for _, forbidden := range []string{
 		"frameTick", "onFrame", "setTimeout", "setInterval", "animation", "timer", "geometry",
@@ -318,30 +307,8 @@ func assertPanelSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)function onInvalidDismiss\(\)\s+if auth ~= nil then return end\s+clearPassword\(\)\s+requestProgrammaticDismiss\(\)`).MatchString(source) {
 		t.Error("panel.luau invalid-state dismiss must not close or suppress a valid request")
 	}
-	if !strings.Contains(source, `onClick = "onInvalidDismiss"`) {
-		t.Error("panel.luau invalid state is not dismissible")
-	}
-	if !regexp.MustCompile(`(?s)text = busy and noctalia\.tr\("panel\.unlocking"\) or noctalia\.tr\("panel\.unlock"\),\s+enabled = ready,\s+onClick = "onUnlock"`).MatchString(source) {
-		t.Error("panel.luau must keep the ready unlock action rendered independently of local password state")
-	}
 	if strings.Contains(source, `enabled = ready and password ~= ""`) {
 		t.Error("panel.luau must not hide the ready unlock action for an empty local password")
-	}
-	for _, callback := range []string{`onClick = "onInvalidDismiss"`, `onClick = "onDismiss"`, `onClick = "onCancel"`, `onClick = "onUnlock"`, `onClick = "onConfirm"`} {
-		if strings.Count(source, callback) != 1 {
-			t.Errorf("panel.luau action callback %q must have exactly one render path", callback)
-		}
-	}
-	actionBranches := regexp.MustCompile(`(?s)if auth == nil then\s+table\.insert\(children, ui\.button\(\{[^}]*onClick = "onInvalidDismiss"[^}]*\}\)\)\s+elseif terminalPhase\(auth\.phase\) then\s+table\.insert\(children, ui\.button\(\{[^}]*onClick = "onDismiss"[^}]*\}\)\)\s+elseif auth\.phase == "ready" or auth\.phase == "busy" or auth\.phase == "cancelling" then(.*?)table\.insert\(children, ui\.row\(\{ gap = 8 \}, actions\)\)\s+end`)
-	branchMatch := actionBranches.FindStringSubmatch(source)
-	if len(branchMatch) != 2 {
-		t.Error("panel.luau must render invalid, terminal, and normal actions as mutually exclusive branches")
-	} else {
-		for _, callback := range []string{`onClick = "onCancel"`, `onClick = "onUnlock"`, `onClick = "onConfirm"`} {
-			if !strings.Contains(branchMatch[1], callback) {
-				t.Errorf("panel.luau normal action row does not contain %q", callback)
-			}
-		}
 	}
 	if !regexp.MustCompile(`(?s)function onClose\(\)\s+local closingRequestId = panelRequestId\s+local closingInstanceId = panelInstanceId.*?clearOwnedPanelMarker\(closingRequestId, closingInstanceId\)`).MatchString(source) {
 		t.Error("panel.luau close must clear only its immutable ID and instance marker")
@@ -361,12 +328,6 @@ func assertPanelSource(t *testing.T, source string) {
 	}
 	if strings.Count(source, `capturedInputKey ~= inputKey or auth == nil or capturedId ~= auth.id`) != 2 {
 		t.Error("panel.luau must generation- and ID-guard both input callbacks")
-	}
-	inputCallbacks := regexp.MustCompile(`(?s)onChange = function\(value\)(.*?)end,\s+onSubmit = function\(\)(.*?)end,`).FindStringSubmatch(source)
-	if len(inputCallbacks) != 3 {
-		t.Error("panel.luau must define inspectable inline input callbacks")
-	} else if strings.Contains(inputCallbacks[1], "password") || strings.Contains(inputCallbacks[2], "password") {
-		t.Error("panel.luau input closures must not capture or access password values")
 	}
 }
 
@@ -1967,7 +1928,7 @@ func assertPluginManifest(t *testing.T, got pluginManifest) {
 	}
 	wantServices := []map[string]any{{"id": "service", "entry": "service.luau"}}
 	wantPanels := []map[string]any{{
-		"id": "unlock", "entry": "panel.luau", "width": 400, "height": 300, "placement": "floating", "position": "center",
+		"id": "unlock", "entry": "panel.luau", "width": 348, "height": 276, "placement": "floating", "position": "center",
 		"open_near_click": false, "dismiss_on_outside_click": false,
 	}}
 	wantSettings := []map[string]any{

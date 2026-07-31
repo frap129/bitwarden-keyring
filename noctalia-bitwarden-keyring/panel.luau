@@ -93,17 +93,21 @@ function render()
   inputAccepting = false
   local title = noctalia.tr("panel.title")
   local prompt = ""
-  local errorText = ""
+  local status = ""
   local confirmOnly = false
   local ready = false
   local busy = false
+  local statusIsError = false
   if auth ~= nil then
     if auth.title ~= "" then title = auth.title end
     prompt = auth.prompt
-    errorText = terminalText()
+    status = terminalText()
     confirmOnly = auth.confirm_only
     ready = auth.phase == "ready"
     busy = auth.phase == "busy"
+    statusIsError = auth.error ~= "" or auth.phase == "failed" or (ready and status ~= "")
+  else
+    statusIsError = true
   end
 
   local icon
@@ -114,9 +118,12 @@ function render()
   end
 
   local children = {
-    icon,
-    ui.label({ text = title }),
-    ui.label({ text = prompt }),
+    ui.row({ justify = "center" }, { icon }),
+    ui.label({ text = title, fontSize = 18, fontWeight = "bold", textAlign = "center" }),
+    ui.box({ height = 16 }),
+    ui.row({ width = 320, justify = "start" }, {
+      ui.label({ text = status ~= "" and status or prompt, color = statusIsError and "error" or nil }),
+    }),
   }
   if auth ~= nil and not confirmOnly then
     if ready then inputAccepting = true end
@@ -124,6 +131,7 @@ function render()
     local capturedId = auth.id
     table.insert(children, ui.input({
       key = "password-" .. inputKey,
+      width = 320,
       value = "",
       placeholder = noctalia.tr("panel.password_placeholder"),
       password = true,
@@ -137,27 +145,27 @@ function render()
       end,
     }))
   end
-  table.insert(children, ui.label({ text = errorText }))
   if auth == nil then
     table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = true, onClick = "onInvalidDismiss" }))
   elseif terminalPhase(auth.phase) then
     table.insert(children, ui.button({ text = noctalia.tr("panel.cancel"), enabled = true, onClick = "onDismiss" }))
   elseif auth.phase == "ready" or auth.phase == "busy" or auth.phase == "cancelling" then
     local actions = {
-      ui.button({ text = noctalia.tr("panel.cancel"), enabled = ready, onClick = "onCancel" }),
+      ui.button({ text = noctalia.tr("panel.cancel"), width = 156, enabled = ready, onClick = "onCancel" }),
     }
     if confirmOnly then
-      table.insert(actions, ui.button({ text = noctalia.tr("panel.confirm"), enabled = ready, onClick = "onConfirm" }))
+      table.insert(actions, ui.button({ text = noctalia.tr("panel.confirm"), width = 156, enabled = ready, onClick = "onConfirm" }))
     else
       table.insert(actions, ui.button({
         text = busy and noctalia.tr("panel.unlocking") or noctalia.tr("panel.unlock"),
+        width = 156,
         enabled = ready,
         onClick = "onUnlock",
       }))
     end
-    table.insert(children, ui.row({ gap = 8 }, actions))
+    table.insert(children, ui.row({ width = 320, gap = 8, align = "center" }, actions))
   end
-  return ui.column({ gap = 12 }, children)
+  return ui.column({ gap = 12, align = "center", justify = "center" }, children)
 end
 
 local function rerender()

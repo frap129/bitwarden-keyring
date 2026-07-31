@@ -16,8 +16,8 @@ entry = "service.luau"
 [[panel]]
 id = "unlock"
 entry = "panel.luau"
-width = 400
-height = 300
+width = 348
+height = 276
 placement = "floating"
 position = "center"
 open_near_click = false
