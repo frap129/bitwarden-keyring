@@ -974,6 +974,22 @@ func doNoctaliaTestRequest(ctx context.Context, client *http.Client, descriptor 
 	return client.Do(req)
 }
 
+func submitNoctaliaTestPassword(do func(method, path, body string) (*http.Response, error), cookie string) error {
+	response, err := do(http.MethodGet, "/v1/request", "")
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+
+	body := fmt.Sprintf(`{"type":"keyring_response","id":%q,"result":"ok","password":"password"}`, cookie)
+	response, err = do(http.MethodPost, "/v1/response", body)
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	return nil
+}
+
 func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -985,17 +1001,9 @@ func serveNoctaliaInitialPassword(runtimeDir, cookie string) error {
 	do := func(method, path, body string) (*http.Response, error) {
 		return doNoctaliaTestRequest(ctx, client, descriptor, method, path, body)
 	}
-	response, err := do(http.MethodGet, "/v1/request", "")
-	if err != nil {
+	if err := submitNoctaliaTestPassword(do, cookie); err != nil {
 		return err
 	}
-	response.Body.Close()
-	body := fmt.Sprintf(`{"type":"keyring_response","id":%q,"result":"ok","password":"password"}`, cookie)
-	response, err = do(http.MethodPost, "/v1/response", body)
-	if err != nil {
-		return err
-	}
-	response.Body.Close()
 	return pollNoctalia(ctx, func() (bool, error) {
 		response, err := do(http.MethodGet, "/v1/result?id="+cookie, "")
 		if err != nil {
@@ -1031,17 +1039,9 @@ func serveNoctaliaPasswordAndResultWithDescriptor(runtimeDir, cookie string, res
 	do := func(method, path, body string) (*http.Response, error) {
 		return doNoctaliaTestRequest(ctx, client, descriptor, method, path, body)
 	}
-	response, err := do(http.MethodGet, "/v1/request", "")
-	if err != nil {
+	if err := submitNoctaliaTestPassword(do, cookie); err != nil {
 		return err
 	}
-	response.Body.Close()
-	body := fmt.Sprintf(`{"type":"keyring_response","id":%q,"result":"ok","password":"password"}`, cookie)
-	response, err = do(http.MethodPost, "/v1/response", body)
-	if err != nil {
-		return err
-	}
-	response.Body.Close()
 	return pollNoctalia(ctx, func() (bool, error) {
 		response, err := do(http.MethodGet, "/v1/result?id="+cookie, "")
 		if err != nil {

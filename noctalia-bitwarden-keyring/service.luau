@@ -47,6 +47,12 @@ local function loadDescriptor(id)
   return descriptor
 end
 
+local function discardDescriptor(descriptor)
+  descriptor.token = nil
+  descriptor.base_url = nil
+  return nil
+end
+
 local function persistLifecycle()
   local queue = {}
   for index, id in ipairs(lifecycle.queue) do
@@ -222,9 +228,7 @@ local function enqueueRequest(id)
   if not validId(id) or id == lifecycle.active_id then return end
   local descriptor = loadDescriptor(id)
   if descriptor == nil then return end
-  descriptor.token = nil
-  descriptor.base_url = nil
-  descriptor = nil
+  descriptor = discardDescriptor(descriptor)
   for _, queuedId in ipairs(lifecycle.queue) do
     if queuedId == id then return end
   end
@@ -258,9 +262,7 @@ local function openRequest(id, restoredPhase)
   end
   bridgeBaseUrl = descriptor.base_url
   bridgeToken = descriptor.token
-  descriptor.token = nil
-  descriptor.base_url = nil
-  descriptor = nil
+  descriptor = discardDescriptor(descriptor)
 
   local started = noctalia.http({
     method = "GET",
@@ -321,9 +323,7 @@ startNextRequest = function()
     changed = true
     local descriptor = loadDescriptor(id)
     if descriptor ~= nil then
-      descriptor.token = nil
-      descriptor.base_url = nil
-      descriptor = nil
+      descriptor = discardDescriptor(descriptor)
       lifecycle.active_id = id
       lifecycle.phase = "fetching"
       persistLifecycle()
@@ -372,9 +372,7 @@ onCommand = function(value)
   end
   bridgeBaseUrl = descriptor.base_url
   bridgeToken = descriptor.token
-  descriptor.token = nil
-  descriptor.base_url = nil
-  descriptor = nil
+  descriptor = discardDescriptor(descriptor)
 
   local result = action == "submit" and "ok" or (action == "cancel" and "cancelled" or "confirmed")
   local wire = {type = "keyring_response", id = id, result = result}
@@ -446,9 +444,7 @@ local function activeDescriptorExists()
   if id == "" then return true end
   local descriptor = loadDescriptor(id)
   if descriptor == nil then return false end
-  descriptor.token = nil
-  descriptor.base_url = nil
-  descriptor = nil
+  descriptor = discardDescriptor(descriptor)
   return true
 end
 
@@ -531,16 +527,7 @@ function onIpc(event, payload)
 end
 
 function onExit()
-  generation = generation + 1
-  active = nil
-  pendingId = nil
-  fetching = false
-  posting = false
-  polling = false
-  bridgeToken = nil
-  bridgeBaseUrl = nil
-  encodedBody = nil
-  postAction = nil
+  invalidatePrivate()
   clearPanelOpening()
 end
 
@@ -576,9 +563,7 @@ local function sanitizeLifecycle(value)
       sanitized.active_id = value.active_id
       sanitized.phase = value.phase
       seen[value.active_id] = true
-      descriptor.token = nil
-      descriptor.base_url = nil
-      descriptor = nil
+      descriptor = discardDescriptor(descriptor)
       droppedActiveId = ""
     end
   end
@@ -589,9 +574,7 @@ local function sanitizeLifecycle(value)
         if descriptor ~= nil then
           table.insert(sanitized.queue, id)
           seen[id] = true
-          descriptor.token = nil
-          descriptor.base_url = nil
-          descriptor = nil
+          descriptor = discardDescriptor(descriptor)
         end
       end
     end

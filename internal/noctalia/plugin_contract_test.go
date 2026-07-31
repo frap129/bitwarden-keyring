@@ -647,16 +647,33 @@ func assertServiceSource(t *testing.T, source string) {
 	if !regexp.MustCompile(`(?s)local capturedAction = action.*?clearAcknowledgedCommand\(capturedId, capturedAction, capturedCommandIdentity\)`).MatchString(source) {
 		t.Error("service.luau acknowledgment must use captured ID, action, and monotonic identity")
 	}
+	invalidatePrivate := regexp.MustCompile(`(?s)local function invalidatePrivate\(\)(.*?)\nend`).FindStringSubmatch(source)
+	if len(invalidatePrivate) != 2 {
+		t.Error("service.luau must define inspectable private invalidation")
+	} else {
+		for _, cleared := range []string{
+			"generation = generation + 1", "active = nil", "pendingId = nil", "fetching = false",
+			"posting = false", "polling = false", "bridgeToken = nil", "bridgeBaseUrl = nil",
+			"encodedBody = nil", "postAction = nil",
+		} {
+			if !strings.Contains(invalidatePrivate[1], cleared) {
+				t.Errorf("service.luau private invalidation does not contain %q", cleared)
+			}
+		}
+	}
+	if !regexp.MustCompile(`(?s)local function discardDescriptor\(descriptor\).*?descriptor\.token = nil.*?descriptor\.base_url = nil.*?return nil`).MatchString(source) {
+		t.Error("service.luau must scrub descriptor secrets before releasing the descriptor")
+	}
 	onExit := regexp.MustCompile(`(?s)function onExit\(\)(.*?)\nend`).FindStringSubmatch(source)
 	if len(onExit) != 2 {
 		t.Error("service.luau must define inspectable onExit")
 	} else if strings.Contains(onExit[1], `noctalia.state.set("command", nil)`) {
 		t.Error("service.luau onExit must retain an unacknowledged shared command")
 	} else {
-		for _, cleared := range []string{"bridgeToken = nil", "bridgeBaseUrl = nil", "encodedBody = nil", "postAction = nil"} {
-			if !strings.Contains(onExit[1], cleared) {
-				t.Errorf("service.luau onExit does not clear private value %q", cleared)
-			}
+		invalidateExit := strings.Index(onExit[1], "invalidatePrivate()")
+		clearPanelExit := strings.Index(onExit[1], "clearPanelOpening()")
+		if invalidateExit < 0 || clearPanelExit < 0 || invalidateExit > clearPanelExit {
+			t.Error("service.luau onExit must invalidate private callbacks and secrets before clearing panel state")
 		}
 		for _, forbiddenExit := range []string{"noctalia.http", "noctalia.state.set", "keyring_response", "cancelled", "clearCommand("} {
 			if strings.Contains(onExit[1], forbiddenExit) {

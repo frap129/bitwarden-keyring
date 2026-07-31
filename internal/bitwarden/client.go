@@ -535,28 +535,14 @@ func (c *Client) runUnlockFlight(ctx context.Context, flight *unlockFlight) (res
 		}
 
 		var password string
+		var nextNotifier ResultNotifier
 		var err error
 
-		// For first attempt or prompters without retry support, prompt for password
-		// For subsequent attempts with a notifier, wait for retry via the session
-		if attempt == 1 || notifier == nil {
-			// Prompt for password with optional error message for retries
-			var nextNotifier ResultNotifier
-			password, nextNotifier, err = c.prompter.PromptForPassword(ctx, errMsg)
-			if err != nil {
-				return err // Preserves ErrUserCancelled
-			}
-			notifier = nextNotifier
-		} else {
-			// Notifier was already set and supports retry - password comes from WaitForRetry
-			// The session manager handles this internally
-			var nextNotifier ResultNotifier
-			password, nextNotifier, err = c.prompter.PromptForPassword(ctx, errMsg)
-			if err != nil {
-				return err
-			}
-			notifier = nextNotifier
+		password, nextNotifier, err = c.prompter.PromptForPassword(ctx, errMsg)
+		if err != nil {
+			return err // Preserves ErrUserCancelled
 		}
+		notifier = nextNotifier
 
 		// Unlock the vault
 		_, err = c.Unlock(ctx, password)
