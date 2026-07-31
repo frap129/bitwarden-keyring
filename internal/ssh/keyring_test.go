@@ -234,7 +234,7 @@ func TestKeyring_Add(t *testing.T) {
 
 func TestKeyring_Add_Duplicate(t *testing.T) {
 	// Generate a key that we'll treat as already existing
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("failed to generate key: %v", err)
 	}
@@ -288,9 +288,6 @@ func TestKeyring_Add_Duplicate(t *testing.T) {
 	if tk.mock.createCalls != 0 {
 		t.Errorf("Expected 0 CreateItem calls for duplicate, got %d", tk.mock.createCalls)
 	}
-
-	// Also ensure we can find both keys (they're the same)
-	_ = pub // use pub to avoid unused variable error
 }
 
 func TestKeyring_Add_VaultLocked(t *testing.T) {

@@ -1633,8 +1633,6 @@ func TestStartServe_FailClosed_StopsOnReadinessFailure(t *testing.T) {
 		t.Skip("skipping slow test in short mode")
 	}
 
-	_ = NewClient(9999) // Use a port we control
-
 	// Start a fake bw serve that exits immediately (simulate failure)
 	// We can't easily test this without mocking exec.Command
 	// For now, this test documents the expected behavior
@@ -1733,11 +1731,6 @@ PY
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Pass chosen port to the shim via env.
-	c.mu.Lock()
-	// StartServe uses os.Environ when starting the process. We can't directly set Cmd.Env here,
-	// so we use an env var that the shim reads.
-	c.mu.Unlock()
 	t.Setenv("BW_SHIM_PORT", fmt.Sprintf("%d", port))
 
 	if err := c.StartServe(ctx, port); err != nil {

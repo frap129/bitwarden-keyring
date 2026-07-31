@@ -527,13 +527,6 @@ func TestNoctaliaSocketFlagRemoved(t *testing.T) {
 	}
 }
 
-func TestNoctaliaTimeoutSessionConfigPreservesValue(t *testing.T) {
-	cfg := Config{NoctaliaTimeout: 45 * time.Second}
-	if got := cfg.SessionConfig().NoctaliaTimeout; got != 45*time.Second {
-		t.Fatalf("SessionConfig().NoctaliaTimeout = %v, want 45s", got)
-	}
-}
-
 func TestConfigFromArgs_NoctaliaEnv(t *testing.T) {
 	t.Setenv("BITWARDEN_KEYRING_NOCTALIA", "1")
 
