@@ -185,6 +185,7 @@ func (c *Client) StartServe(ctx context.Context, port int) error {
 	// caller-provided context. Callers typically pass a startup timeout context
 	// that is canceled after readiness. We use ctx only for readiness checks.
 	cmd := exec.Command("bw", "serve", "--hostname", "127.0.0.1", "--port", fmt.Sprintf("%d", port))
+	cmd.Stderr = os.Stderr
 
 	// Pass through session key if available
 	sessionKey := c.session.GetSession()
