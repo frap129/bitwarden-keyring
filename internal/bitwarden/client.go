@@ -124,8 +124,9 @@ type Client struct {
 	mu               sync.RWMutex
 	serveCmd         *exec.Cmd
 	serveDone        chan error // closed/sent when Wait() returns
-	serveErr         error      // last exit error
-	servePID         int        // process ID
+	serveExited      chan struct{}
+	serveErr         error // last exit error
+	servePID         int   // process ID
 	unlockFlightMu   sync.Mutex
 	unlockFlight     *unlockFlight
 	flightWaiterHook func(*unlockFlight)
@@ -201,7 +202,9 @@ func (c *Client) StartServe(ctx context.Context, port int) error {
 	c.serveCmd = cmd
 	c.servePID = cmd.Process.Pid
 	c.serveDone = make(chan error, 1)
+	c.serveExited = make(chan struct{})
 	c.serveErr = nil
+	exited := c.serveExited
 
 	// Unlock before waitForReady (which makes HTTP calls)
 	c.mu.Unlock()
@@ -214,6 +217,7 @@ func (c *Client) StartServe(ctx context.Context, port int) error {
 		c.serveCmd = nil
 		c.servePID = 0
 		c.mu.Unlock()
+		close(exited)
 		c.serveDone <- err
 	}()
 
@@ -225,6 +229,14 @@ func (c *Client) StartServe(ctx context.Context, port int) error {
 	}
 
 	return nil
+}
+
+// ServeExited returns a channel that is closed when the bw serve process
+// exits. It returns nil if serve was never started.
+func (c *Client) ServeExited() <-chan struct{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.serveExited
 }
 
 // ServeHealthy returns an error if the bw serve process is not healthy.

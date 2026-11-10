@@ -39,16 +39,22 @@ func run(args []string) error {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigChan)
 
-	<-sigChan
-	fmt.Println()
-	logging.L.Info("shutting down")
+	var runErr error
+	select {
+	case <-sigChan:
+		fmt.Println()
+		logging.L.Info("shutting down")
+	case <-app.BackendExited():
+		runErr = fmt.Errorf("bitwarden backend exited: %w", app.bwClient.ServeHealthy())
+		logging.L.Error("bitwarden backend exited, shutting down")
+	}
 
 	if err := app.Stop(); err != nil {
 		logging.L.Warn("warning during shutdown", "error", err)
 	}
 
 	logging.L.Info("goodbye")
-	return nil
+	return runErr
 }
 
 func main() {

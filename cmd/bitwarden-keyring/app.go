@@ -183,6 +183,14 @@ func isSystemdUserRunning() bool {
 	return err == nil
 }
 
+// BackendExited returns a channel closed when the bw serve process exits.
+func (a *App) BackendExited() <-chan struct{} {
+	if a.bwClient == nil {
+		return nil
+	}
+	return a.bwClient.ServeExited()
+}
+
 // Stop gracefully shuts down all components in reverse order
 func (a *App) Stop() error {
 	var errs []string

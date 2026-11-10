@@ -1749,8 +1749,21 @@ PY
 		t.Fatalf("Status() after ctx cancel error = %v", err)
 	}
 
+	exited := c.ServeExited()
+	select {
+	case <-exited:
+		t.Fatal("ServeExited() closed while serve is running")
+	default:
+	}
+
 	if err := c.Stop(); err != nil {
 		t.Fatalf("Stop() error = %v", err)
+	}
+
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("ServeExited() not closed after serve exited")
 	}
 }
 
