@@ -188,10 +188,15 @@ func (c *Client) StartServe(ctx context.Context, port int) error {
 	cmd := exec.Command("bw", "serve", "--hostname", "127.0.0.1", "--port", fmt.Sprintf("%d", port))
 	cmd.Stderr = os.Stderr
 
+	// bw serve crashes on unhandled rejections, e.g. a token refresh failing
+	// while the network is still down after resume. Log them instead.
+	nodeOptions := strings.TrimSpace(os.Getenv("NODE_OPTIONS") + " --unhandled-rejections=warn")
+	cmd.Env = append(os.Environ(), "NODE_OPTIONS="+nodeOptions)
+
 	// Pass through session key if available
 	sessionKey := c.session.GetSession()
 	if sessionKey != "" {
-		cmd.Env = append(os.Environ(), "BW_SESSION="+sessionKey)
+		cmd.Env = append(cmd.Env, "BW_SESSION="+sessionKey)
 	}
 
 	if err := cmd.Start(); err != nil {
