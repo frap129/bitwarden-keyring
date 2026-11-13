@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 
@@ -18,11 +19,13 @@ import (
 
 // App coordinates the application components
 type App struct {
-	config    Config
-	bwClient  *bitwarden.Client
-	conn      *dbus.Conn
-	service   *secretdbus.Service
-	sshServer *ssh.Server
+	config             Config
+	bwClient           *bitwarden.Client
+	conn               *dbus.Conn
+	service            *secretdbus.Service
+	sshServer          *ssh.Server
+	backendRestarts    int
+	lastBackendRestart time.Time
 }
 
 // NewApp creates a new App with the given configuration
@@ -189,6 +192,35 @@ func (a *App) BackendExited() <-chan struct{} {
 		return nil
 	}
 	return a.bwClient.ServeExited()
+}
+
+const (
+	maxBackendRestarts   = 3
+	backendRestartWindow = time.Minute
+)
+
+// RestartBackend restarts bw serve after it exited, reusing the current
+// session key. It fails if bw serve exits too often within a short window.
+func (a *App) RestartBackend(ctx context.Context) error {
+	logging.L.Warn("bitwarden backend exited, restarting", "error", a.bwClient.ServeHealthy())
+
+	if time.Since(a.lastBackendRestart) > backendRestartWindow {
+		a.backendRestarts = 0
+	}
+	if a.backendRestarts >= maxBackendRestarts {
+		return fmt.Errorf("bw serve exited %d times within %s", a.backendRestarts+1, backendRestartWindow)
+	}
+	a.backendRestarts++
+	a.lastBackendRestart = time.Now()
+
+	startCtx, cancel := context.WithTimeout(ctx, a.config.BWStartTimeout)
+	defer cancel()
+	if err := a.bwClient.StartServe(startCtx, a.config.BWPort); err != nil {
+		return fmt.Errorf("failed to restart bw serve: %w", err)
+	}
+
+	logging.L.Info("bitwarden backend restarted")
+	return nil
 }
 
 // Stop gracefully shuts down all components in reverse order

@@ -40,13 +40,20 @@ func run(args []string) error {
 	defer signal.Stop(sigChan)
 
 	var runErr error
-	select {
-	case <-sigChan:
-		fmt.Println()
-		logging.L.Info("shutting down")
-	case <-app.BackendExited():
-		runErr = fmt.Errorf("bitwarden backend exited: %w", app.bwClient.ServeHealthy())
-		logging.L.Error("bitwarden backend exited, shutting down")
+loop:
+	for {
+		select {
+		case <-sigChan:
+			fmt.Println()
+			logging.L.Info("shutting down")
+			break loop
+		case <-app.BackendExited():
+			if err := app.RestartBackend(ctx); err != nil {
+				runErr = fmt.Errorf("bitwarden backend failed: %w", err)
+				logging.L.Error("bitwarden backend failed, shutting down")
+				break loop
+			}
+		}
 	}
 
 	if err := app.Stop(); err != nil {

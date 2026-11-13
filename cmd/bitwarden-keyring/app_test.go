@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joe/bitwarden-keyring/internal/bitwarden"
 )
 
 // setupSystemdSocket creates a fake XDG_RUNTIME_DIR with systemd/private
@@ -214,5 +216,38 @@ func TestStart_NoBW(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "Bitwarden CLI (bw) not found") {
 		t.Errorf("App.Start() error = %v, want error containing 'Bitwarden CLI (bw) not found'", err)
+	}
+}
+
+func TestRestartBackend_RateLimit(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	tests := []struct {
+		name        string
+		restarts    int
+		lastRestart time.Time
+		wantErr     string
+		wantCount   int
+	}{
+		{"limit reached within window", maxBackendRestarts, time.Now(), "exited 4 times", maxBackendRestarts},
+		{"limit resets after window", maxBackendRestarts, time.Now().Add(-2 * backendRestartWindow), "failed to restart bw serve", 1},
+		{"attempts restart below limit", 1, time.Now(), "failed to restart bw serve", 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := NewApp(Config{BWPort: 8087, BWStartTimeout: time.Second})
+			app.bwClient = bitwarden.NewClient(8087)
+			app.backendRestarts = tt.restarts
+			app.lastBackendRestart = tt.lastRestart
+
+			err := app.RestartBackend(t.Context())
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("RestartBackend() error = %v, want containing %q", err, tt.wantErr)
+			}
+			if app.backendRestarts != tt.wantCount {
+				t.Errorf("backendRestarts = %d, want %d", app.backendRestarts, tt.wantCount)
+			}
+		})
 	}
 }
